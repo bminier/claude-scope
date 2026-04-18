@@ -59,15 +59,29 @@ impl BackupTracker {
         Self::default()
     }
 
-    fn contains(&self, path: &Path) -> bool {
-        self.seen.lock().expect("backup tracker poisoned").contains(path)
-    }
-
-    fn record(&self, path: &Path) {
-        self.seen
-            .lock()
-            .expect("backup tracker poisoned")
-            .insert(path.to_path_buf());
+    /// Ensure `path` has been backed up this session, holding the lock for
+    /// the full check-and-copy so two concurrent saves of the same file can't
+    /// race past each other and each attempt a backup.
+    ///
+    /// If a pre-session file exists at `path` and no `.bak` is already
+    /// present from an earlier run, copy it aside. On copy failure the path
+    /// is *not* recorded so a later retry still gets a chance. When there's
+    /// no pre-session file to preserve we still record the path, preventing
+    /// a later save (after our own session created the file) from mistaking
+    /// its own earlier write for a pre-session original.
+    fn ensure_backed_up(&self, path: &Path) -> Result<(), IoError> {
+        let mut guard = self.seen.lock().expect("backup tracker poisoned");
+        if guard.contains(path) {
+            return Ok(());
+        }
+        if path.exists() {
+            let bak = bak_path(path);
+            if !bak.exists() {
+                fs::copy(path, &bak).map_err(|e| IoError::io(&bak, e))?;
+            }
+        }
+        guard.insert(path.to_path_buf());
+        Ok(())
     }
 }
 
@@ -109,18 +123,9 @@ pub fn save(path: &Path, doc: &SettingsDoc, backups: &BackupTracker) -> Result<(
         .ok_or_else(|| IoError::io(path, std::io::Error::other("path has no parent")))?;
     fs::create_dir_all(parent).map_err(|e| IoError::io(parent, e))?;
 
-    // Back up on the first save of this file this session, but only if no
-    // `.bak` is sitting there already — we don't want to clobber a backup a
-    // previous run left behind. Only mark the path as backed up after the
-    // copy actually succeeds so a transient I/O failure doesn't suppress a
-    // later retry.
-    if path.exists() && !backups.contains(path) {
-        let bak = bak_path(path);
-        if !bak.exists() {
-            fs::copy(path, &bak).map_err(|e| IoError::io(&bak, e))?;
-        }
-        backups.record(path);
-    }
+    // Back up the pre-session file on the first save this session. The
+    // tracker handles concurrency, missing-file, and existing-.bak cases.
+    backups.ensure_backed_up(path)?;
 
     let mut tmp =
         tempfile::NamedTempFile::new_in(parent).map_err(|e| IoError::io(parent, e))?;
