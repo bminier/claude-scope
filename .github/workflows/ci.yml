@@ -16,7 +16,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # ubuntu-24.04 is pinned (not ubuntu-latest) because Tauri 2 needs
+        # libwebkit2gtk-4.1-dev, which only exists on Ubuntu 24.04+. If
+        # ubuntu-latest ever shifts, the install step below would break.
+        os: [ubuntu-24.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -34,7 +37,7 @@ jobs:
           workspaces: src-tauri
 
       - name: Install Linux GUI deps
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu-')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
