@@ -1,0 +1,142 @@
+//! Scope discovery.
+//!
+//! Claude Code recognizes these scopes (highest precedence first):
+//!   1. Managed (enterprise, out of scope for this tool)
+//!   2. Local   — <project>/.claude/settings.local.json
+//!   3. Project — <project>/.claude/settings.json
+//!   4. User    — ~/.claude/settings.json
+//!
+//! `~/.claude/settings.local.json` is NOT a recognized scope.
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    Local,
+    Project,
+    User,
+}
+
+impl Scope {
+    pub const ALL: [Scope; 3] = [Scope::Local, Scope::Project, Scope::User];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Scope::Local => "local",
+            Scope::Project => "project",
+            Scope::User => "user",
+        }
+    }
+}
+
+/// Resolved on-disk paths for each recognized scope. A path is `None` only when
+/// it cannot be determined (e.g. no home directory). The file at the path may
+/// or may not exist.
+#[derive(Debug, Clone)]
+pub struct ScopePaths {
+    pub project_dir: PathBuf,
+    pub local: Option<PathBuf>,
+    pub project: Option<PathBuf>,
+    pub user: Option<PathBuf>,
+}
+
+impl ScopePaths {
+    pub fn path_for(&self, scope: Scope) -> Option<&Path> {
+        match scope {
+            Scope::Local => self.local.as_deref(),
+            Scope::Project => self.project.as_deref(),
+            Scope::User => self.user.as_deref(),
+        }
+    }
+}
+
+/// Walks up from `start` (or the current working directory if `None`) looking
+/// for the nearest `.claude/` directory. The search stops at the first match
+/// or at the filesystem root. Returns the directory that *contains* `.claude/`
+/// so callers can treat it as the "project dir"; if no match is found, the
+/// starting directory itself is returned (caller can decide to create
+/// `.claude/` there later).
+pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
+    let start_buf;
+    let start = match start {
+        Some(p) => p,
+        None => {
+            start_buf = std::env::current_dir()?;
+            &start_buf
+        }
+    };
+    let mut cursor = start.to_path_buf();
+    loop {
+        if cursor.join(".claude").is_dir() {
+            return Ok(cursor);
+        }
+        if !cursor.pop() {
+            // Reached filesystem root without finding .claude; fall back to
+            // the starting directory so the UI can still render empty scopes.
+            return Ok(start.to_path_buf());
+        }
+    }
+}
+
+/// Resolve the file paths for every recognized scope given a starting
+/// directory. The starting directory becomes the project dir after walking
+/// upward for `.claude/`.
+pub fn resolve(start: Option<&Path>) -> std::io::Result<ScopePaths> {
+    let project_dir = find_project_root(start)?;
+    let local = Some(project_dir.join(".claude").join("settings.local.json"));
+    let project = Some(project_dir.join(".claude").join("settings.json"));
+    let user = dirs::home_dir().map(|h| h.join(".claude").join("settings.json"));
+    Ok(ScopePaths {
+        project_dir,
+        local,
+        project,
+        user,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_project_root_when_dot_claude_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        // Canonicalize both sides so the test isn't flaky on macOS, where the
+        // tempdir lives under /var which resolves to /private/var via a
+        // filesystem-level symlink.
+        let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+        let got = canon(find_project_root(Some(&nested)).unwrap());
+        let want = canon(tmp.path().to_path_buf());
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn falls_back_to_start_when_no_dot_claude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let got = find_project_root(Some(&nested)).unwrap();
+        assert_eq!(got, nested);
+    }
+
+    #[test]
+    fn resolve_builds_local_and_project_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        let paths = resolve(Some(tmp.path())).unwrap();
+        assert_eq!(
+            paths.local.as_deref().unwrap().file_name().unwrap(),
+            "settings.local.json"
+        );
+        assert_eq!(
+            paths.project.as_deref().unwrap().file_name().unwrap(),
+            "settings.json"
+        );
+    }
+}
