@@ -181,6 +181,10 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
     const btn = document.createElement("button");
     btn.className = "move-btn";
     btn.textContent = `→ ${SCOPE_LABELS[target]}`;
+    btn.setAttribute(
+      "aria-label",
+      `Move ${KIND_LABELS[kind]} rule ${rule} from ${SCOPE_LABELS[scope]} to ${SCOPE_LABELS[target]}`,
+    );
     btn.disabled = props.busy;
     btn.onclick = () => props.onMove({ rule, kind, from: scope, to: target });
     moveBtns.appendChild(btn);

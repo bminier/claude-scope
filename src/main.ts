@@ -14,7 +14,7 @@ async function load(projectDir: string | null): Promise<void> {
   state.busy = true;
   render();
   try {
-    const scopes = await invoke<LoadedScopes>("load_scopes", { projectDir: projectDir });
+    const scopes = await invoke<LoadedScopes>("load_scopes", { project_dir: projectDir });
     state.scopes = scopes;
     state.projectDir = scopes.project_dir;
   } catch (err) {
@@ -37,9 +37,9 @@ async function moveRule(req: MoveRequest): Promise<void> {
   state.busy = true;
   render();
   try {
-    const preview = await invoke<string>("diff_move", { req, projectDir });
+    const preview = await invoke<string>("diff_move", { req, project_dir: projectDir });
     if (!confirm(`Apply this change?\n\n${preview}`)) return;
-    await invoke("apply_move", { req, projectDir });
+    await invoke("apply_move", { req, project_dir: projectDir });
     await load(projectDir);
   } catch (err) {
     alert(`Move failed: ${err}`);
