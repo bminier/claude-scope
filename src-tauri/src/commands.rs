@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
 
 use crate::io_atomic::{self, BackupTracker};
 use crate::model::{PermissionKind, PermissionRules, SettingsDoc};
@@ -51,42 +50,36 @@ pub fn load_scopes(project_dir: Option<String>) -> Result<LoadedScopes, String> 
 }
 
 #[tauri::command]
-pub fn diff_move(req: MoveRequest, _state: State<'_, ()>) -> Result<String, String> {
-    let paths = scope::resolve(None).map_err(|e| e.to_string())?;
+pub fn diff_move(req: MoveRequest, project_dir: Option<String>) -> Result<String, String> {
+    let start = project_dir.as_ref().map(Path::new);
+    let paths = scope::resolve(start).map_err(|e| e.to_string())?;
     diff_move_impl(&paths, &req).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn apply_move(req: MoveRequest, _state: State<'_, ()>) -> Result<(), String> {
-    let paths = scope::resolve(None).map_err(|e| e.to_string())?;
+pub fn apply_move(req: MoveRequest, project_dir: Option<String>) -> Result<(), String> {
+    let start = project_dir.as_ref().map(Path::new);
+    let paths = scope::resolve(start).map_err(|e| e.to_string())?;
     apply_move_impl(&paths, &req, backups()).map_err(|e| e.to_string())
 }
 
 fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::Error>> {
     let mut views = Vec::with_capacity(3);
-    let mut docs: [Option<SettingsDoc>; 3] = Default::default();
 
-    for (idx, scope) in Scope::ALL.iter().copied().enumerate() {
+    for scope in Scope::ALL {
         let path = paths.path_for(scope);
-        let (exists, perms, other, err, doc) = match path {
+        let (exists, perms, other, err) = match path {
             Some(p) => match io_atomic::load(p) {
-                Ok(Some(doc)) => (
-                    true,
-                    doc.permissions(),
-                    doc.other_keys(),
-                    None,
-                    Some(doc),
-                ),
-                Ok(None) => (false, PermissionRules::default(), vec![], None, None),
+                Ok(Some(doc)) => (true, doc.permissions(), doc.other_keys(), None),
+                Ok(None) => (false, PermissionRules::default(), vec![], None),
                 Err(e) => (
                     p.exists(),
                     PermissionRules::default(),
                     vec![],
                     Some(e.to_string()),
-                    None,
                 ),
             },
-            None => (false, PermissionRules::default(), vec![], None, None),
+            None => (false, PermissionRules::default(), vec![], None),
         };
         views.push(ScopeView {
             scope,
@@ -96,7 +89,6 @@ fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::
             other_keys: other,
             parse_error: err,
         });
-        docs[idx] = doc;
     }
 
     let effective = effective_permissions(&views);
