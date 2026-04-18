@@ -112,8 +112,9 @@ impl SettingsDoc {
     }
 
     /// Add a rule to the given list if it isn't already present. Ensures
-    /// `permissions.<kind>` exists as an array.
-    pub fn add_rule(&mut self, kind: PermissionKind, rule: &str) {
+    /// `permissions.<kind>` exists as an array. Returns true if the document
+    /// was actually mutated (i.e. the rule wasn't already present).
+    pub fn add_rule(&mut self, kind: PermissionKind, rule: &str) -> bool {
         let obj = ensure_object(&mut self.root);
         let perms_entry = obj
             .entry("permissions".to_string())
@@ -129,9 +130,11 @@ impl SettingsDoc {
             *list_entry = Value::Array(Vec::new());
         }
         let arr = list_entry.as_array_mut().expect("rule list is array");
-        if !arr.iter().any(|v| v.as_str() == Some(rule)) {
-            arr.push(Value::String(rule.to_string()));
+        if arr.iter().any(|v| v.as_str() == Some(rule)) {
+            return false;
         }
+        arr.push(Value::String(rule.to_string()));
+        true
     }
 
     /// Remove every occurrence of `rule` from `permissions.<kind>`. Returns
@@ -309,10 +312,10 @@ mod tests {
     }
 
     #[test]
-    fn add_rule_is_idempotent() {
+    fn add_rule_is_idempotent_and_reports_mutation() {
         let mut doc = SettingsDoc::empty();
-        doc.add_rule(PermissionKind::Deny, "Bash(rm -rf /)");
-        doc.add_rule(PermissionKind::Deny, "Bash(rm -rf /)");
+        assert!(doc.add_rule(PermissionKind::Deny, "Bash(rm -rf /)"));
+        assert!(!doc.add_rule(PermissionKind::Deny, "Bash(rm -rf /)"));
         assert_eq!(doc.permissions().deny.len(), 1);
     }
 

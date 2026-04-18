@@ -81,7 +81,8 @@ npm run tauri build
   directory → `rename` over target.
 - On the first write of a given file per session, the original is copied to
   `<file>.bak`.
-- A move writes the destination first, then removes from the source, so if
-  the second write fails the rule still exists in exactly one scope (the
-  destination) rather than being lost.
+- A move writes the destination first, then removes from the source. If the
+  source write fails, the destination write is rolled back so the rule ends
+  up in exactly one scope rather than being lost *or* duplicated. If the
+  rollback itself fails the user sees an explicit error.
 - `~/.claude/settings.local.json` is **not** treated as a scope.

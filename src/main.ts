@@ -34,15 +34,16 @@ async function pickProject(): Promise<void> {
 
 async function moveRule(req: MoveRequest): Promise<void> {
   const projectDir = state.projectDir;
-  const preview = await invoke<string>("diff_move", { req, projectDir });
-  if (!confirm(`Apply this change?\n\n${preview}`)) return;
   state.busy = true;
   render();
   try {
+    const preview = await invoke<string>("diff_move", { req, projectDir });
+    if (!confirm(`Apply this change?\n\n${preview}`)) return;
     await invoke("apply_move", { req, projectDir });
     await load(projectDir);
   } catch (err) {
     alert(`Move failed: ${err}`);
+  } finally {
     state.busy = false;
     render();
   }

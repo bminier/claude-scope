@@ -171,10 +171,8 @@ fn apply_move_impl(
     let from_path = require_path(paths, req.from)?.to_path_buf();
     let to_path = require_path(paths, req.to)?.to_path_buf();
 
-    // Load destination first — creating it in-memory if missing — so we can
-    // fail early before mutating the source.
     let mut to_doc = io_atomic::load(&to_path)?.unwrap_or_else(SettingsDoc::empty);
-    to_doc.add_rule(req.kind, &req.rule);
+    let dest_mutated = to_doc.add_rule(req.kind, &req.rule);
 
     let mut from_doc = match io_atomic::load(&from_path)? {
         Some(d) => d,
@@ -191,11 +189,26 @@ fn apply_move_impl(
         .into());
     }
 
-    // Destination first: if the source write fails after adding to the dest,
-    // the rule still exists in exactly one place (dest), which is safer than
-    // losing it entirely.
-    io_atomic::save(&to_path, &to_doc, backups)?;
-    io_atomic::save(&from_path, &from_doc, backups)?;
+    // Destination first, then source. If the destination already had the rule
+    // there's nothing to write there; skipping the save also avoids creating
+    // a spurious `.bak` for a file we aren't actually changing.
+    if dest_mutated {
+        io_atomic::save(&to_path, &to_doc, backups)?;
+    }
+    // If the source write fails after the destination was updated, roll back
+    // the destination so the rule doesn't end up duplicated in both scopes.
+    if let Err(source_err) = io_atomic::save(&from_path, &from_doc, backups) {
+        if dest_mutated {
+            to_doc.remove_rule(req.kind, &req.rule);
+            if let Err(rollback_err) = io_atomic::save(&to_path, &to_doc, backups) {
+                return Err(format!(
+                    "source save failed: {source_err}; destination rollback also failed: {rollback_err}"
+                )
+                .into());
+            }
+        }
+        return Err(format!("source save failed and destination was rolled back: {source_err}").into());
+    }
     Ok(())
 }
 
@@ -316,6 +329,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("must differ"));
+    }
+
+    #[test]
+    fn move_when_destination_already_has_rule_skips_dest_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(git status)"]}}"#,
+        );
+        write(
+            paths.user.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(git status)"]}}"#,
+        );
+        let user_bak = paths
+            .user
+            .as_ref()
+            .unwrap()
+            .with_file_name("settings.json.bak");
+        assert!(!user_bak.exists());
+
+        let backups = BackupTracker::new();
+        apply_move_impl(
+            &paths,
+            &MoveRequest {
+                rule: "Bash(git status)".into(),
+                kind: PermissionKind::Allow,
+                from: Scope::Project,
+                to: Scope::User,
+            },
+            &backups,
+        )
+        .unwrap();
+
+        // Source still loses the rule.
+        let project_doc = io_atomic::load(paths.project.as_ref().unwrap()).unwrap().unwrap();
+        assert!(project_doc.permissions().allow.is_empty());
+        // Destination was not rewritten, so no .bak should have been created.
+        assert!(
+            !user_bak.exists(),
+            "destination .bak should not be created when rule was already present"
+        );
     }
 
     #[test]
