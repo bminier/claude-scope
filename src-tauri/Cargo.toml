@@ -1,0 +1,29 @@
+[package]
+name = "claude-scope"
+version = "0.1.0"
+description = "Desktop GUI for promoting Claude Code settings between scopes"
+authors = ["Brian Minier"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "claude_scope_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "1"
+dirs = "5"
+tempfile = "3"
+
+[features]
+# By default Tauri runs in production mode.
+# When `tauri dev` runs it is executed with `cargo run --no-default-features` if `devPath` is set.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
