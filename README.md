@@ -47,7 +47,7 @@ claude-scope/
 
 ### Prerequisites
 
-- Rust (stable, 1.77+)
+- Rust (stable, 1.88+ — imposed by Tauri 2.10's transitive deps)
 - Node.js 20+ and npm
 - Linux build deps (only on Linux):
   `sudo apt-get install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev`

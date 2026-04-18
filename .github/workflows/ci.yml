@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-24.04 is pinned (not ubuntu-latest) because Tauri 2 needs
+        # libwebkit2gtk-4.1-dev, which only exists on Ubuntu 24.04+. If
+        # ubuntu-latest ever shifts, the install step below would break.
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux GUI deps
+        if: startsWith(matrix.os, 'ubuntu-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - run: npm ci
+
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Rust unit tests
+        working-directory: src-tauri
+        run: cargo test --lib --locked
+
+  msrv:
+    # Validates the MSRV declared in src-tauri/Cargo.toml (rust-version).
+    # The main matrix runs on stable so it also catches upstream regressions;
+    # this job proves we haven't accidentally leaned on a post-MSRV API.
+    # 1.88 is the current floor imposed by Tauri 2.10's transitive deps
+    # (darling, serde_with, time all require 1.88). If those deps bump again,
+    # this job fails loudly rather than letting a stale MSRV ship.
+    name: msrv (1.88)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: msrv
+
+      - name: Install Linux GUI deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - run: npm ci
+
+      - name: Build frontend
+        # Needed even for `cargo check` because tauri::generate_context!()
+        # validates the frontendDist path at compile time.
+        run: npm run build
+
+      - name: Rust check (lib + tests) on MSRV
+        working-directory: src-tauri
+        run: cargo check --lib --tests --locked
