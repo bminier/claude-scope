@@ -61,8 +61,9 @@ jobs:
   msrv:
     # Validates the MSRV declared in src-tauri/Cargo.toml (rust-version).
     # The main matrix runs on stable so it also catches upstream regressions;
-    # this job proves we haven't accidentally leaned on a post-1.77 API.
-    name: msrv (1.77)
+    # this job proves we haven't accidentally leaned on a post-MSRV API.
+    # 1.85 is the floor imposed by Tauri 2.10's transitive deps (edition2024).
+    name: msrv (1.85)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -72,7 +73,7 @@ jobs:
           node-version: "20"
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@1.77.0
+      - uses: dtolnay/rust-toolchain@1.85.0
 
       - uses: Swatinem/rust-cache@v2
         with:
