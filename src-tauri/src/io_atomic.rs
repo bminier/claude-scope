@@ -59,9 +59,15 @@ impl BackupTracker {
         Self::default()
     }
 
-    fn mark(&self, path: &Path) -> bool {
-        let mut guard = self.seen.lock().expect("backup tracker poisoned");
-        guard.insert(path.to_path_buf())
+    fn contains(&self, path: &Path) -> bool {
+        self.seen.lock().expect("backup tracker poisoned").contains(path)
+    }
+
+    fn record(&self, path: &Path) {
+        self.seen
+            .lock()
+            .expect("backup tracker poisoned")
+            .insert(path.to_path_buf());
     }
 }
 
@@ -103,9 +109,17 @@ pub fn save(path: &Path, doc: &SettingsDoc, backups: &BackupTracker) -> Result<(
         .ok_or_else(|| IoError::io(path, std::io::Error::other("path has no parent")))?;
     fs::create_dir_all(parent).map_err(|e| IoError::io(parent, e))?;
 
-    if path.exists() && backups.mark(path) {
+    // Back up on the first save of this file this session, but only if no
+    // `.bak` is sitting there already — we don't want to clobber a backup a
+    // previous run left behind. Only mark the path as backed up after the
+    // copy actually succeeds so a transient I/O failure doesn't suppress a
+    // later retry.
+    if path.exists() && !backups.contains(path) {
         let bak = bak_path(path);
-        fs::copy(path, &bak).map_err(|e| IoError::io(&bak, e))?;
+        if !bak.exists() {
+            fs::copy(path, &bak).map_err(|e| IoError::io(&bak, e))?;
+        }
+        backups.record(path);
     }
 
     let mut tmp =
@@ -215,6 +229,26 @@ mod tests {
         save(&path, &doc, &backups).unwrap();
         let bak_mtime2 = std::fs::metadata(&bak).unwrap().modified().unwrap();
         assert_eq!(bak_mtime, bak_mtime2);
+    }
+
+    #[test]
+    fn save_preserves_existing_bak_from_previous_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"permissions":{"allow":["new"]}}"#).unwrap();
+        let bak = path.with_file_name("settings.json.bak");
+        // Pre-existing backup from a prior session.
+        std::fs::write(&bak, r#"{"permissions":{"allow":["preserved"]}}"#).unwrap();
+
+        let backups = BackupTracker::new();
+        let doc = load(&path).unwrap().unwrap();
+        save(&path, &doc, &backups).unwrap();
+
+        let bak_contents = std::fs::read_to_string(&bak).unwrap();
+        assert!(
+            bak_contents.contains("preserved"),
+            "pre-existing .bak must not be clobbered on first save of session, got: {bak_contents}"
+        );
     }
 
     #[test]
