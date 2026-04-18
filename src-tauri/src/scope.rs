@@ -107,8 +107,13 @@ mod tests {
         let nested = tmp.path().join("a").join("b").join("c");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
-        let got = find_project_root(Some(&nested)).unwrap();
-        assert_eq!(got, tmp.path().canonicalize().unwrap_or(tmp.path().to_path_buf()));
+        // Canonicalize both sides so the test isn't flaky on macOS, where the
+        // tempdir lives under /var which resolves to /private/var via a
+        // filesystem-level symlink.
+        let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+        let got = canon(find_project_root(Some(&nested)).unwrap());
+        let want = canon(tmp.path().to_path_buf());
+        assert_eq!(got, want);
     }
 
     #[test]

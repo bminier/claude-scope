@@ -136,7 +136,7 @@ fn detect_indent(text: &str) -> Indent {
             Some('\t') => return Indent::Tab,
             Some(' ') => {
                 let width = 1 + chars.take_while(|c| *c == ' ').count();
-                return Indent::Spaces(width.max(2));
+                return Indent::Spaces(width);
             }
             _ => continue,
         }
