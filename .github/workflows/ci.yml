@@ -57,3 +57,44 @@ jobs:
       - name: Rust unit tests
         working-directory: src-tauri
         run: cargo test --lib --locked
+
+  msrv:
+    # Validates the MSRV declared in src-tauri/Cargo.toml (rust-version).
+    # The main matrix runs on stable so it also catches upstream regressions;
+    # this job proves we haven't accidentally leaned on a post-1.77 API.
+    name: msrv (1.77)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@1.77.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: msrv
+
+      - name: Install Linux GUI deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - run: npm ci
+
+      - name: Build frontend
+        # Needed even for `cargo check` because tauri::generate_context!()
+        # validates the frontendDist path at compile time.
+        run: npm run build
+
+      - name: Rust check (lib + tests) on MSRV
+        working-directory: src-tauri
+        run: cargo check --lib --tests --locked
