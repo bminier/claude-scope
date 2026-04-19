@@ -187,8 +187,17 @@ jobs:
       # (which is `<productName>_<version>_<arch>.<ext>`). Rename it post-upload
       # via the GitHub Releases API so asset names stay consistent and older
       # downloads don't silently mask newer ones in a user's Downloads folder.
-      # No-op if the asset isn't found (forward-compatible with a future
-      # tauri-bundler that adds the version itself).
+      #
+      # Contract:
+      #   * If `<product>_<version>_universal.app.tar.gz` is already on the
+      #     release, exit 0 (idempotent re-run; or a future tauri-bundler
+      #     that produces the versioned name itself).
+      #   * If the unversioned `<product>.app.tar.gz` is on the release,
+      #     rename it.
+      #   * Otherwise retry (for eventual-consistency on the release-list
+      #     endpoint), then fail — consistency is the whole point of this
+      #     step; a silent skip on an unrecognized artifact name would
+      #     defeat it.
       - name: Version-stamp macOS .app.tar.gz
         if: matrix.platform.os == 'macos-latest'
         env:
