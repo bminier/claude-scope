@@ -210,27 +210,47 @@ jobs:
           # Draft releases don't have a git tag yet, so we can't use
           # /releases/tags/<tag>. List all releases and filter by tag_name.
           #
-          # Two subtleties we have to handle:
+          # Three subtleties we have to handle:
           #   * `gh api --paginate` emits one JSON array per page, so we pipe
           #     to `jq --slurp` (rather than `gh api --jq`) to see all pages
           #     as a single stream. Without this, the jq filter runs once per
           #     page and a mismatch on page N followed by a match on page N+1
-          #     would yield a multi-line asset_id that passes the null check.
-          #   * RELEASE_TAG and old_name come from tauri.conf.json — treat them
-          #     as data, not as jq source. Pass via `--arg` so embedded quotes
-          #     or backslashes can't break jq parsing.
-          asset_id=$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
-              | jq -r --slurp \
-                  --arg tag "$RELEASE_TAG" \
-                  --arg name "$old_name" \
-                  '.[][] | select(.tag_name == $tag) | .assets[]? | select(.name == $name) | .id' \
-              | head -n1
-          )
+          #     would yield a multi-line asset_id.
+          #   * Use `limit(1; …)` inside jq to pick the first match. Piping
+          #     to `head -n1` externally works, but `head` closes the pipe
+          #     after one line and jq exits on SIGPIPE — fatal under
+          #     `set -o pipefail`.
+          #   * RELEASE_TAG and old_name come from tauri.conf.json — treat
+          #     them as data, not jq source. Pass via `--arg` so embedded
+          #     quotes/backslashes can't break parsing.
+          #
+          # GitHub's release-listing endpoint has mild eventual-consistency;
+          # tauri-action may finish uploading a few seconds before the list
+          # reflects it. Retry a few times before giving up so a transient
+          # delay can't leave us with an inconsistent release.
+          asset_id=""
+          max_attempts=5
+          sleep_secs=3
+          for attempt in $(seq 1 $max_attempts); do
+            asset_id=$(
+              gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+                | jq -r --slurp \
+                    --arg tag "$RELEASE_TAG" \
+                    --arg name "$old_name" \
+                    'limit(1; .[][] | select(.tag_name == $tag) | .assets[]? | select(.name == $name) | .id)'
+            )
+            if [ -n "$asset_id" ]; then
+              break
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "asset not found yet (attempt ${attempt}/${max_attempts}); waiting ${sleep_secs}s for GitHub's release listing to catch up"
+              sleep "$sleep_secs"
+            fi
+          done
 
           if [ -z "$asset_id" ]; then
-            echo "no asset named ${old_name} found on release ${RELEASE_TAG} — either tauri-bundler changed the name or the upload is still pending. Skipping."
-            exit 0
+            echo "::error::no asset named ${old_name} found on release ${RELEASE_TAG} after ${max_attempts} attempts. tauri-bundler may have changed the artifact name, or the upload itself failed upstream. Refusing to leave the release with an inconsistent asset name."
+            exit 1
           fi
 
           gh api --method PATCH "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
