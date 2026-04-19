@@ -40,6 +40,9 @@ use crate::scope::ScopePaths;
 
 const DEBOUNCE_MS: u64 = 200;
 const SELF_WRITE_GRACE_MS: u64 = 500;
+/// Minimum gap between `watcher-error` emissions. A broken watcher would
+/// otherwise fire one per debounced batch and flood the devtools console.
+const ERROR_EMIT_COOLDOWN_MS: u64 = 5_000;
 
 /// Tauri-managed state. `WatchState::default()` is a no-op watcher; call
 /// `install` to wire up actual paths.
@@ -102,23 +105,57 @@ impl WatchState {
             return Ok(());
         }
 
+        // Store both raw and canonicalized forms of each match path. On
+        // platforms with symlinked parents (macOS `/var` -> `/private/var`)
+        // notify can report either spelling, so a straight PathBuf equality
+        // check against a set of just-raw paths would miss legit events.
+        let match_paths_for_cb: HashSet<PathBuf> = plan
+            .match_paths
+            .iter()
+            .flat_map(|p| {
+                let mut forms = vec![p.clone()];
+                if let Ok(canon) = std::fs::canonicalize(p) {
+                    if canon != *p {
+                        forms.push(canon);
+                    }
+                }
+                forms
+            })
+            .collect();
+
         let last_self_write = Arc::clone(&self.last_self_write);
         let app_for_cb = app.clone();
-        let match_paths_for_cb = plan.match_paths;
+        // Cooldown guard against flooding the frontend with `watcher-error`
+        // notifications if notify enters a persistent error state. The
+        // debouncer itself caps event batches; this caps batched errors.
+        let last_error_emit: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let mut debouncer = new_debouncer(
             Duration::from_millis(DEBOUNCE_MS),
             move |res: DebounceEventResult| {
                 let events = match res {
                     Ok(evs) => evs,
-                    Err(_) => return, // Best-effort: swallow notify errors.
+                    Err(err) => {
+                        emit_watcher_error_rate_limited(&app_for_cb, &last_error_emit, &err);
+                        return;
+                    }
                 };
                 // Exact-path filter. match_paths is precomputed from the
                 // resolved scope paths (plus any expected-but-missing
-                // `.claude/` dirs), so unrelated `settings.json` files
-                // elsewhere in the tree can't fire a spurious reload.
-                let interesting = events
-                    .iter()
-                    .any(|ev| match_paths_for_cb.contains(&ev.path));
+                // `.claude/` dirs), with both raw and canonical forms
+                // inserted, so unrelated `settings.json` files elsewhere
+                // in the tree can't fire a spurious reload.
+                let interesting = events.iter().any(|ev| {
+                    if match_paths_for_cb.contains(&ev.path) {
+                        return true;
+                    }
+                    // Fallback: canonicalize the incoming event path and
+                    // check again. Handles the inverse of the install-time
+                    // canonicalization (raw-in-match-set, canonical event)
+                    // and any other late-resolving symlink cases.
+                    std::fs::canonicalize(&ev.path)
+                        .map(|c| match_paths_for_cb.contains(&c))
+                        .unwrap_or(false)
+                });
                 if !interesting {
                     return;
                 }
@@ -198,6 +235,22 @@ fn compute_watch_plan(paths: &ScopePaths) -> WatchPlan {
         }
     }
     plan
+}
+
+fn emit_watcher_error_rate_limited(
+    app: &AppHandle,
+    cooldown: &Arc<Mutex<Option<Instant>>>,
+    error: &notify_debouncer_mini::notify::Error,
+) {
+    let mut guard = cooldown.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if let Some(last) = *guard {
+        if now.duration_since(last) < Duration::from_millis(ERROR_EMIT_COOLDOWN_MS) {
+            return;
+        }
+    }
+    *guard = Some(now);
+    let _ = app.emit("watcher-error", error.to_string());
 }
 
 fn recent_self_write(slot: &Arc<Mutex<Instant>>) -> bool {
