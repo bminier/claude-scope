@@ -25,18 +25,26 @@ async function load(projectDir: string | null): Promise<void> {
   }
 }
 
+// Guards against a second move flow starting while one is still running
+// (e.g. double-click on a button), and against pickProject/load swapping
+// state.projectDir mid-move (which would let apply_move target the original
+// dir while the UI reloads to a new one). Lives outside `state` because
+// flipping it must NOT trigger a re-render — re-rendering would destroy the
+// trigger button confirmMove() needs alive for focus restoration.
+let moveInFlight = false;
+
 async function pickProject(): Promise<void> {
+  if (moveInFlight) return;
   const picked = await openDialog({ directory: true, multiple: false });
   if (typeof picked === "string") {
     await load(picked);
   }
 }
 
-// Guards against a second move flow starting while one is still running
-// (e.g. double-click on a button). Lives outside `state` because flipping it
-// must NOT trigger a re-render — re-rendering would destroy the trigger
-// button confirmMove() needs alive for focus restoration.
-let moveInFlight = false;
+async function reload(): Promise<void> {
+  if (moveInFlight) return;
+  await load(state.projectDir);
+}
 
 async function moveRule(req: MoveRequest, trigger?: HTMLElement): Promise<void> {
   if (moveInFlight) return;
@@ -82,7 +90,7 @@ function render(): void {
     projectDir: state.projectDir,
     busy: state.busy,
     onPickProject: pickProject,
-    onReload: () => load(state.projectDir),
+    onReload: reload,
     onMove: moveRule,
   });
 }
