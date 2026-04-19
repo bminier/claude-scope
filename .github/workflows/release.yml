@@ -181,3 +181,42 @@ jobs:
           releaseDraft: true
           prerelease: ${{ needs.setup.outputs.prerelease == 'true' }}
           args: ${{ matrix.platform.args }}
+
+      # tauri-bundler names the macOS app-tarball as `<productName>.app.tar.gz`
+      # with no version component, unlike every other artifact in the drop
+      # (which is `<productName>_<version>_<arch>.<ext>`). Rename it post-upload
+      # via the GitHub Releases API so asset names stay consistent and older
+      # downloads don't silently mask newer ones in a user's Downloads folder.
+      # No-op if the asset isn't found (forward-compatible with a future
+      # tauri-bundler that adds the version itself).
+      - name: Version-stamp macOS .app.tar.gz
+        if: matrix.platform.os == 'macos-latest'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          product=$(node -p "require('./src-tauri/tauri.conf.json').productName")
+          old_name="${product}.app.tar.gz"
+          new_name="${product}_${version}_universal.app.tar.gz"
+
+          if [ "$old_name" = "$new_name" ]; then
+            echo "old and new names match — nothing to rename"
+            exit 0
+          fi
+
+          # Draft releases don't have a git tag yet, so we can't use
+          # /releases/tags/<tag>. List all releases and filter by tag_name.
+          asset_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq "[.[] | select(.tag_name == \"${RELEASE_TAG}\") | .assets[]? | select(.name == \"${old_name}\") | .id] | .[0]")
+
+          if [ -z "$asset_id" ] || [ "$asset_id" = "null" ]; then
+            echo "no asset named ${old_name} found on release ${RELEASE_TAG} — either tauri-bundler changed the name or the upload is still pending. Skipping."
+            exit 0
+          fi
+
+          gh api --method PATCH "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+            -f "name=${new_name}"
+          echo "renamed ${old_name} → ${new_name}"
