@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Existing tag to build (e.g. v0.1.0). Leave blank for a disposable "nightly-<short-sha>" draft.'
+        description: 'Existing tag to build (e.g. v0.1.0). Leave blank for a disposable "nightly-<full-sha>" draft pre-release.'
         required: false
         default: ""
 

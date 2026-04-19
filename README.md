@@ -174,7 +174,7 @@ Signing would require a Windows code-signing certificate and/or an Apple Develop
 
 The release workflow is also wired up for `workflow_dispatch` — useful for rebuilding an existing tag or testing workflow changes before cutting a real release. From the Actions UI, click **Run workflow** on the Release workflow and pick a branch:
 
-- **Leave `tag_name` blank** → the workflow builds off the dispatched branch's HEAD, generates a `nightly-<short-sha>` tag, and creates a draft pre-release titled `ClaudeScope nightly-<short-sha>`. Delete the draft when you're done.
+- **Leave `tag_name` blank** → the workflow builds off the dispatched branch's HEAD, generates a `nightly-<full-sha>` tag (full 40-char commit SHA, so two nightlies on the same commit share a draft but different commits never collide), and creates a draft pre-release titled `ClaudeScope nightly-<full-sha>`. Delete the draft when you're done.
 - **Set `tag_name` to an existing tag** (e.g. `v0.1.0`) → the workflow checks out that exact tag and rebuilds its draft release. Useful for re-uploading artifacts if a platform job was flaky.
 
 ## License
