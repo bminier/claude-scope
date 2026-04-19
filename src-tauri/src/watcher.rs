@@ -340,12 +340,18 @@ mod tests {
         .join();
         assert!(state.last_self_write.is_poisoned());
 
+        // Bracket the call with wall-clock reads and assert the stored
+        // timestamp sits inside [before, after]. Avoids a tight freshness
+        // threshold that can flake when CI deschedules this thread.
+        let before = Instant::now();
         state.note_self_write();
+        let after = Instant::now();
 
         let ts = state
             .last_self_write
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert!(Instant::now().duration_since(*ts) < Duration::from_millis(200));
+        assert!(*ts >= before);
+        assert!(*ts <= after);
     }
 }
