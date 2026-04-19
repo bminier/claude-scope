@@ -4,10 +4,16 @@ import "./styles.css";
 import { confirmMove, renderApp } from "./ui.ts";
 import type { LoadedScopes, MovePreview, MoveRequest } from "./types.ts";
 
-const state: { scopes: LoadedScopes | null; projectDir: string | null; busy: boolean } = {
+const state: {
+  scopes: LoadedScopes | null;
+  projectDir: string | null;
+  busy: boolean;
+  query: string;
+} = {
   scopes: null,
   projectDir: null,
   busy: false,
+  query: "",
 };
 
 async function load(projectDir: string | null): Promise<void> {
@@ -83,6 +89,12 @@ async function moveRule(req: MoveRequest, trigger?: HTMLElement): Promise<void> 
   }
 }
 
+function setQuery(next: string): void {
+  if (state.query === next) return;
+  state.query = next;
+  render();
+}
+
 function render(): void {
   const root = document.getElementById("app");
   if (!root) return;
@@ -90,10 +102,34 @@ function render(): void {
     scopes: state.scopes,
     projectDir: state.projectDir,
     busy: state.busy,
+    query: state.query,
     onPickProject: pickProject,
     onReload: reload,
     onMove: moveRule,
+    onQueryChange: setQuery,
   });
 }
+
+// Pressing "/" anywhere focuses the rule-search input, GitHub / Gmail style —
+// but skip when the user is already typing in a text field or interacting
+// with a modal, so we don't steal their keystroke.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "/" || e.ctrlKey || e.metaKey || e.altKey) return;
+  const target = e.target as HTMLElement | null;
+  if (
+    target &&
+    (target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.isContentEditable)
+  ) {
+    return;
+  }
+  if (document.querySelector(".modal-backdrop")) return;
+  const search = document.getElementById("rule-search") as HTMLInputElement | null;
+  if (!search) return;
+  e.preventDefault();
+  search.focus();
+  search.select();
+});
 
 load(null);
