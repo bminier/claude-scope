@@ -52,13 +52,15 @@ jobs:
               echo "prerelease=false" >> "$GITHUB_OUTPUT"
             else
               # No input — build a disposable nightly off the dispatched
-              # branch. Draft release lives at `nightly-<short-sha>` so
-              # re-running on the same commit updates the same draft, and
-              # different commits get different drafts you can delete
-              # without colliding.
+              # commit. Checkout the immutable SHA (not the branch name) so
+              # all matrix legs build the exact same tree even if new
+              # commits land on the branch mid-run. Draft release lives at
+              # `nightly-<short-sha>` — re-running on the same commit
+              # updates the same draft; different commits get different
+              # drafts that can be deleted without colliding.
               short_sha=$(echo "$SHA" | cut -c1-7)
               echo "release_tag=nightly-$short_sha" >> "$GITHUB_OUTPUT"
-              echo "checkout_ref=$REF_NAME" >> "$GITHUB_OUTPUT"
+              echo "checkout_ref=$SHA" >> "$GITHUB_OUTPUT"
               echo "prerelease=true" >> "$GITHUB_OUTPUT"
             fi
           else
@@ -142,8 +144,10 @@ jobs:
 
       # tauri-action runs `beforeBuildCommand` (which is `npm run build`)
       # before invoking `tauri build`, so the frontend dist/ is produced
-      # as part of the same step.
-      - uses: tauri-apps/tauri-action@v0
+      # as part of the same step. Pinned to a specific version rather than
+      # `@v0` so rebuilds of an older tag don't silently pick up
+      # behavior/bundler changes from a newer action release.
+      - uses: tauri-apps/tauri-action@v0.5.22
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -155,10 +159,10 @@ jobs:
           releaseBody: |
             Binaries are attached below.
 
-            Release notes can be edited here before publishing — compare
-            against the previous tag at
-            https://github.com/${{ github.repository }}/compare for the
-            full diff.
+            Release notes can be edited here before publishing — use the
+            Compare view at
+            https://github.com/${{ github.repository }}/compare to diff
+            this release against the previous tag.
 
             ⚠️ Builds are currently **unsigned**. On first launch you'll see:
             - **Windows**: a SmartScreen warning — click "More info" → "Run anyway".
