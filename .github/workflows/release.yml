@@ -185,22 +185,27 @@ jobs:
           prerelease: ${{ needs.setup.outputs.prerelease == 'true' }}
           args: ${{ matrix.platform.args }}
 
-      # tauri-bundler names the macOS app-tarball as `<productName>.app.tar.gz`
-      # with no version component, unlike every other artifact in the drop
-      # (which is `<productName>_<version>_<arch>.<ext>`). Rename it post-upload
-      # via the GitHub Releases API so asset names stay consistent and older
-      # downloads don't silently mask newer ones in a user's Downloads folder.
+      # tauri-bundler writes the macOS app-tarball to disk as
+      # `<productName>.app.tar.gz` (no version component), unlike every other
+      # artifact we ship (which is `<productName>_<version>_<arch>.<ext>`).
+      # Then `tauri-action` renames on upload:
+      #   * 0.5.x: uploads as `<productName>.app.tar.gz` unchanged.
+      #   * 0.6.x: uploads as `<productName>_universal.app.tar.gz`.
+      # Neither version includes the release version in the filename.
+      # Rename post-upload via the Releases API so the name stays consistent
+      # with the rest of the drop and older downloads don't silently mask
+      # newer ones in a user's Downloads folder.
       #
-      # Contract:
-      #   * If `<product>_<version>_universal.app.tar.gz` is already on the
-      #     release, exit 0 (idempotent re-run; or a future tauri-bundler
-      #     that produces the versioned name itself).
-      #   * If the unversioned `<product>.app.tar.gz` is on the release,
-      #     rename it.
-      #   * Otherwise retry (for eventual-consistency on the release-list
-      #     endpoint), then fail — consistency is the whole point of this
-      #     step; a silent skip on an unrecognized artifact name would
-      #     defeat it.
+      # Contract (in priority order):
+      #   1. If `<product>_<version>_universal.app.tar.gz` is already on the
+      #      release, exit 0 (idempotent re-run; or a future tauri-action
+      #      that produces the versioned name itself).
+      #   2. Otherwise look for any asset named `<product>…app.tar.gz` —
+      #      covers the two known on-wire shapes above and any reasonable
+      #      variant a future tauri-action might pick. PATCH it.
+      #   3. Otherwise retry (eventual-consistency on the release-list
+      #      endpoint), then fail — a silent skip on an unrecognized name
+      #      would defeat the whole point of the step.
       - name: Version-stamp macOS .app.tar.gz
         if: matrix.platform.os == 'macos-latest'
         env:
@@ -211,44 +216,25 @@ jobs:
 
           version=$(node -p "require('./src-tauri/tauri.conf.json').version")
           product=$(node -p "require('./src-tauri/tauri.conf.json').productName")
-          old_name="${product}.app.tar.gz"
           new_name="${product}_${version}_universal.app.tar.gz"
-
-          if [ "$old_name" = "$new_name" ]; then
-            echo "old and new names match — nothing to rename"
-            exit 0
-          fi
 
           # Draft releases don't have a git tag yet, so we can't use
           # /releases/tags/<tag>. List all releases and filter by tag_name.
           #
-          # Three subtleties we have to handle:
-          #   * `gh api --paginate` emits one JSON array per page, so we pipe
-          #     to `jq --slurp` (rather than `gh api --jq`) to see all pages
-          #     as a single stream. Without this, the jq filter runs once per
-          #     page and a mismatch on page N followed by a match on page N+1
-          #     would yield a multi-line asset_id.
-          #   * Use `limit(1; …)` inside jq to pick the first match. Piping
-          #     to `head -n1` externally works, but `head` closes the pipe
-          #     after one line and jq exits on SIGPIPE — fatal under
-          #     `set -o pipefail`.
-          #   * RELEASE_TAG / old_name / new_name come from tauri.conf.json —
-          #     treat them as data, not jq source. Pass via `--arg` so
-          #     embedded quotes/backslashes can't break parsing.
-          #
-          # Behavior, in priority order:
-          #   1. If `new_name` already exists on the release, the rename is
-          #      already done — either an idempotent re-run of this step on
-          #      the same draft, or a future tauri-bundler that started
-          #      producing the right name itself. Success, nothing to do.
-          #   2. Otherwise look for `old_name` and PATCH it. Retry a few
-          #      times so GitHub's release-listing eventual consistency
-          #      after upload doesn't cause a spurious miss.
-          #   3. If neither name ever shows up, fail the step — producing an
-          #      inconsistent release is worse than a visible CI failure.
+          # Three subtleties:
+          #   * `gh api --paginate` emits one JSON array per page; pipe to
+          #     `jq --slurp` so the filter sees every page as a single
+          #     stream (otherwise a match on page N+1 after a miss on
+          #     page N would produce a multi-line asset_id).
+          #   * `limit(1; …)` inside jq picks the first match without a
+          #     SIGPIPE race (`jq | head -n1` would die under pipefail).
+          #   * RELEASE_TAG / product / new_name come from tauri.conf.json —
+          #     pass via `--arg` so embedded quotes/backslashes can't break
+          #     jq parsing.
           max_attempts=5
           sleep_secs=3
           asset_id=""
+          matched_name=""
           for attempt in $(seq 1 $max_attempts); do
             assets_json=$(
               gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
@@ -263,23 +249,35 @@ jobs:
               exit 0
             fi
 
-            asset_id=$(echo "$assets_json" | jq -r --arg name "$old_name" \
-              'limit(1; .[] | select(.name == $name) | .id)')
-            if [ -n "$asset_id" ]; then
+            # Any asset whose name starts with the product name and ends in
+            # `.app.tar.gz` is our target. Covers `ClaudeScope.app.tar.gz`
+            # (tauri-action 0.5), `ClaudeScope_universal.app.tar.gz`
+            # (tauri-action 0.6), and any mildly different shape a newer
+            # release might pick — but excludes `new_name` itself, which
+            # the idempotency check above already settled.
+            #
+            # Using `find(...) // empty` both picks the first match and
+            # yields no output on miss, so shell sees empty — no `null`
+            # string leak.
+            match=$(echo "$assets_json" | jq -c --arg product "$product" \
+              'first(.[] | select(.name | startswith($product) and endswith(".app.tar.gz"))) // empty')
+            if [ -n "$match" ]; then
+              asset_id=$(echo "$match" | jq -r '.id')
+              matched_name=$(echo "$match" | jq -r '.name')
               break
             fi
 
             if [ "$attempt" -lt "$max_attempts" ]; then
-              echo "neither ${old_name} nor ${new_name} found yet (attempt ${attempt}/${max_attempts}); waiting ${sleep_secs}s for GitHub's release listing to catch up"
+              echo "no asset matching ${product}*.app.tar.gz found yet (attempt ${attempt}/${max_attempts}); waiting ${sleep_secs}s for GitHub's release listing to catch up"
               sleep "$sleep_secs"
             fi
           done
 
           if [ -z "$asset_id" ]; then
-            echo "::error::neither ${old_name} nor ${new_name} found on release ${RELEASE_TAG} after ${max_attempts} attempts. tauri-bundler produced an unexpected name, or the upload failed. Not leaving the release with an inconsistent asset set."
+            echo "::error::no asset matching ${product}*.app.tar.gz found on release ${RELEASE_TAG} after ${max_attempts} attempts. tauri-bundler/tauri-action produced an unexpected name, or the upload failed. Not leaving the release with an inconsistent asset set."
             exit 1
           fi
 
           gh api --method PATCH "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
             -f "name=${new_name}"
-          echo "renamed ${old_name} → ${new_name}"
+          echo "renamed ${matched_name} → ${new_name}"
