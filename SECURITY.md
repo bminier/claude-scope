@@ -24,7 +24,7 @@ ClaudeScope is pre-1.0. Only the most recent tagged release gets security fixes 
 These checks run on every push to `dev` and every PR against it (see [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)):
 
 - **`cargo-audit`** — gates on advisories in the [RustSec advisory DB](https://rustsec.org) for any Rust dep in `src-tauri/Cargo.lock`
-- **`npm audit --audit-level=high`** — gates on high+ severity vulnerabilities in the npm tree
+- **`npm audit --package-lock-only --audit-level=high`** — gates on high+ severity vulnerabilities in the npm tree, reading `package-lock.json` directly (no `node_modules` install, no lifecycle scripts)
 - **`detect-private-key`** pre-commit hook — rejects commits containing common private-key headers
 - **Dependabot** — opens weekly grouped PRs for Cargo, npm, and GitHub Actions minor/patch bumps so known-patched vulns don't linger
 

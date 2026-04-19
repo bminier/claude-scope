@@ -133,7 +133,7 @@ Every push to `dev` and every PR against `dev` runs four jobs in parallel, produ
 - `build` — a matrix job across `ubuntu-24.04`, `windows-latest`, `macos-latest`. Each runs `npm ci`, `tsc --noEmit`, `vite build`, `cargo test --lib --locked`.
 - `msrv (1.88)` — validates the declared MSRV via `cargo check --lib --tests --locked` on Rust 1.88.0
 - `lint` — runs `pre-commit/action@v3` (Biome, rustfmt, clippy, hygiene hooks)
-- `security` — `rustsec/audit-check` against the RustSec advisory DB + `npm audit --audit-level=high`
+- `security` — `rustsec/audit-check` against the RustSec advisory DB + `npm audit --package-lock-only --audit-level=high` (reads the lockfile directly; no `node_modules` install, no lifecycle scripts)
 
 ## Automated dependency updates
 
