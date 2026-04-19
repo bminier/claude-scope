@@ -220,36 +220,51 @@ jobs:
           #     to `head -n1` externally works, but `head` closes the pipe
           #     after one line and jq exits on SIGPIPE — fatal under
           #     `set -o pipefail`.
-          #   * RELEASE_TAG and old_name come from tauri.conf.json — treat
-          #     them as data, not jq source. Pass via `--arg` so embedded
-          #     quotes/backslashes can't break parsing.
+          #   * RELEASE_TAG / old_name / new_name come from tauri.conf.json —
+          #     treat them as data, not jq source. Pass via `--arg` so
+          #     embedded quotes/backslashes can't break parsing.
           #
-          # GitHub's release-listing endpoint has mild eventual-consistency;
-          # tauri-action may finish uploading a few seconds before the list
-          # reflects it. Retry a few times before giving up so a transient
-          # delay can't leave us with an inconsistent release.
-          asset_id=""
+          # Behavior, in priority order:
+          #   1. If `new_name` already exists on the release, the rename is
+          #      already done — either an idempotent re-run of this step on
+          #      the same draft, or a future tauri-bundler that started
+          #      producing the right name itself. Success, nothing to do.
+          #   2. Otherwise look for `old_name` and PATCH it. Retry a few
+          #      times so GitHub's release-listing eventual consistency
+          #      after upload doesn't cause a spurious miss.
+          #   3. If neither name ever shows up, fail the step — producing an
+          #      inconsistent release is worse than a visible CI failure.
           max_attempts=5
           sleep_secs=3
+          asset_id=""
           for attempt in $(seq 1 $max_attempts); do
-            asset_id=$(
+            assets_json=$(
               gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
-                | jq -r --slurp \
-                    --arg tag "$RELEASE_TAG" \
-                    --arg name "$old_name" \
-                    'limit(1; .[][] | select(.tag_name == $tag) | .assets[]? | select(.name == $name) | .id)'
+                | jq --slurp --arg tag "$RELEASE_TAG" \
+                    '[.[][] | select(.tag_name == $tag) | .assets[]?]'
             )
+
+            has_new=$(echo "$assets_json" | jq -r --arg name "$new_name" \
+              'any(.[]; .name == $name)')
+            if [ "$has_new" = "true" ]; then
+              echo "asset ${new_name} already present — nothing to rename (idempotent re-run or upstream rename)"
+              exit 0
+            fi
+
+            asset_id=$(echo "$assets_json" | jq -r --arg name "$old_name" \
+              'limit(1; .[] | select(.name == $name) | .id)')
             if [ -n "$asset_id" ]; then
               break
             fi
+
             if [ "$attempt" -lt "$max_attempts" ]; then
-              echo "asset not found yet (attempt ${attempt}/${max_attempts}); waiting ${sleep_secs}s for GitHub's release listing to catch up"
+              echo "neither ${old_name} nor ${new_name} found yet (attempt ${attempt}/${max_attempts}); waiting ${sleep_secs}s for GitHub's release listing to catch up"
               sleep "$sleep_secs"
             fi
           done
 
           if [ -z "$asset_id" ]; then
-            echo "::error::no asset named ${old_name} found on release ${RELEASE_TAG} after ${max_attempts} attempts. tauri-bundler may have changed the artifact name, or the upload itself failed upstream. Refusing to leave the release with an inconsistent asset name."
+            echo "::error::neither ${old_name} nor ${new_name} found on release ${RELEASE_TAG} after ${max_attempts} attempts. tauri-bundler produced an unexpected name, or the upload failed. Not leaving the release with an inconsistent asset set."
             exit 1
           fi
 
