@@ -32,14 +32,25 @@ async function pickProject(): Promise<void> {
   }
 }
 
-async function moveRule(req: MoveRequest): Promise<void> {
+async function moveRule(req: MoveRequest, trigger?: HTMLElement): Promise<void> {
   const projectDir = state.projectDir;
+  // Intentionally *don't* flip busy/re-render before diff_move: it's fast,
+  // the modal itself blocks interaction once open, and keeping the triggering
+  // button alive lets confirmMove restore focus to it on Cancel/Esc.
+  let preview: MovePreview;
+  try {
+    preview = await invoke<MovePreview>("diff_move", { req, project_dir: projectDir });
+  } catch (err) {
+    alert(`Move failed: ${err}`);
+    return;
+  }
+
+  const apply = await confirmMove(preview, trigger);
+  if (!apply) return;
+
   state.busy = true;
   render();
   try {
-    const preview = await invoke<MovePreview>("diff_move", { req, project_dir: projectDir });
-    const apply = await confirmMove(preview);
-    if (!apply) return;
     await invoke("apply_move", { req, project_dir: projectDir });
     await load(projectDir);
   } catch (err) {
