@@ -65,6 +65,16 @@ body {
   border-color: var(--accent);
 }
 
+/* Keyboard users get a stronger, theme-independent ring so focus stays
+   visible even where the border-color shift alone washes out (e.g. high
+   contrast modes). Mouse users still fall back to the quieter :focus. */
+.search-input:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px rgba(122, 162, 247, 0.25);
+}
+
 .search-input:disabled {
   opacity: 0.5;
   cursor: not-allowed;

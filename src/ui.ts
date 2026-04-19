@@ -7,7 +7,7 @@ import type {
   Scope,
   ScopeView,
 } from "./types.ts";
-import { SCOPES } from "./types.ts";
+import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
 
 interface AppProps {
   scopes: LoadedScopes | null;
@@ -45,7 +45,7 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   // after we rebuild — otherwise focus jumps to body on every keystroke and
   // the input becomes unusable.
   const active = document.activeElement;
-  const preserveSearchFocus = active instanceof HTMLInputElement && active.id === "rule-search";
+  const preserveSearchFocus = active instanceof HTMLInputElement && active.id === SEARCH_INPUT_ID;
   const caret =
     preserveSearchFocus
       ? { start: active.selectionStart, end: active.selectionEnd }
@@ -76,7 +76,7 @@ function restoreSearchFocus(
   caret: { start: number | null; end: number | null } | null,
 ): void {
   if (!shouldRestore) return;
-  const input = document.getElementById("rule-search") as HTMLInputElement | null;
+  const input = document.getElementById(SEARCH_INPUT_ID) as HTMLInputElement | null;
   if (!input) return;
   input.focus();
   if (caret && caret.start !== null && caret.end !== null) {
@@ -131,7 +131,7 @@ function searchBox(props: AppProps): HTMLElement {
   const input = document.createElement("input");
   input.type = "search";
   input.className = "search-input";
-  input.id = "rule-search";
+  input.id = SEARCH_INPUT_ID;
   input.placeholder = "Filter rules…  (press / to focus)";
   input.value = props.query;
   input.setAttribute("aria-label", "Filter permission rules across scopes");

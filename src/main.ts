@@ -3,6 +3,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 import { confirmMove, renderApp } from "./ui.ts";
 import type { LoadedScopes, MovePreview, MoveRequest } from "./types.ts";
+import { SEARCH_INPUT_ID } from "./types.ts";
 
 const state: {
   scopes: LoadedScopes | null;
@@ -133,7 +134,7 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (document.querySelector(".modal-backdrop")) return;
-  const search = document.getElementById("rule-search") as HTMLInputElement | null;
+  const search = document.getElementById(SEARCH_INPUT_ID) as HTMLInputElement | null;
   // Don't swallow the keystroke if the input is missing or currently
   // disabled (e.g. before any project has loaded).
   if (!search || search.disabled) return;

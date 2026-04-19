@@ -48,3 +48,10 @@ export interface MovePreview {
   from: MoveSide;
   to: MoveSide;
 }
+
+/**
+ * DOM id of the global rule-filter input. Exported as a single source of
+ * truth because both the render path (ui.ts sets it) and the keyboard
+ * shortcut (main.ts looks it up) need to agree.
+ */
+export const SEARCH_INPUT_ID = "rule-search";
