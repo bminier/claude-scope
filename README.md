@@ -128,15 +128,20 @@ npm run tauri build
 
 ## CI
 
-Every push to `dev` and every PR against `dev` runs three jobs in parallel, producing five check runs total:
+Every push to `dev` and every PR against `dev` runs four jobs in parallel, producing six check runs total:
 
 - `build` — a matrix job across `ubuntu-24.04`, `windows-latest`, `macos-latest`. Each runs `npm ci`, `tsc --noEmit`, `vite build`, `cargo test --lib --locked`.
 - `msrv (1.88)` — validates the declared MSRV via `cargo check --lib --tests --locked` on Rust 1.88.0
 - `lint` — runs `pre-commit/action@v3` (Biome, rustfmt, clippy, hygiene hooks)
+- `security` — `rustsec/audit-check` against the RustSec advisory DB + `npm audit --audit-level=high`
 
 ## Automated dependency updates
 
 [Dependabot](./.github/dependabot.yml) opens weekly grouped PRs for Cargo, npm, and GitHub Actions minor/patch bumps. Major bumps land as separate PRs.
+
+## Reporting security issues
+
+Please use [GitHub Private Vulnerability Reporting](https://github.com/bminier/claude-scope/security/advisories/new) — see [`SECURITY.md`](./SECURITY.md) for details.
 
 ## Releasing
 

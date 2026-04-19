@@ -150,3 +150,37 @@ jobs:
         run: npm run build
 
       - uses: pre-commit/action@v3.0.1
+
+  security:
+    # Gate on known-CVE deps in both ecosystems. Runs in parallel with
+    # build/msrv/lint — a fresh advisory on yesterday's working tree is a
+    # real signal we should act on, so we want it loud and fast.
+    # Per SECURITY.md: cargo-audit covers the Rust side, npm audit covers
+    # the JS side. Severity threshold for npm is `high`; anything moderate
+    # surfaces as a warning at `npm install` time but doesn't block the
+    # pipeline.
+    name: security
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      # rustsec/audit-check@v2 wraps cargo-audit with a self-updating copy
+      # of the RustSec advisory DB. It runs against src-tauri/Cargo.lock by
+      # default so no --manifest-path is needed.
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Don't need a full `npm ci` (no build step) — just enough to resolve
+      # the tree so `npm audit` has something to work with. `npm audit`
+      # reads package-lock.json directly without needing node_modules, but
+      # a clean-room install confirms the lockfile is self-consistent too.
+      - run: npm ci
+
+      - name: npm audit
+        run: npm audit --audit-level=high
