@@ -170,7 +170,12 @@ v0.1 releases are **unsigned**. That means:
 
 Signing would require a Windows code-signing certificate and/or an Apple Developer ID + notarization. Planned, but out of scope until there's demand.
 
-You can also kick off a dry-run release from the Actions UI via **Run workflow** — it'll produce a draft release you can delete afterwards.
+### Manual dispatch
+
+The release workflow is also wired up for `workflow_dispatch` — useful for rebuilding an existing tag or testing workflow changes before cutting a real release. From the Actions UI, click **Run workflow** on the Release workflow and pick a branch:
+
+- **Leave `tag_name` blank** → the workflow builds off the dispatched branch's HEAD and publishes to a draft release named `nightly-<short-sha>` marked as a pre-release. Delete the draft when you're done.
+- **Set `tag_name` to an existing tag** (e.g. `v0.1.0`) → the workflow checks out that exact tag and rebuilds its draft release. Useful for re-uploading artifacts if a platform job was flaky.
 
 ## License
 

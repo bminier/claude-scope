@@ -4,13 +4,10 @@ on:
   push:
     tags:
       - "v*.*.*"
-  # Manual dispatch for dry-runs / testing the workflow itself without
-  # cutting a tag. The dispatch run still produces a draft release, which
-  # the maintainer can delete if it was just a test.
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name to build (e.g. v0.1.0). Leave blank for "nightly-<sha>".'
+        description: 'Existing tag to build (e.g. v0.1.0). Leave blank for a disposable "nightly-<short-sha>" draft.'
         required: false
         default: ""
 
@@ -26,7 +23,53 @@ permissions:
   contents: write
 
 jobs:
+  # Resolve what tag to publish under and what ref to check out, so every
+  # matrix leg in `release` builds from the same commit and uploads to the
+  # same draft release. On tag push both are just the tag. On
+  # workflow_dispatch, an input tag wins; otherwise we synthesize a
+  # disposable `nightly-<short-sha>` draft off the dispatched branch.
+  setup:
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.compute.outputs.release_tag }}
+      checkout_ref: ${{ steps.compute.outputs.checkout_ref }}
+      prerelease: ${{ steps.compute.outputs.prerelease }}
+    steps:
+      - id: compute
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag_name }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -n "$INPUT_TAG" ]; then
+              # Maintainer explicitly named a tag to rebuild — check that ref
+              # out and publish under that exact name.
+              echo "release_tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+              echo "checkout_ref=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+              echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            else
+              # No input — build a disposable nightly off the dispatched
+              # branch. Draft release lives at `nightly-<short-sha>` so
+              # re-running on the same commit updates the same draft, and
+              # different commits get different drafts you can delete
+              # without colliding.
+              short_sha=$(echo "$SHA" | cut -c1-7)
+              echo "release_tag=nightly-$short_sha" >> "$GITHUB_OUTPUT"
+              echo "checkout_ref=$REF_NAME" >> "$GITHUB_OUTPUT"
+              echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # push on a v*.*.* tag
+            echo "release_tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "checkout_ref=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
   release:
+    needs: setup
     name: release (${{ matrix.platform.os }})
     strategy:
       # Don't stop siblings on one-platform failure. If macOS trips but
@@ -35,37 +78,46 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          # `target` is passed to `tauri build --target` so installer
-          # names are architecture-explicit. `args` gets appended to the
-          # build command per-platform.
+          # `target` is passed to `tauri build --target` via `args` so
+          # cargo writes into `target/<triple>/release/` per-platform.
+          # That makes rust-cache keying deterministic across matrix legs
+          # and keeps installer naming architecture-explicit.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            args: ""
+            args: "--target x86_64-unknown-linux-gnu"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            args: ""
+            args: "--target x86_64-pc-windows-msvc"
           - os: macos-latest
             # Universal binary (arm64 + x86_64) in a single .dmg so the
-            # download works on both Apple Silicon and Intel Macs. Tauri
-            # wires this up via `--target universal-apple-darwin`.
+            # download works on both Apple Silicon and Intel Macs.
             target: universal-apple-darwin
             args: "--target universal-apple-darwin"
 
     runs-on: ${{ matrix.platform.os }}
 
     steps:
+      # Pull the exact ref the `setup` job resolved — for tag pushes this is
+      # the tag, for dispatch-with-input this is the named tag, and for
+      # dispatch-without-input this is the dispatched branch HEAD.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.checkout_ref }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pin the release toolchain so rebuilds of the same tag remain
+      # deterministic over time. 1.88.0 matches the declared MSRV (and the
+      # `msrv` / `lint` jobs in ci.yml), so if that MSRV ever bumps we bump
+      # here in lockstep.
+      - uses: dtolnay/rust-toolchain@1.88.0
         with:
           # universal-apple-darwin needs both Mac targets installed so cargo
           # can cross-compile to the other arch from whichever the runner is.
-          targets: ${{ matrix.platform.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.platform.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.platform.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -95,19 +147,23 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # Create (or reuse) a draft release matching this tag. The
-          # maintainer reviews the uploaded artifacts and publishes by
-          # hand from the GitHub UI — no surprise public release if a
-          # build is broken.
-          tagName: ${{ github.event.inputs.tag_name || github.ref_name }}
-          releaseName: "ClaudeScope ${{ github.event.inputs.tag_name || github.ref_name }}"
+          # Create (or reuse) a draft release for the resolved tag. The
+          # maintainer reviews the uploaded artifacts and publishes from
+          # the GitHub UI — no surprise public release if a build is broken.
+          tagName: ${{ needs.setup.outputs.release_tag }}
+          releaseName: "ClaudeScope ${{ needs.setup.outputs.release_tag }}"
           releaseBody: |
-            See CHANGELOG for details. Binaries are attached below.
+            Binaries are attached below.
+
+            Release notes can be edited here before publishing — compare
+            against the previous tag at
+            https://github.com/${{ github.repository }}/compare for the
+            full diff.
 
             ⚠️ Builds are currently **unsigned**. On first launch you'll see:
             - **Windows**: a SmartScreen warning — click "More info" → "Run anyway".
             - **macOS**: a Gatekeeper warning — right-click the app → Open → Open.
             - **Linux**: no warning.
           releaseDraft: true
-          prerelease: false
+          prerelease: ${{ needs.setup.outputs.prerelease == 'true' }}
           args: ${{ matrix.platform.args }}
