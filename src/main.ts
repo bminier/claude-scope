@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 import { confirmMove, renderApp } from "./ui.ts";
@@ -141,6 +142,17 @@ document.addEventListener("keydown", (e) => {
   e.preventDefault();
   search.focus();
   search.select();
+});
+
+// The Rust watcher (`src-tauri/src/watcher.rs`) emits `scopes-changed` when
+// any of the three settings files mutates externally. Reload the data so the
+// UI mirrors what's on disk. Skip while a move is mid-flight: the user is
+// staring at the diff modal and reloading would yank the rules they're
+// inspecting out from under them — and our own writes are suppressed at the
+// watcher level anyway.
+listen("scopes-changed", () => {
+  if (moveInFlight) return;
+  void load(state.projectDir);
 });
 
 load(null);

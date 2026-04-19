@@ -4,10 +4,12 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, State};
 
 use crate::io_atomic::{self, BackupTracker};
 use crate::model::{PermissionKind, PermissionRules, SettingsDoc};
 use crate::scope::{self, Scope, ScopePaths};
+use crate::watcher::WatchState;
 
 /// Process-global backup tracker so we only write one `.bak` per file per
 /// session, regardless of which command triggered the first write.
@@ -69,10 +71,22 @@ pub struct MoveSide {
 }
 
 #[tauri::command]
-pub fn load_scopes(project_dir: Option<String>) -> Result<LoadedScopes, String> {
+pub fn load_scopes(
+    project_dir: Option<String>,
+    app: AppHandle,
+    watch: State<'_, WatchState>,
+) -> Result<LoadedScopes, String> {
     let start = project_dir.as_ref().map(Path::new);
     let paths = scope::resolve(start).map_err(|e| e.to_string())?;
-    build_loaded(&paths).map_err(|e| e.to_string())
+    let loaded = build_loaded(&paths).map_err(|e| e.to_string())?;
+    // (Re)install the watcher every time we load. This handles both first
+    // load and project-switch with no extra command surface area for the
+    // front-end to keep in sync. Watcher errors are non-fatal — auto-reload
+    // is a nice-to-have, the load itself succeeded.
+    if let Err(err) = watch.install(app, &paths) {
+        eprintln!("watcher install failed: {err}");
+    }
+    Ok(loaded)
 }
 
 #[tauri::command]
@@ -83,10 +97,14 @@ pub fn diff_move(req: MoveRequest, project_dir: Option<String>) -> Result<MovePr
 }
 
 #[tauri::command]
-pub fn apply_move(req: MoveRequest, project_dir: Option<String>) -> Result<(), String> {
+pub fn apply_move(
+    req: MoveRequest,
+    project_dir: Option<String>,
+    watch: State<'_, WatchState>,
+) -> Result<(), String> {
     let start = project_dir.as_ref().map(Path::new);
     let paths = scope::resolve(start).map_err(|e| e.to_string())?;
-    apply_move_impl(&paths, &req, backups()).map_err(|e| e.to_string())
+    apply_move_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
 }
 
 fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::Error>> {
@@ -241,6 +259,7 @@ fn apply_move_impl(
     paths: &ScopePaths,
     req: &MoveRequest,
     backups: &BackupTracker,
+    watch: &WatchState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if req.from == req.to {
         return Err("source and destination scopes must differ".into());
@@ -270,13 +289,16 @@ fn apply_move_impl(
     // there's nothing to write there; skipping the save also avoids creating
     // a spurious `.bak` for a file we aren't actually changing.
     if dest_mutated {
+        watch.note_self_write();
         io_atomic::save(&to_path, &to_doc, backups)?;
     }
     // If the source write fails after the destination was updated, roll back
     // the destination so the rule doesn't end up duplicated in both scopes.
+    watch.note_self_write();
     if let Err(source_err) = io_atomic::save(&from_path, &from_doc, backups) {
         if dest_mutated {
             to_doc.remove_rule(req.kind, &req.rule);
+            watch.note_self_write();
             if let Err(rollback_err) = io_atomic::save(&to_path, &to_doc, backups) {
                 return Err(format!(
                     "source save failed: {source_err}; destination rollback also failed: {rollback_err}"
@@ -344,6 +366,7 @@ mod tests {
                 to: Scope::User,
             },
             &backups,
+            &WatchState::default(),
         )
         .unwrap();
 
@@ -473,6 +496,7 @@ mod tests {
                 to: Scope::Local,
             },
             &backups,
+            &WatchState::default(),
         )
         .unwrap();
 
@@ -498,6 +522,7 @@ mod tests {
                 to: Scope::Project,
             },
             &BackupTracker::new(),
+            &WatchState::default(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("must differ"));
@@ -532,6 +557,7 @@ mod tests {
                 to: Scope::User,
             },
             &backups,
+            &WatchState::default(),
         )
         .unwrap();
 
@@ -559,6 +585,7 @@ mod tests {
                 to: Scope::User,
             },
             &BackupTracker::new(),
+            &WatchState::default(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("not found"));
