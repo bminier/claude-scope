@@ -175,7 +175,7 @@ jobs:
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          workingDirectory: src-tauri
+          working-directory: src-tauri
 
       # Don't need a full `npm ci` (no build step) — just enough to resolve
       # the tree so `npm audit` has something to work with. `npm audit`
