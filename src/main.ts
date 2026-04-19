@@ -70,10 +70,11 @@ async function moveRule(req: MoveRequest, trigger?: HTMLElement): Promise<void> 
     render();
     try {
       await invoke("apply_move", { req, project_dir: projectDir });
+      // load() owns busy cleanup + final render on success — don't
+      // duplicate that work in a finally block.
       await load(projectDir);
     } catch (err) {
       alert(`Move failed: ${err}`);
-    } finally {
       state.busy = false;
       render();
     }

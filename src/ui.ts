@@ -367,9 +367,10 @@ function diffSide(side: MoveSide, mode: "add" | "remove", movingRule: string): H
     col.appendChild(note);
   }
 
-  // Render the backend's view of the final list directly so the modal matches
-  // what apply_move will actually write: rules_before on the remove side,
-  // rules_after on the add side.
+  // Remove side shows the pre-move list with the moved rule struck through
+  // (diff context, not the post-write contents — apply_move will actually
+  // persist rules_after there). Add side shows the backend's rules_after so
+  // the dest column mirrors exactly what will be written.
   const rules = mode === "remove" ? side.rules_before : side.rules_after;
   const list = document.createElement("ul");
   list.className = "modal-diff-list";

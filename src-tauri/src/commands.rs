@@ -164,8 +164,18 @@ fn diff_move_impl(
     let from_path = require_path(paths, req.from)?;
     let to_path = require_path(paths, req.to)?;
 
-    // Source side: rule must currently be there; after a move it's gone.
-    let from_doc = io_atomic::load(from_path)?.unwrap_or_else(SettingsDoc::empty);
+    // Source side: file must exist and the rule must currently be there.
+    // Match apply_move_impl's error wording so the preview path doesn't
+    // produce a different message than the one the user would see if they
+    // somehow skipped the preview.
+    let from_doc = match io_atomic::load(from_path)? {
+        Some(d) => d,
+        None => {
+            return Err(
+                format!("source file {} does not exist", from_path.display()).into(),
+            );
+        }
+    };
     let from_before = from_doc.permissions().get(req.kind).to_vec();
     if !from_before.iter().any(|r| r == &req.rule) {
         return Err(format!(
@@ -402,6 +412,24 @@ mod tests {
         assert!(!preview.to.will_write, "dest doesn't need a write when rule already there");
         assert_eq!(preview.to.rules_before, preview.to.rules_after);
         assert!(preview.to.note.as_deref().unwrap().contains("Already present"));
+    }
+
+    #[test]
+    fn diff_move_errors_when_source_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        // Source file intentionally never written.
+        let err = diff_move_impl(
+            &paths,
+            &MoveRequest {
+                rule: "Bash(git status)".into(),
+                kind: PermissionKind::Allow,
+                from: Scope::Project,
+                to: Scope::User,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
     }
 
     #[test]
