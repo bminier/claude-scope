@@ -8,6 +8,7 @@ import type {
   ScopeView,
 } from "./types.ts";
 import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
+import { lintRule } from "./lint.ts";
 
 interface AppProps {
   scopes: LoadedScopes | null;
@@ -200,10 +201,31 @@ function effectivePanel(
       chip.className = "chip";
       chip.textContent = rule;
       group.appendChild(chip);
+      const badge = lintBadge(rule);
+      if (badge) group.appendChild(badge);
     }
     panel.appendChild(group);
   }
   return panel;
+}
+
+/**
+ * Returns a small warning element when the rule fails shape lint, or null
+ * when the rule looks well-formed. The lint is intentionally lenient — we
+ * can't match Claude Code's real parser precisely — so we flag rather than
+ * block.
+ */
+function lintBadge(rule: string): HTMLElement | null {
+  const result = lintRule(rule);
+  if (result.ok) return null;
+  const warn = document.createElement("span");
+  warn.className = "lint-warn";
+  warn.textContent = "⚠";
+  warn.setAttribute("role", "img");
+  const reason = result.reason ?? "Rule shape not recognized.";
+  warn.setAttribute("aria-label", `Rule warning: ${reason}`);
+  warn.title = reason;
+  return warn;
 }
 
 function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
@@ -308,6 +330,9 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
   code.className = "rule-text";
   code.textContent = rule;
   row.appendChild(code);
+
+  const badge = lintBadge(rule);
+  if (badge) row.appendChild(badge);
 
   const moveBtns = document.createElement("div");
   moveBtns.className = "rule-moves";
