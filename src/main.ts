@@ -18,6 +18,13 @@ const state: {
   query: "",
 };
 
+// Set by the scopes-changed listener when it fires while another load or
+// move is already in flight. The load that finishes last checks this flag
+// in its finally block and kicks off one deferred reload, so we don't miss
+// external edits that happen during a load without needing a full job
+// queue.
+let externalReloadPending = false;
+
 async function load(projectDir: string | null): Promise<void> {
   state.busy = true;
   render();
@@ -30,6 +37,10 @@ async function load(projectDir: string | null): Promise<void> {
   } finally {
     state.busy = false;
     render();
+    if (externalReloadPending && !moveInFlight) {
+      externalReloadPending = false;
+      void load(state.projectDir);
+    }
   }
 }
 
@@ -146,13 +157,21 @@ document.addEventListener("keydown", (e) => {
 
 // The Rust watcher (`src-tauri/src/watcher.rs`) emits `scopes-changed` when
 // any of the three settings files mutates externally. Reload the data so the
-// UI mirrors what's on disk. Skip while a move is mid-flight: the user is
-// staring at the diff modal and reloading would yank the rules they're
-// inspecting out from under them — and our own writes are suppressed at the
-// watcher level anyway.
+// UI mirrors what's on disk.
+//
+// If a load or move is already in flight, skip this reload but set a sticky
+// flag — the current load's finally block will drain it with a single
+// follow-up reload. That prevents overlapping `load_scopes` invokes and the
+// out-of-order state writes that would come with them, without needing a
+// full job queue.
 listen("scopes-changed", () => {
-  if (moveInFlight) return;
+  if (moveInFlight || state.busy) {
+    externalReloadPending = true;
+    return;
+  }
   void load(state.projectDir);
+}).catch((err) => {
+  console.error("failed to register scopes-changed listener", err);
 });
 
 load(null);

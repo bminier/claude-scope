@@ -68,38 +68,48 @@ impl WatchState {
         }
     }
 
-    /// Tear down any existing watcher and install a fresh one over the parent
-    /// directories of the three resolved scope files. Idempotent: calling it
-    /// twice with the same paths is fine.
+    /// Tear down any existing watcher and install a fresh one over the
+    /// three resolved scope files. Idempotent: calling it twice with the
+    /// same paths is fine. The new debouncer is built and wired up *before*
+    /// the old one is dropped — if construction or any `watch()` call
+    /// fails, the previous watcher keeps working.
     pub fn install(&self, app: AppHandle, paths: &ScopePaths) -> Result<(), String> {
-        let mut parents: HashSet<PathBuf> = HashSet::new();
-        for path in [
+        // Collect (watch_root, scope_path) pairs. We watch the nearest
+        // existing ancestor of each scope path (not the parent blindly) so a
+        // workspace without `.claude/` yet still gets wired up — the user
+        // creating `.claude/settings.json` later will fire through the
+        // ancestor's recursive watch. Events are filtered by matching the
+        // exact scope path in the callback so unrelated `settings.json`
+        // files elsewhere in the tree can't trigger a reload.
+        let scope_paths: Vec<PathBuf> = [
             paths.local.as_ref(),
             paths.project.as_ref(),
             paths.user.as_ref(),
         ]
         .into_iter()
         .flatten()
-        {
-            if let Some(parent) = path.parent() {
-                if parent.exists() {
-                    parents.insert(parent.to_path_buf());
-                }
+        .cloned()
+        .collect();
+
+        let mut roots: HashSet<PathBuf> = HashSet::new();
+        for p in &scope_paths {
+            if let Some(root) = nearest_existing_ancestor(p) {
+                roots.insert(root);
             }
         }
 
-        // Drop the old debouncer first so we don't leak file handles when we
-        // replace it.
-        if let Ok(mut guard) = self.debouncer.lock() {
-            guard.take();
-        }
-
-        if parents.is_empty() {
-            return Ok(()); // Nothing to watch — empty workspace state.
+        if roots.is_empty() {
+            // Nothing to watch (no home dir, no project). Drop the old
+            // watcher — there's explicitly nothing to replace it with.
+            if let Ok(mut guard) = self.debouncer.lock() {
+                guard.take();
+            }
+            return Ok(());
         }
 
         let last_self_write = Arc::clone(&self.last_self_write);
         let app_for_cb = app.clone();
+        let watched_paths: Vec<PathBuf> = scope_paths.clone();
         let mut debouncer = new_debouncer(
             Duration::from_millis(DEBOUNCE_MS),
             move |res: DebounceEventResult| {
@@ -108,11 +118,25 @@ impl WatchState {
                     Err(_) => return, // Best-effort: swallow notify errors.
                 };
                 let interesting = events.iter().any(|ev| {
-                    ev.path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| WATCHED_FILE_NAMES.iter().any(|w| *w == n))
-                        .unwrap_or(false)
+                    // Match on either the exact scope path (covers renames
+                    // landing on that path) or the filename convention
+                    // (covers create/remove that notify reports as the
+                    // parent dir on some backends). Belt-and-suspenders.
+                    watched_paths.iter().any(|w| w == &ev.path)
+                        || ev
+                            .path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| {
+                                WATCHED_FILE_NAMES.iter().any(|w| *w == n)
+                                    && ev
+                                        .path
+                                        .parent()
+                                        .and_then(|p| p.file_name())
+                                        .and_then(|n| n.to_str())
+                                        == Some(".claude")
+                            })
+                            .unwrap_or(false)
                 });
                 if !interesting {
                     return;
@@ -120,24 +144,40 @@ impl WatchState {
                 if recent_self_write(&last_self_write) {
                     return;
                 }
-                // Best-effort emit: if the window is gone the app is shutting
-                // down anyway.
                 let _ = app_for_cb.emit("scopes-changed", ());
             },
         )
         .map_err(|e| format!("failed to start file watcher: {e}"))?;
 
-        for dir in &parents {
+        for dir in &roots {
             debouncer
                 .watcher()
-                .watch(dir, RecursiveMode::NonRecursive)
+                .watch(dir, RecursiveMode::Recursive)
                 .map_err(|e| format!("failed to watch {}: {}", dir.display(), e))?;
         }
 
+        // Swap-then-drop: the new debouncer is fully constructed and watching
+        // at this point, so replacing the slot is atomic. The old value is
+        // dropped when the guard goes out of scope, stopping its threads.
         if let Ok(mut guard) = self.debouncer.lock() {
             *guard = Some(debouncer);
         }
         Ok(())
+    }
+}
+
+/// Walk up from `path`'s parent until we find a directory that exists on
+/// disk. Returns `None` if we hit the filesystem root without finding one
+/// (effectively impossible on sane systems).
+fn nearest_existing_ancestor(path: &std::path::Path) -> Option<PathBuf> {
+    let mut cursor = path.parent()?.to_path_buf();
+    loop {
+        if cursor.exists() {
+            return Some(cursor);
+        }
+        if !cursor.pop() {
+            return None;
+        }
     }
 }
 

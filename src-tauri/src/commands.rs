@@ -288,26 +288,32 @@ fn apply_move_impl(
     // Destination first, then source. If the destination already had the rule
     // there's nothing to write there; skipping the save also avoids creating
     // a spurious `.bak` for a file we aren't actually changing.
+    //
+    // `note_self_write` is called *after* each successful save, not before:
+    // a failed save means no filesystem event will arrive, so suppressing a
+    // would-be-legitimate external change would leave the UI stale for no
+    // reason. The 200ms debouncer gives us a comfortable window to record
+    // the write before the notify callback fires.
     if dest_mutated {
-        watch.note_self_write();
         io_atomic::save(&to_path, &to_doc, backups)?;
+        watch.note_self_write();
     }
     // If the source write fails after the destination was updated, roll back
     // the destination so the rule doesn't end up duplicated in both scopes.
-    watch.note_self_write();
     if let Err(source_err) = io_atomic::save(&from_path, &from_doc, backups) {
         if dest_mutated {
             to_doc.remove_rule(req.kind, &req.rule);
-            watch.note_self_write();
             if let Err(rollback_err) = io_atomic::save(&to_path, &to_doc, backups) {
                 return Err(format!(
                     "source save failed: {source_err}; destination rollback also failed: {rollback_err}"
                 )
                 .into());
             }
+            watch.note_self_write();
         }
         return Err(format!("source save failed and destination was rolled back: {source_err}").into());
     }
+    watch.note_self_write();
     Ok(())
 }
 
