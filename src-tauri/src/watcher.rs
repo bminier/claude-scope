@@ -175,19 +175,23 @@ fn compute_watch_plan(paths: &ScopePaths) -> WatchPlan {
     for scope_path in &scope_paths {
         plan.match_paths.insert(scope_path.clone());
         let Some(parent) = scope_path.parent() else { continue };
-        if parent.exists() {
+        // `is_dir()` (not `exists()`) — a stray regular file named `.claude`
+        // would satisfy `exists()` but can't be watched as a directory, so
+        // we fall through to the grandparent watch instead and wait for it
+        // to be replaced with an actual directory.
+        if parent.is_dir() {
             // Common case: `.claude/` is already there, watch it
             // non-recursively and wait for settings*.json events.
             plan.roots.insert(parent.to_path_buf());
             continue;
         }
-        // Fallback: `.claude/` doesn't exist yet. Watch its parent
-        // non-recursively and match on the creation of `.claude/`. When
-        // that fires, the scopes-changed event triggers a reload on the
-        // front-end, which re-invokes install() with the now-existing
-        // `.claude/` as the watch root.
+        // Fallback: `.claude/` doesn't exist yet (or isn't a directory).
+        // Watch its parent non-recursively and match on the creation of
+        // `.claude/`. When that fires, the scopes-changed event triggers
+        // a reload on the front-end, which re-invokes install() with the
+        // now-existing `.claude/` as the watch root.
         if let Some(grandparent) = parent.parent() {
-            if grandparent.exists() {
+            if grandparent.is_dir() {
                 plan.roots.insert(grandparent.to_path_buf());
                 plan.match_paths.insert(parent.to_path_buf());
             }
@@ -253,6 +257,28 @@ mod tests {
         // creation of the .claude/ dir, so reinstall can be re-triggered.
         assert!(plan.match_paths.contains(&settings));
         assert!(plan.match_paths.contains(&claude_dir));
+    }
+
+    #[test]
+    fn plan_falls_back_when_claude_is_a_file_not_a_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a stray regular file named `.claude` — .exists() says
+        // true, but we can't watch it as a directory. The plan should
+        // treat this like the "missing" case and fall back to the
+        // grandparent, waiting for `.claude` to become an actual dir.
+        let claude_path = tmp.path().join(".claude");
+        std::fs::write(&claude_path, "not a directory").unwrap();
+        let settings = claude_path.join("settings.json");
+
+        let plan = compute_watch_plan(&scope_paths_from(None, Some(settings), None));
+        assert!(
+            plan.roots.contains(tmp.path()),
+            "should fall back to grandparent when .claude is a file",
+        );
+        assert!(
+            !plan.roots.contains(&claude_path),
+            "must not try to watch a non-directory as a directory",
+        );
     }
 
     #[test]
