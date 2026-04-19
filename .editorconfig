@@ -1,7 +1,7 @@
 # EditorConfig helps maintain consistent coding style across editors.
 # Biome owns the enforcement for TS/JS/JSON/CSS (see biome.json); rustfmt
-# owns Rust (.rustfmt.toml — we use defaults). This file fills the gap
-# for everything else so editors don't silently introduce drift.
+# owns Rust using its default settings. This file fills the gap for
+# everything else so editors don't silently introduce drift.
 # https://editorconfig.org
 
 root = true

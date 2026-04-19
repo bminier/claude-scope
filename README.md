@@ -128,9 +128,9 @@ npm run tauri build
 
 ## CI
 
-Every push to `dev` and every PR against `dev` runs five jobs in parallel:
+Every push to `dev` and every PR against `dev` runs three jobs in parallel, producing five check runs total:
 
-- `build (ubuntu-24.04)`, `build (windows-latest)`, `build (macos-latest)` — `npm ci`, `tsc --noEmit`, `vite build`, `cargo test --lib --locked`
+- `build` — a matrix job across `ubuntu-24.04`, `windows-latest`, `macos-latest`. Each runs `npm ci`, `tsc --noEmit`, `vite build`, `cargo test --lib --locked`.
 - `msrv (1.88)` — validates the declared MSRV via `cargo check --lib --tests --locked` on Rust 1.88.0
 - `lint` — runs `pre-commit/action@v3` (Biome, rustfmt, clippy, hygiene hooks)
 
