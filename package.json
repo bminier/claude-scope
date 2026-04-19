@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Desktop GUI for promoting Claude Code settings between scopes",
+  "license": "MIT",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
