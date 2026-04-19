@@ -181,14 +181,17 @@ function effectivePanel(
   const kinds: PermissionKind[] = ["allow", "deny", "ask"];
   for (const kind of kinds) {
     const all = loaded.effective_permissions[kind];
-    const matched = all.filter((r) => matchesLoweredQuery(r, lowerQuery));
+    // Fast path when the filter is empty — no allocation, no iteration.
+    const matched = lowerQuery === "" ? all : all.filter((r) => matchesLoweredQuery(r, lowerQuery));
     const group = document.createElement("div");
     group.className = `eff-group eff-${kind}`;
     const label = document.createElement("span");
     label.className = "eff-label";
-    // Show matched / total when filtering so users can tell the filter is active.
+    // Show matched/total when a filter is active AND the group isn't empty —
+    // otherwise "(0/0)" reads as noise. Unfiltered groups and empty groups
+    // fall back to the plain "(N)" format.
     label.textContent =
-      query === ""
+      query === "" || all.length === 0
         ? `${KIND_LABELS[kind]} (${all.length})`
         : `${KIND_LABELS[kind]} (${matched.length}/${all.length})`;
     group.appendChild(label);
@@ -247,34 +250,45 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
   col.appendChild(head);
 
   const kinds: PermissionKind[] = ["allow", "deny", "ask"];
-  let totalMatched = 0;
-  let totalAll = 0;
-  for (const kind of kinds) {
+  const isFiltering = lowerQuery !== "";
+  // Compute all the groups up front so we can decide between the per-kind
+  // view and the column-level "no matches" placeholder without re-filtering.
+  const groups = kinds.map((kind) => {
     const rules = view.permissions[kind];
-    totalAll += rules.length;
-    const matched = rules.filter((r) => matchesLoweredQuery(r, lowerQuery));
-    totalMatched += matched.length;
-    if (matched.length === 0) continue;
-    const section = document.createElement("div");
-    section.className = `rule-group rule-${kind}`;
-    const label = document.createElement("h4");
-    // Show m/n when filtering so the column tells the truth about what's hidden.
-    label.textContent =
-      props.query === ""
-        ? `${KIND_LABELS[kind]} (${rules.length})`
-        : `${KIND_LABELS[kind]} (${matched.length}/${rules.length})`;
-    section.appendChild(label);
-    for (const rule of matched) {
-      section.appendChild(ruleRow(view.scope, kind, rule, props));
-    }
-    col.appendChild(section);
-  }
+    const matched =
+      isFiltering ? rules.filter((r) => matchesLoweredQuery(r, lowerQuery)) : rules;
+    return { kind, rules, matched };
+  });
+  const totalAll = groups.reduce((s, g) => s + g.rules.length, 0);
+  const totalMatched = groups.reduce((s, g) => s + g.matched.length, 0);
 
-  if (props.query !== "" && totalAll > 0 && totalMatched === 0) {
+  if (isFiltering && totalAll > 0 && totalMatched === 0) {
+    // Nothing matched anywhere in this scope — replace the group headers with
+    // a single column-level placeholder so the user doesn't see three empty
+    // "(0/N)" headers stacked on top of each other.
     const none = document.createElement("div");
     none.className = "col-no-matches";
     none.textContent = `No rules match “${props.query}”.`;
     col.appendChild(none);
+  } else {
+    for (const { kind, rules, matched } of groups) {
+      // Skip empty kinds outright; when filtering, still render a header for
+      // kinds that exist but have 0 matches so the m/n count makes the hidden
+      // rules visible to the user.
+      if (rules.length === 0) continue;
+      if (!isFiltering && matched.length === 0) continue;
+      const section = document.createElement("div");
+      section.className = `rule-group rule-${kind}`;
+      const label = document.createElement("h4");
+      label.textContent = isFiltering
+        ? `${KIND_LABELS[kind]} (${matched.length}/${rules.length})`
+        : `${KIND_LABELS[kind]} (${rules.length})`;
+      section.appendChild(label);
+      for (const rule of matched) {
+        section.appendChild(ruleRow(view.scope, kind, rule, props));
+      }
+      col.appendChild(section);
+    }
   }
 
   if (view.other_keys.length > 0) {
