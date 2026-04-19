@@ -66,12 +66,10 @@ jobs:
               # No input — build a disposable nightly off the dispatched
               # commit. Checkout the immutable SHA (not the branch name) so
               # all matrix legs build the exact same tree even if new
-              # commits land on the branch mid-run. Draft release lives at
-              # `nightly-<short-sha>` — re-running on the same commit
-              # updates the same draft; different commits get different
-              # drafts that can be deleted without colliding.
-              short_sha=$(echo "$SHA" | cut -c1-7)
-              echo "release_tag=nightly-$short_sha" >> "$GITHUB_OUTPUT"
+              # commits land on the branch mid-run. Use the full SHA in the
+              # tag to avoid any theoretical collision risk from a short
+              # prefix and to match the concurrency-group key scheme below.
+              echo "release_tag=nightly-$SHA" >> "$GITHUB_OUTPUT"
               echo "checkout_ref=$SHA" >> "$GITHUB_OUTPUT"
               echo "prerelease=true" >> "$GITHUB_OUTPUT"
             fi

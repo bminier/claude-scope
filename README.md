@@ -162,7 +162,7 @@ To cut a release:
 
 ### Known limitation: unsigned builds
 
-v0.1 releases are **unsigned**. That means:
+Releases are currently **unsigned**. That means:
 
 - **Windows**: first launch shows a SmartScreen warning (click "More info" → "Run anyway").
 - **macOS**: first launch shows a Gatekeeper warning (right-click the app → Open → Open).
