@@ -20,9 +20,9 @@ interface AppProps {
   onQueryChange: (next: string) => void;
 }
 
-function matchesQuery(rule: string, query: string): boolean {
-  if (query === "") return true;
-  return rule.toLowerCase().includes(query.toLowerCase());
+function matchesLoweredQuery(rule: string, lowerQuery: string): boolean {
+  if (lowerQuery === "") return true;
+  return rule.toLowerCase().includes(lowerQuery);
 }
 
 const SCOPE_LABELS: Record<Scope, string> = {
@@ -63,8 +63,11 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
     return;
   }
 
-  root.appendChild(effectivePanel(props.scopes, props.query));
-  root.appendChild(scopeGrid(props));
+  // Lowercase the query once per render instead of per rule; scopeGrid/
+  // effectivePanel push this down into every filter call.
+  const lowerQuery = props.query.toLowerCase();
+  root.appendChild(effectivePanel(props.scopes, props.query, lowerQuery));
+  root.appendChild(scopeGrid(props, lowerQuery));
   restoreSearchFocus(preserveSearchFocus, caret);
 }
 
@@ -151,14 +154,24 @@ function searchBox(props: AppProps): HTMLElement {
     clear.className = "search-clear";
     clear.setAttribute("aria-label", "Clear filter");
     clear.textContent = "×";
-    clear.onclick = () => props.onQueryChange("");
+    clear.onclick = () => {
+      // Focus the input first so the pre-render snapshot in renderApp() sees
+      // it as the active element and restores focus there — otherwise focus
+      // jumps to body after the clear.
+      input.focus();
+      props.onQueryChange("");
+    };
     wrap.appendChild(clear);
   }
 
   return wrap;
 }
 
-function effectivePanel(loaded: LoadedScopes, query: string): HTMLElement {
+function effectivePanel(
+  loaded: LoadedScopes,
+  query: string,
+  lowerQuery: string,
+): HTMLElement {
   const panel = document.createElement("section");
   panel.className = "effective";
   const title = document.createElement("h2");
@@ -168,7 +181,7 @@ function effectivePanel(loaded: LoadedScopes, query: string): HTMLElement {
   const kinds: PermissionKind[] = ["allow", "deny", "ask"];
   for (const kind of kinds) {
     const all = loaded.effective_permissions[kind];
-    const matched = all.filter((r) => matchesQuery(r, query));
+    const matched = all.filter((r) => matchesLoweredQuery(r, lowerQuery));
     const group = document.createElement("div");
     group.className = `eff-group eff-${kind}`;
     const label = document.createElement("span");
@@ -190,17 +203,17 @@ function effectivePanel(loaded: LoadedScopes, query: string): HTMLElement {
   return panel;
 }
 
-function scopeGrid(props: AppProps): HTMLElement {
+function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
   const grid = document.createElement("section");
   grid.className = "grid";
   for (const scope of SCOPES) {
     const view = props.scopes!.scopes.find((s) => s.scope === scope)!;
-    grid.appendChild(scopeColumn(view, props));
+    grid.appendChild(scopeColumn(view, props, lowerQuery));
   }
   return grid;
 }
 
-function scopeColumn(view: ScopeView, props: AppProps): HTMLElement {
+function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTMLElement {
   const col = document.createElement("div");
   col.className = "col";
 
@@ -239,7 +252,7 @@ function scopeColumn(view: ScopeView, props: AppProps): HTMLElement {
   for (const kind of kinds) {
     const rules = view.permissions[kind];
     totalAll += rules.length;
-    const matched = rules.filter((r) => matchesQuery(r, props.query));
+    const matched = rules.filter((r) => matchesLoweredQuery(r, lowerQuery));
     totalMatched += matched.length;
     if (matched.length === 0) continue;
     const section = document.createElement("div");

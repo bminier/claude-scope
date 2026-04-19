@@ -43,6 +43,11 @@ async function pickProject(): Promise<void> {
   if (moveInFlight) return;
   const picked = await openDialog({ directory: true, multiple: false });
   if (typeof picked === "string") {
+    // Reset the filter when the user explicitly picks a different project —
+    // a query that matched rules in the old project would silently hide the
+    // new project's rules otherwise. Plain Reload keeps the filter intact
+    // so move → reload flows don't clobber the user's context.
+    state.query = "";
     await load(picked);
   }
 }
@@ -115,6 +120,9 @@ function render(): void {
 // with a modal, so we don't steal their keystroke.
 document.addEventListener("keydown", (e) => {
   if (e.key !== "/" || e.ctrlKey || e.metaKey || e.altKey) return;
+  // Bail out if something else already handled this keystroke so we don't
+  // hijack future shortcuts that happen to include "/".
+  if (e.defaultPrevented) return;
   const target = e.target as HTMLElement | null;
   if (
     target &&
