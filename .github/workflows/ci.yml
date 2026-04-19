@@ -127,7 +127,7 @@ jobs:
       # Bump this pin deliberately when we want newer clippy signal;
       # Dependabot is configured to ignore `dtolnay/rust-toolchain` so
       # bulk bumps can't silently re-bump the MSRV pin alongside this one.
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
 

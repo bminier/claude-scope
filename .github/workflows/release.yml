@@ -128,7 +128,7 @@ jobs:
       # Bump this pin deliberately when we want to ship with a newer
       # compiler; Dependabot is configured to ignore
       # `dtolnay/rust-toolchain` so bulk bumps can't do it silently.
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           # universal-apple-darwin needs both Mac targets installed so cargo
           # can cross-compile to the other arch from whichever the runner is.
