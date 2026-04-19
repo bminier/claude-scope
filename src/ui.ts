@@ -210,7 +210,14 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
 
 /**
  * Show a modal diff confirm and resolve to whether the user applied the move.
- * Escape cancels, Enter applies, Tab/Shift+Tab cycle focus within the dialog.
+ *
+ * Keyboard:
+ *   - Escape cancels.
+ *   - Enter activates the focused button (Apply by default, since that's the
+ *     initial focus — but Tab-to-Cancel followed by Enter cancels, matching
+ *     platform button convention).
+ *   - Tab / Shift+Tab cycle focus within the dialog.
+ *
  * If `trigger` is passed and still live in the DOM when the dialog closes,
  * focus is returned to it.
  */
