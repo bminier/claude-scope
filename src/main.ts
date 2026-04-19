@@ -134,7 +134,9 @@ document.addEventListener("keydown", (e) => {
   }
   if (document.querySelector(".modal-backdrop")) return;
   const search = document.getElementById("rule-search") as HTMLInputElement | null;
-  if (!search) return;
+  // Don't swallow the keystroke if the input is missing or currently
+  // disabled (e.g. before any project has loaded).
+  if (!search || search.disabled) return;
   e.preventDefault();
   search.focus();
   search.select();

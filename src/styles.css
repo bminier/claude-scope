@@ -74,6 +74,14 @@ body {
   color: var(--muted);
 }
 
+/* Hide WebKit's built-in cancel affordance for type=search — we render our
+   own × button so users don't see two stacked clear controls. */
+.search-input[type="search"]::-webkit-search-cancel-button,
+.search-input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
 .search-clear {
   position: absolute;
   top: 50%;

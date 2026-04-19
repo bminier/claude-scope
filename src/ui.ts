@@ -272,11 +272,10 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
     col.appendChild(none);
   } else {
     for (const { kind, rules, matched } of groups) {
-      // Skip empty kinds outright; when filtering, still render a header for
-      // kinds that exist but have 0 matches so the m/n count makes the hidden
-      // rules visible to the user.
+      // Skip empty kinds outright. When filtering, kinds that exist but
+      // have 0 matches still render a header so the m/n count makes the
+      // hidden rules visible to the user.
       if (rules.length === 0) continue;
-      if (!isFiltering && matched.length === 0) continue;
       const section = document.createElement("div");
       section.className = `rule-group rule-${kind}`;
       const label = document.createElement("h4");
