@@ -138,6 +138,45 @@ Every push to `dev` and every PR against `dev` runs three jobs in parallel, prod
 
 [Dependabot](./.github/dependabot.yml) opens weekly grouped PRs for Cargo, npm, and GitHub Actions minor/patch bumps. Major bumps land as separate PRs.
 
+## Releasing
+
+Pushing a tag of the form `v*.*.*` triggers [`.github/workflows/release.yml`](./.github/workflows/release.yml), which builds installers for all three platforms and uploads them to a GitHub Release as a draft. The maintainer reviews + publishes from the GitHub UI.
+
+To cut a release:
+
+1. **Bump the version in three places** (they have to stay in sync — `tauri-action` reads `tauri.conf.json`, but `cargo` and `npm` each have their own copy):
+   - `src-tauri/tauri.conf.json` → `version`
+   - `src-tauri/Cargo.toml` → `version`
+   - `package.json` → `version`
+2. Commit and merge that bump into `dev` (and whatever downstream branch actually ships).
+3. Tag and push:
+   ```sh
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+4. Watch [Actions](https://github.com/bminier/claude-scope/actions/workflows/release.yml). When all three matrix legs finish, a draft release appears at [Releases](https://github.com/bminier/claude-scope/releases) with:
+   - **Windows**: `.msi` (WiX installer) and `.exe` (NSIS)
+   - **macOS**: `.dmg` and `.app.tar.gz` (universal binary — runs on Intel and Apple Silicon)
+   - **Linux**: `.deb`, `.rpm`, and `.AppImage`
+5. Review the artifacts, edit release notes if you want, click **Publish release**.
+
+### Known limitation: unsigned builds
+
+Releases are currently **unsigned**. That means:
+
+- **Windows**: first launch shows a SmartScreen warning (click "More info" → "Run anyway").
+- **macOS**: first launch shows a Gatekeeper warning (right-click the app → Open → Open).
+- **Linux**: no warning.
+
+Signing would require a Windows code-signing certificate and/or an Apple Developer ID + notarization. Planned, but out of scope until there's demand.
+
+### Manual dispatch
+
+The release workflow is also wired up for `workflow_dispatch` — useful for rebuilding an existing tag or testing workflow changes before cutting a real release. From the Actions UI, click **Run workflow** on the Release workflow and pick a branch:
+
+- **Leave `tag_name` blank** → the workflow builds off the dispatched branch's HEAD, generates a `nightly-<full-sha>` tag (full 40-char commit SHA, so two nightlies on the same commit share a draft but different commits never collide), and creates a draft pre-release titled `ClaudeScope nightly-<full-sha>`. Delete the draft when you're done.
+- **Set `tag_name` to an existing tag** (e.g. `v0.1.0`) → the workflow checks out that exact tag and rebuilds its draft release. Useful for re-uploading artifacts if a platform job was flaky.
+
 ## License
 
 [MIT](./LICENSE) © Brian Minier

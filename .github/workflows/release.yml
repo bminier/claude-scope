@@ -1,0 +1,183 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Existing tag to build (e.g. v0.1.0). Leave blank for a disposable "nightly-<full-sha>" draft pre-release.'
+        required: false
+        default: ""
+
+# Serialize runs that target the *same release tag*, not the same git ref.
+# A tag push (refs/tags/vX.Y.Z) and a workflow_dispatch rebuild of that
+# same tag would otherwise get different concurrency groups (refs/tags/...
+# vs refs/heads/...) and race on uploads to the shared draft release.
+# Matching on the effective tagName keeps those two runs serialized.
+# cancel-in-progress stays false because we'd rather wait than abandon a
+# partially-uploaded draft.
+concurrency:
+  group: >-
+    release-${{
+      github.ref_type == 'tag' && github.ref_name
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name != '' && github.event.inputs.tag_name)
+      || format('nightly-{0}', github.sha)
+    }}
+  cancel-in-progress: false
+
+permissions:
+  # Required for tauri-action to create/update a GitHub Release and upload
+  # artifacts to it.
+  contents: write
+
+jobs:
+  # Resolve what tag to publish under and what ref to check out, so every
+  # matrix leg in `release` builds from the same commit and uploads to the
+  # same draft release. On tag push both are just the tag. On
+  # workflow_dispatch, an input tag wins; otherwise we synthesize a
+  # disposable `nightly-<full-sha>` draft off the dispatched branch.
+  setup:
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.compute.outputs.release_tag }}
+      checkout_ref: ${{ steps.compute.outputs.checkout_ref }}
+      prerelease: ${{ steps.compute.outputs.prerelease }}
+    steps:
+      - id: compute
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          # `inputs` is only populated on workflow_dispatch / workflow_call;
+          # `github.event.inputs` resolves safely to empty on tag pushes.
+          INPUT_TAG: ${{ github.event.inputs.tag_name }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -n "$INPUT_TAG" ]; then
+              # Maintainer explicitly named a tag to rebuild — check that ref
+              # out and publish under that exact name.
+              echo "release_tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+              echo "checkout_ref=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+              echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            else
+              # No input — build a disposable nightly off the dispatched
+              # commit. Checkout the immutable SHA (not the branch name) so
+              # all matrix legs build the exact same tree even if new
+              # commits land on the branch mid-run. Use the full SHA in the
+              # tag to avoid any theoretical collision risk from a short
+              # prefix and to match the concurrency-group key scheme below.
+              echo "release_tag=nightly-$SHA" >> "$GITHUB_OUTPUT"
+              echo "checkout_ref=$SHA" >> "$GITHUB_OUTPUT"
+              echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # push on a v*.*.* tag
+            echo "release_tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "checkout_ref=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: setup
+    name: release (${{ matrix.platform.os }})
+    strategy:
+      # Don't stop siblings on one-platform failure. If macOS trips but
+      # Windows + Linux succeed we still want those installers uploaded
+      # so the user can publish what's usable.
+      fail-fast: false
+      matrix:
+        platform:
+          # `target` is passed to `tauri build --target` via `args` so
+          # cargo writes into `target/<triple>/release/` per-platform.
+          # That makes rust-cache keying deterministic across matrix legs
+          # and keeps installer naming architecture-explicit.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            args: "--target x86_64-unknown-linux-gnu"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: "--target x86_64-pc-windows-msvc"
+          - os: macos-latest
+            # Universal binary (arm64 + x86_64) in a single .dmg so the
+            # download works on both Apple Silicon and Intel Macs.
+            target: universal-apple-darwin
+            args: "--target universal-apple-darwin"
+
+    runs-on: ${{ matrix.platform.os }}
+
+    steps:
+      # Pull the exact ref the `setup` job resolved — for tag pushes this is
+      # the tag, for dispatch-with-input this is the named tag, and for
+      # dispatch-without-input this is the dispatched branch HEAD.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.checkout_ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      # Pin the release toolchain so rebuilds of the same tag remain
+      # deterministic over time. 1.88.0 matches the declared MSRV (and the
+      # `msrv` / `lint` jobs in ci.yml), so if that MSRV ever bumps we bump
+      # here in lockstep.
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          # universal-apple-darwin needs both Mac targets installed so cargo
+          # can cross-compile to the other arch from whichever the runner is.
+          targets: ${{ matrix.platform.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.platform.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          # Key the cache per-target so cross-compiled universal-apple-darwin
+          # doesn't thrash the single-arch Linux/Windows caches.
+          key: release-${{ matrix.platform.target }}
+
+      - name: Install Linux bundler deps
+        if: startsWith(matrix.platform.os, 'ubuntu-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            patchelf
+
+      - run: npm ci
+
+      # tauri-action runs `beforeBuildCommand` (which is `npm run build`)
+      # before invoking `tauri build`, so the frontend dist/ is produced
+      # as part of the same step. Pinned to a specific version rather than
+      # `@v0` so rebuilds of an older tag don't silently pick up
+      # behavior/bundler changes from a newer action release.
+      - uses: tauri-apps/tauri-action@v0.5.22
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Create (or reuse) a draft release for the resolved tag. The
+          # maintainer reviews the uploaded artifacts and publishes from
+          # the GitHub UI — no surprise public release if a build is broken.
+          tagName: ${{ needs.setup.outputs.release_tag }}
+          releaseName: "ClaudeScope ${{ needs.setup.outputs.release_tag }}"
+          releaseBody: |
+            Binaries are attached below.
+
+            Release notes can be edited here before publishing — use the
+            Compare view at
+            https://github.com/${{ github.repository }}/compare to diff
+            this release against the previous tag.
+
+            ⚠️ Builds are currently **unsigned**. On first launch you'll see:
+            - **Windows**: a SmartScreen warning — click "More info" → "Run anyway".
+            - **macOS**: a Gatekeeper warning — right-click the app → Open → Open.
+            - **Linux**: no warning.
+          releaseDraft: true
+          prerelease: ${{ needs.setup.outputs.prerelease == 'true' }}
+          args: ${{ matrix.platform.args }}
