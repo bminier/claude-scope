@@ -11,10 +11,20 @@ on:
         required: false
         default: ""
 
-# Don't cancel in-progress releases when another tag lands — each release
-# is distinct and we want all artifacts uploaded for all tags.
+# Serialize runs that target the *same release tag*, not the same git ref.
+# A tag push (refs/tags/vX.Y.Z) and a workflow_dispatch rebuild of that
+# same tag would otherwise get different concurrency groups (refs/tags/...
+# vs refs/heads/...) and race on uploads to the shared draft release.
+# Matching on the effective tagName keeps those two runs serialized.
+# cancel-in-progress stays false because we'd rather wait than abandon a
+# partially-uploaded draft.
 concurrency:
-  group: release-${{ github.ref }}
+  group: >-
+    release-${{
+      github.ref_type == 'tag' && github.ref_name
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name != '' && github.event.inputs.tag_name)
+      || format('nightly-{0}', github.sha)
+    }}
   cancel-in-progress: false
 
 permissions:
@@ -38,7 +48,9 @@ jobs:
       - id: compute
         env:
           EVENT_NAME: ${{ github.event_name }}
-          INPUT_TAG: ${{ inputs.tag_name }}
+          # `inputs` is only populated on workflow_dispatch / workflow_call;
+          # `github.event.inputs` resolves safely to empty on tag pushes.
+          INPUT_TAG: ${{ github.event.inputs.tag_name }}
           REF_NAME: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
         run: |
