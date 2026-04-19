@@ -104,6 +104,15 @@ async function moveRule(req: MoveRequest, trigger?: HTMLElement): Promise<void> 
     }
   } finally {
     moveInFlight = false;
+    // A scopes-changed event that landed while the diff modal was open
+    // set externalReloadPending but couldn't trigger its own load (we
+    // were in the middle of a move). Drain it here so an external edit
+    // during the confirm step still gets picked up after the modal
+    // closes. load()'s finally does the same thing for the load case.
+    if (externalReloadPending && !state.busy) {
+      externalReloadPending = false;
+      void load(state.projectDir);
+    }
   }
 }
 
