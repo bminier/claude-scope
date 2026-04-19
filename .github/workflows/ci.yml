@@ -120,11 +120,14 @@ jobs:
           node-version: "20"
           cache: npm
 
-      # Pin to the declared MSRV so the set of clippy lints is deterministic.
-      # `stable` advances over time and new clippy lints can start failing
-      # CI with no code change — we'd rather bump the pin explicitly when
-      # we want newer signal.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      # Pin explicitly (not @stable) so the set of clippy lints stays
+      # deterministic over time. This is decoupled from the declared MSRV
+      # — clippy runs here with a newer toolchain to pick up modern lints
+      # while the `msrv` job above continues to gate on 1.88.0.
+      # Bump this pin deliberately when we want newer clippy signal;
+      # Dependabot is configured to ignore `dtolnay/rust-toolchain` so
+      # bulk bumps can't silently re-bump the MSRV pin alongside this one.
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt, clippy
 

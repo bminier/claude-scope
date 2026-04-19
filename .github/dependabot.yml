@@ -40,3 +40,12 @@ updates:
         update-types:
           - minor
           - patch
+    # Dependabot versions dtolnay/rust-toolchain tags as Rust releases
+    # (1.88.0 → 1.89.0 → …). Our three pins serve different purposes:
+    #   * ci.yml `msrv` job — must stay at the declared MSRV.
+    #   * ci.yml `lint` job + release.yml — pinned for determinism, bump
+    #     when we want newer clippy / shipped-compiler signal.
+    # A bulk bump would bounce the msrv job off its own meaning. Pin
+    # these by hand and keep Dependabot out of the loop.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"

@@ -122,10 +122,13 @@ jobs:
           cache: npm
 
       # Pin the release toolchain so rebuilds of the same tag remain
-      # deterministic over time. 1.88.0 matches the declared MSRV (and the
-      # `msrv` / `lint` jobs in ci.yml), so if that MSRV ever bumps we bump
-      # here in lockstep.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      # deterministic over time. This is decoupled from the declared MSRV
+      # — shipped binaries get the optimizer improvements of a newer Rust
+      # while the `msrv` job in ci.yml continues to gate on 1.88.0.
+      # Bump this pin deliberately when we want to ship with a newer
+      # compiler; Dependabot is configured to ignore
+      # `dtolnay/rust-toolchain` so bulk bumps can't do it silently.
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           # universal-apple-darwin needs both Mac targets installed so cargo
           # can cross-compile to the other arch from whichever the runner is.
@@ -157,7 +160,7 @@ jobs:
       # as part of the same step. Pinned to a specific version rather than
       # `@v0` so rebuilds of an older tag don't silently pick up
       # behavior/bundler changes from a newer action release.
-      - uses: tauri-apps/tauri-action@v0.5.22
+      - uses: tauri-apps/tauri-action@v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
