@@ -177,11 +177,9 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: src-tauri
 
-      # Don't need a full `npm ci` (no build step) — just enough to resolve
-      # the tree so `npm audit` has something to work with. `npm audit`
-      # reads package-lock.json directly without needing node_modules, but
-      # a clean-room install confirms the lockfile is self-consistent too.
-      - run: npm ci
-
+      # `npm audit --package-lock-only` reads package-lock.json directly,
+      # so we skip the full `npm ci` and the lifecycle scripts it would
+      # otherwise run. The other CI jobs already validate the lockfile
+      # via their own `npm ci`, so we don't lose that signal.
       - name: npm audit
-        run: npm audit --audit-level=high
+        run: npm audit --package-lock-only --audit-level=high
