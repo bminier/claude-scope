@@ -1,4 +1,12 @@
-import type { LoadedScopes, MoveRequest, PermissionKind, Scope, ScopeView } from "./types.ts";
+import type {
+  LoadedScopes,
+  MovePreview,
+  MoveRequest,
+  MoveSide,
+  PermissionKind,
+  Scope,
+  ScopeView,
+} from "./types.ts";
 import { SCOPES } from "./types.ts";
 
 interface AppProps {
@@ -192,4 +200,150 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
   row.appendChild(moveBtns);
 
   return row;
+}
+
+/**
+ * Show a modal diff confirm and resolve to whether the user applied the move.
+ * Escape cancels, Enter applies.
+ */
+export function confirmMove(preview: MovePreview): Promise<boolean> {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+
+    const panel = document.createElement("div");
+    panel.className = "modal";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-labelledby", "modal-title");
+
+    const title = document.createElement("h2");
+    title.id = "modal-title";
+    title.className = "modal-title";
+    title.textContent = `Move ${KIND_LABELS[preview.kind]} rule`;
+    panel.appendChild(title);
+
+    const subtitle = document.createElement("div");
+    subtitle.className = "modal-subtitle";
+    const ruleCode = document.createElement("code");
+    ruleCode.className = "chip";
+    ruleCode.textContent = preview.rule;
+    subtitle.appendChild(ruleCode);
+    subtitle.appendChild(document.createTextNode(` from ${SCOPE_LABELS[preview.from.scope]} to ${SCOPE_LABELS[preview.to.scope]}`));
+    panel.appendChild(subtitle);
+
+    const diff = document.createElement("div");
+    diff.className = "modal-diff";
+    diff.appendChild(diffSide(preview.from, "remove", preview.rule));
+    diff.appendChild(diffSide(preview.to, "add", preview.rule));
+    panel.appendChild(diff);
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.textContent = "Cancel";
+    cancel.className = "btn-cancel";
+    const apply = document.createElement("button");
+    apply.textContent = "Apply";
+    apply.className = "btn-apply";
+    actions.append(cancel, apply);
+    panel.appendChild(actions);
+
+    backdrop.appendChild(panel);
+
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+
+    const close = (result: boolean) => {
+      document.removeEventListener("keydown", onKey);
+      backdrop.remove();
+      previouslyFocused?.focus?.();
+      resolve(result);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close(false);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        close(true);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    backdrop.addEventListener("click", (e) => {
+      if (e.target === backdrop) close(false);
+    });
+    cancel.addEventListener("click", () => close(false));
+    apply.addEventListener("click", () => close(true));
+
+    document.body.appendChild(backdrop);
+    apply.focus();
+  });
+}
+
+function diffSide(side: MoveSide, mode: "add" | "remove", movingRule: string): HTMLElement {
+  const col = document.createElement("div");
+  col.className = `modal-side modal-side-${mode}`;
+
+  const head = document.createElement("div");
+  head.className = "modal-side-head";
+  const label = document.createElement("h3");
+  label.textContent = SCOPE_LABELS[side.scope];
+  head.appendChild(label);
+
+  const path = document.createElement("div");
+  path.className = "modal-side-path";
+  path.textContent = side.path;
+  head.appendChild(path);
+
+  const verdict = document.createElement("div");
+  verdict.className = "modal-side-verdict";
+  if (!side.will_write) {
+    verdict.textContent = "(no change)";
+    verdict.classList.add("muted");
+  } else if (mode === "add") {
+    verdict.textContent = "+1 rule";
+    verdict.classList.add("added");
+  } else {
+    verdict.textContent = "−1 rule";
+    verdict.classList.add("removed");
+  }
+  head.appendChild(verdict);
+  col.appendChild(head);
+
+  if (side.note) {
+    const note = document.createElement("div");
+    note.className = "modal-side-note";
+    note.textContent = side.note;
+    col.appendChild(note);
+  }
+
+  const list = document.createElement("ul");
+  list.className = "modal-diff-list";
+  for (const rule of side.rules_before) {
+    const li = document.createElement("li");
+    const code = document.createElement("code");
+    code.textContent = rule;
+    if (mode === "remove" && rule === movingRule) {
+      li.className = "diff-removed";
+    }
+    li.appendChild(code);
+    list.appendChild(li);
+  }
+  if (mode === "add" && side.will_write) {
+    const li = document.createElement("li");
+    li.className = "diff-added";
+    const code = document.createElement("code");
+    code.textContent = movingRule;
+    li.appendChild(code);
+    list.appendChild(li);
+  }
+  if (list.children.length === 0) {
+    const li = document.createElement("li");
+    li.className = "diff-empty";
+    li.textContent = "(empty)";
+    list.appendChild(li);
+  }
+  col.appendChild(list);
+
+  return col;
 }

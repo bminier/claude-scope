@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
-import { renderApp } from "./ui.ts";
-import type { LoadedScopes, MoveRequest } from "./types.ts";
+import { confirmMove, renderApp } from "./ui.ts";
+import type { LoadedScopes, MovePreview, MoveRequest } from "./types.ts";
 
 const state: { scopes: LoadedScopes | null; projectDir: string | null; busy: boolean } = {
   scopes: null,
@@ -37,8 +37,9 @@ async function moveRule(req: MoveRequest): Promise<void> {
   state.busy = true;
   render();
   try {
-    const preview = await invoke<string>("diff_move", { req, project_dir: projectDir });
-    if (!confirm(`Apply this change?\n\n${preview}`)) return;
+    const preview = await invoke<MovePreview>("diff_move", { req, project_dir: projectDir });
+    const apply = await confirmMove(preview);
+    if (!apply) return;
     await invoke("apply_move", { req, project_dir: projectDir });
     await load(projectDir);
   } catch (err) {
