@@ -209,10 +209,26 @@ jobs:
 
           # Draft releases don't have a git tag yet, so we can't use
           # /releases/tags/<tag>. List all releases and filter by tag_name.
-          asset_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
-            --jq "[.[] | select(.tag_name == \"${RELEASE_TAG}\") | .assets[]? | select(.name == \"${old_name}\") | .id] | .[0]")
+          #
+          # Two subtleties we have to handle:
+          #   * `gh api --paginate` emits one JSON array per page, so we pipe
+          #     to `jq --slurp` (rather than `gh api --jq`) to see all pages
+          #     as a single stream. Without this, the jq filter runs once per
+          #     page and a mismatch on page N followed by a match on page N+1
+          #     would yield a multi-line asset_id that passes the null check.
+          #   * RELEASE_TAG and old_name come from tauri.conf.json — treat them
+          #     as data, not as jq source. Pass via `--arg` so embedded quotes
+          #     or backslashes can't break jq parsing.
+          asset_id=$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+              | jq -r --slurp \
+                  --arg tag "$RELEASE_TAG" \
+                  --arg name "$old_name" \
+                  '.[][] | select(.tag_name == $tag) | .assets[]? | select(.name == $name) | .id' \
+              | head -n1
+          )
 
-          if [ -z "$asset_id" ] || [ "$asset_id" = "null" ]; then
+          if [ -z "$asset_id" ]; then
             echo "no asset named ${old_name} found on release ${RELEASE_TAG} — either tauri-bundler changed the name or the upload is still pending. Skipping."
             exit 0
           fi
