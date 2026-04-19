@@ -1,19 +1,34 @@
 /**
  * Shape-only lint for Claude Code permission rule strings.
  *
- * This is intentionally lenient — Claude Code's actual parser isn't publicly
- * documented in detail (case sensitivity, whitespace handling, argument
- * grammars for each tool), so we only flag rules that don't match any of
- * the shapes we *do* know about from the official docs:
+ * This lives on top of an imprecise target — Claude Code's actual parser
+ * isn't publicly documented in full (case sensitivity, whitespace handling,
+ * per-tool argument grammars). We therefore stick to shape-matching against
+ * the forms that do appear in official examples:
  *
  *   - `Bash(...)` / `Read(...)` / `Edit(...)` / `Write(...)` / `Agent(...)`
  *   - `WebFetch(domain:<host>)`
  *   - `mcp__<server>__<tool>` (or `mcp__<server>__*`)
  *   - Bare tool name (e.g. just `Bash`) — equivalent to `Bash(*)`
  *
- * We never call a rule invalid — we return a warning with a reason. The UI
- * shows a subtle indicator so users can fix typos before promoting a
- * half-broken rule to a wider scope, but no move is ever blocked.
+ * What the lint does flag, deliberately:
+ *   - Non-canonical casing (`bash(...)`) — docs always capitalize, so this
+ *     is almost certainly a typo even if the runtime turns out to tolerate
+ *     it. Falling into the "Unknown tool" branch is the right signal.
+ *   - Whitespace between the tool name and the `(` (`Bash (...)`). Same
+ *     reasoning: no example permits this, treating it as suspect is safer
+ *     than silently accepting it.
+ *
+ * What the lint intentionally does not check:
+ *   - The internal grammar of each tool's argument (Bash globs, Read path
+ *     syntax, WebFetch domain shape beyond the `domain:` prefix). That's
+ *     where the docs run out.
+ *   - Load-time behavior — we don't know whether Claude Code drops,
+ *     warns, or errors on malformed rules.
+ *
+ * No rule is ever rejected outright; we return a warning with a reason and
+ * the UI shows a subtle indicator so users can fix typos before promoting
+ * a half-broken rule to a wider scope. Moves are never blocked.
  *
  * If Anthropic publishes a formal schema later, we can tighten this toward
  * a strict validator.
