@@ -245,45 +245,54 @@ jobs:
                     '[.[][] | select(.tag_name == $tag) | .assets[]?]'
             )
 
-            has_new=$(echo "$assets_json" | jq -r --arg name "$new_name" \
-              'any(.[]; .name == $name)')
-            if [ "$has_new" = "true" ]; then
-              echo "asset ${new_name} already present — nothing to rename (idempotent re-run or upstream rename)"
-              exit 0
-            fi
-
-            # Any asset whose name starts with the product name and ends in
-            # `.app.tar.gz` is our target. Covers `ClaudeScope.app.tar.gz`
-            # (tauri-action 0.5), `ClaudeScope_universal.app.tar.gz`
-            # (tauri-action 0.6), and any mildly different shape a newer
-            # release might pick — but excludes `new_name` itself, which
-            # the idempotency check above already settled.
-            #
-            # Collect all matches and branch on the count: exactly one is
-            # the normal case, zero means keep retrying, and two-or-more
-            # means a rerun across tauri-action versions left both the
-            # legacy and new on-wire names on the draft. In that case we
-            # refuse to pick one arbitrarily — an orphan with a different
-            # name would defeat the whole point of this step. Maintainer
-            # needs to delete the stale asset in the GitHub UI and re-run.
+            # Collect every asset on the release whose name matches our
+            # app-tarball shape (<product>*.app.tar.gz). This covers the
+            # tauri-action 0.5 name (`ClaudeScope.app.tar.gz`), the 0.6
+            # name (`ClaudeScope_universal.app.tar.gz`), and our target
+            # `new_name`. We split the matches into
+            # "already-renamed (== new_name)" vs "rename candidates
+            # (everything else matching the shape)" so a rerun can't leave
+            # both a versioned and an unversioned tarball on the release:
+            #   * 0 candidates, has_new true  → idempotent, exit 0
+            #   * 0 candidates, has_new false → retry (eventual consistency)
+            #   * 1 candidate,  has_new false → normal rename
+            #   * any other combo (has_new true AND candidates > 0, or
+            #     candidates > 1) → fail loudly with every match listed
             matches=$(echo "$assets_json" | jq -c --arg product "$product" \
               '[.[] | select(.name | startswith($product) and endswith(".app.tar.gz"))]')
-            match_count=$(echo "$matches" | jq 'length')
+            has_new=$(echo "$matches" | jq -r --arg name "$new_name" \
+              'any(.[]; .name == $name)')
+            candidates=$(echo "$matches" | jq -c --arg name "$new_name" \
+              '[.[] | select(.name != $name)]')
+            candidate_count=$(echo "$candidates" | jq 'length')
 
-            if [ "$match_count" -gt 1 ]; then
-              # `jq join(", ")` — not shell `paste -sd ", " -` — because
-              # paste's -d cycles character-by-character through its
-              # delimiter list, so with three matches `paste` would
-              # produce e.g. `a,b c,d` (comma, space, comma) instead of
-              # the consistent `, ` we want.
-              dupe_names=$(echo "$matches" | jq -r 'map(.name) | join(", ")')
-              echo "::error::multiple assets match ${product}*.app.tar.gz on release ${RELEASE_TAG}: ${dupe_names}. Refusing to rename one and leave the other orphaned. Delete the stale asset(s) in the GitHub UI and re-run this workflow."
+            # Stale candidates next to new_name = a rerun uploaded a fresh
+            # unversioned tarball alongside our renamed one. OR multiple
+            # legacy names left over from tauri-action-version churn. Both
+            # leave the release in an ambiguous state; refuse to pick.
+            if [ "$has_new" = "true" ] && [ "$candidate_count" -gt 0 ]; then
+              # `jq join(", ")` — shell `paste -sd ", " -` cycles
+              # delimiters character-by-character, so with three+ matches
+              # it would produce e.g. `a,b c,d` instead of consistent ", ".
+              stale_names=$(echo "$candidates" | jq -r 'map(.name) | join(", ")')
+              echo "::error::${new_name} is already on release ${RELEASE_TAG}, but so are stale ${product}*.app.tar.gz asset(s): ${stale_names}. Refusing to leave a duplicate tarball on the release — delete the stale asset(s) in the GitHub UI and re-run."
               exit 1
             fi
 
-            if [ "$match_count" -eq 1 ]; then
-              asset_id=$(echo "$matches" | jq -r '.[0].id')
-              matched_name=$(echo "$matches" | jq -r '.[0].name')
+            if [ "$has_new" = "true" ]; then
+              echo "asset ${new_name} already present and no stale siblings — nothing to rename (idempotent re-run or upstream rename)"
+              exit 0
+            fi
+
+            if [ "$candidate_count" -gt 1 ]; then
+              stale_names=$(echo "$candidates" | jq -r 'map(.name) | join(", ")')
+              echo "::error::multiple assets match ${product}*.app.tar.gz on release ${RELEASE_TAG}: ${stale_names}. Refusing to rename one and leave the other orphaned. Delete the stale asset(s) in the GitHub UI and re-run this workflow."
+              exit 1
+            fi
+
+            if [ "$candidate_count" -eq 1 ]; then
+              asset_id=$(echo "$candidates" | jq -r '.[0].id')
+              matched_name=$(echo "$candidates" | jq -r '.[0].name')
               break
             fi
 
