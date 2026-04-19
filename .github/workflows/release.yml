@@ -226,12 +226,11 @@ jobs:
           #     `jq --slurp` so the filter sees every page as a single
           #     stream (otherwise a match on page N+1 after a miss on
           #     page N would produce a multi-line asset_id).
-          #   * `first(...) // empty` inside jq picks the first match and
-          #     yields no output on miss — so shell sees an empty string,
-          #     never the literal "null" that would slip past `-z` checks.
-          #     Both short-circuit semantics are important: `first` stops
-          #     consuming the generator after one hit, avoiding the
-          #     SIGPIPE race `jq | head -n1` has under pipefail.
+          #   * jq filters collect matching assets into an array; shell
+          #     branches on `length`. Where a boolean is needed (the
+          #     idempotency check) `any(...)` already yields strict
+          #     true/false. No `first(...)`/`head -n1` means no SIGPIPE
+          #     edge case to worry about.
           #   * RELEASE_TAG / product / new_name come from tauri.conf.json —
           #     pass via `--arg` so embedded quotes/backslashes can't break
           #     jq parsing.
@@ -272,7 +271,12 @@ jobs:
             match_count=$(echo "$matches" | jq 'length')
 
             if [ "$match_count" -gt 1 ]; then
-              dupe_names=$(echo "$matches" | jq -r '.[].name' | paste -sd ", " -)
+              # `jq join(", ")` — not shell `paste -sd ", " -` — because
+              # paste's -d cycles character-by-character through its
+              # delimiter list, so with three matches `paste` would
+              # produce e.g. `a,b c,d` (comma, space, comma) instead of
+              # the consistent `, ` we want.
+              dupe_names=$(echo "$matches" | jq -r 'map(.name) | join(", ")')
               echo "::error::multiple assets match ${product}*.app.tar.gz on release ${RELEASE_TAG}: ${dupe_names}. Refusing to rename one and leave the other orphaned. Delete the stale asset(s) in the GitHub UI and re-run this workflow."
               exit 1
             fi
