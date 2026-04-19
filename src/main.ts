@@ -2,9 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
-import { confirmMove, renderApp } from "./ui.ts";
 import type { LoadedScopes, MovePreview, MoveRequest } from "./types.ts";
 import { SEARCH_INPUT_ID } from "./types.ts";
+import { confirmMove, renderApp } from "./ui.ts";
 
 const state: {
   scopes: LoadedScopes | null;
@@ -148,9 +148,7 @@ document.addEventListener("keydown", (e) => {
   const target = e.target as HTMLElement | null;
   if (
     target &&
-    (target.tagName === "INPUT" ||
-      target.tagName === "TEXTAREA" ||
-      target.isContentEditable)
+    (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
   ) {
     return;
   }

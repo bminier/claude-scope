@@ -39,14 +39,7 @@ export interface LintResult {
   reason?: string;
 }
 
-const BARE_TOOL_NAMES = new Set([
-  "Bash",
-  "Read",
-  "Edit",
-  "Write",
-  "WebFetch",
-  "Agent",
-]);
+const BARE_TOOL_NAMES = new Set(["Bash", "Read", "Edit", "Write", "WebFetch", "Agent"]);
 
 const TOOLS_WITH_ARGS = BARE_TOOL_NAMES;
 
@@ -65,7 +58,8 @@ export function lintRule(raw: string): LintResult {
     if (/[\s()]/.test(rule)) {
       return {
         ok: false,
-        reason: "MCP rule shouldn't contain parentheses or whitespace; use `mcp__<server>__<tool>`.",
+        reason:
+          "MCP rule shouldn't contain parentheses or whitespace; use `mcp__<server>__<tool>`.",
       };
     }
     const parts = rule.split("__");
@@ -109,8 +103,7 @@ export function lintRule(raw: string): LintResult {
   if (!TOOLS_WITH_ARGS.has(name)) {
     return {
       ok: false,
-      reason:
-        `Unknown tool \`${name}\`. Expected one of: Bash, Read, Edit, Write, WebFetch, Agent, or mcp__…`,
+      reason: `Unknown tool \`${name}\`. Expected one of: Bash, Read, Edit, Write, WebFetch, Agent, or mcp__…`,
     };
   }
 
@@ -123,8 +116,7 @@ export function lintRule(raw: string): LintResult {
   if (name === "WebFetch" && !args.trim().startsWith("domain:")) {
     return {
       ok: false,
-      reason:
-        "WebFetch requires a `domain:` prefix, e.g. `WebFetch(domain:example.com)`.",
+      reason: "WebFetch requires a `domain:` prefix, e.g. `WebFetch(domain:example.com)`.",
     };
   }
 

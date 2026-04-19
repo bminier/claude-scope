@@ -145,10 +145,6 @@ body {
   white-space: nowrap;
 }
 
-.actions button {
-  margin-left: 8px;
-}
-
 button {
   background: var(--panel-2);
   color: var(--text);
@@ -167,6 +163,10 @@ button:hover:not(:disabled) {
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.actions button {
+  margin-left: 8px;
 }
 
 .empty {
@@ -203,9 +203,15 @@ button:disabled {
   min-width: 80px;
 }
 
-.eff-allow .eff-label { color: var(--allow); }
-.eff-deny .eff-label { color: var(--deny); }
-.eff-ask .eff-label { color: var(--ask); }
+.eff-allow .eff-label {
+  color: var(--allow);
+}
+.eff-deny .eff-label {
+  color: var(--deny);
+}
+.eff-ask .eff-label {
+  color: var(--ask);
+}
 
 .chip {
   display: inline-block;
@@ -258,8 +264,12 @@ button:disabled {
   margin-bottom: 8px;
 }
 
-.col-status.err { color: var(--err); }
-.col-status.muted { color: var(--muted); }
+.col-status.err {
+  color: var(--err);
+}
+.col-status.muted {
+  color: var(--muted);
+}
 
 .rule-group {
   margin-top: 8px;
@@ -273,9 +283,15 @@ button:disabled {
   color: var(--muted);
 }
 
-.rule-allow h4 { color: var(--allow); }
-.rule-deny h4 { color: var(--deny); }
-.rule-ask h4 { color: var(--ask); }
+.rule-allow h4 {
+  color: var(--allow);
+}
+.rule-deny h4 {
+  color: var(--deny);
+}
+.rule-ask h4 {
+  color: var(--ask);
+}
 
 .rule {
   display: flex;
@@ -369,8 +385,12 @@ button:disabled {
   min-width: 0;
 }
 
-.modal-side-remove { border-left: 3px solid var(--deny); }
-.modal-side-add { border-left: 3px solid var(--allow); }
+.modal-side-remove {
+  border-left: 3px solid var(--deny);
+}
+.modal-side-add {
+  border-left: 3px solid var(--allow);
+}
 
 .modal-side-head {
   display: flex;
@@ -401,9 +421,15 @@ button:disabled {
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
-.modal-side-verdict.added { color: var(--allow); }
-.modal-side-verdict.removed { color: var(--deny); }
-.modal-side-verdict.muted { color: var(--muted); }
+.modal-side-verdict.added {
+  color: var(--allow);
+}
+.modal-side-verdict.removed {
+  color: var(--deny);
+}
+.modal-side-verdict.muted {
+  color: var(--muted);
+}
 
 .modal-side-note {
   font-size: 12px;

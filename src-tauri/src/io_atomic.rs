@@ -127,15 +127,13 @@ pub fn save(path: &Path, doc: &SettingsDoc, backups: &BackupTracker) -> Result<(
     // tracker handles concurrency, missing-file, and existing-.bak cases.
     backups.ensure_backed_up(path)?;
 
-    let mut tmp =
-        tempfile::NamedTempFile::new_in(parent).map_err(|e| IoError::io(parent, e))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| IoError::io(parent, e))?;
     tmp.write_all(rendered.as_bytes())
         .map_err(|e| IoError::io(tmp.path(), e))?;
     tmp.as_file_mut()
         .sync_all()
         .map_err(|e| IoError::io(tmp.path(), e))?;
-    tmp.persist(path)
-        .map_err(|e| IoError::io(path, e.error))?;
+    tmp.persist(path).map_err(|e| IoError::io(path, e.error))?;
 
     Ok(())
 }

@@ -1,0 +1,52 @@
+# Pre-commit config — install with `pipx install pre-commit && pre-commit install`
+# (or `pip install --user pre-commit`). The same set is mirrored by the `lint`
+# job in `.github/workflows/ci.yml`, so anything these hooks catch locally
+# would have failed CI anyway.
+
+repos:
+  # -------- Off-the-shelf hygiene hooks --------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: check-json
+        # Biome handles the project's JSON (lint + format); this is a
+        # safety net for files outside the Biome scope.
+        exclude: ^(biome\.json|package-lock\.json|src-tauri/Cargo\.lock|src-tauri/tauri\.conf\.json|src-tauri/capabilities/)
+      - id: check-toml
+      - id: check-yaml
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  # -------- TypeScript / JS / CSS / JSON (Biome) --------
+  - repo: https://github.com/biomejs/pre-commit
+    rev: v2.4.12
+    hooks:
+      - id: biome-check
+        additional_dependencies: ["@biomejs/biome@2.4.12"]
+
+  # -------- Rust: fmt + clippy --------
+  # Using local hooks because the upstream `doublify/pre-commit-rust` repo is
+  # unmaintained. These rely on a local Rust toolchain with rustfmt + clippy.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        description: Format Rust sources with rustfmt.
+        language: system
+        entry: cargo fmt --all --manifest-path src-tauri/Cargo.toml --check
+        pass_filenames: false
+        files: \.rs$
+
+      - id: cargo-clippy
+        name: cargo clippy
+        description: Lint Rust sources with clippy, denying warnings.
+        language: system
+        entry: cargo clippy --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+        pass_filenames: false
+        files: \.rs$

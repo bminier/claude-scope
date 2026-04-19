@@ -101,3 +101,48 @@ jobs:
       - name: Rust check (lib + tests) on MSRV
         working-directory: src-tauri
         run: cargo check --lib --tests --locked
+
+  lint:
+    # Mirrors `.pre-commit-config.yaml` — anything that fails here should
+    # have failed locally. Splitting out as its own job keeps the signal
+    # distinct from the matrix build, and runs in parallel so it's cheap.
+    name: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: lint
+
+      - name: Install Linux GUI deps (for clippy)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - run: npm ci
+
+      - name: Build frontend
+        # clippy compiles the lib, and the tauri::generate_context!() macro
+        # requires the frontendDist path to exist at compile time.
+        run: npm run build
+
+      - uses: pre-commit/action@v3.0.1

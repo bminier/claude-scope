@@ -20,8 +20,11 @@ pub enum PermissionKind {
 }
 
 impl PermissionKind {
-    pub const ALL: [PermissionKind; 3] =
-        [PermissionKind::Allow, PermissionKind::Deny, PermissionKind::Ask];
+    pub const ALL: [PermissionKind; 3] = [
+        PermissionKind::Allow,
+        PermissionKind::Deny,
+        PermissionKind::Ask,
+    ];
 
     pub fn key(self) -> &'static str {
         match self {
@@ -302,7 +305,10 @@ mod tests {
     fn add_then_remove_roundtrip() {
         let mut doc = SettingsDoc::empty();
         doc.add_rule(PermissionKind::Allow, "Bash(git status)");
-        assert!(doc.permissions().allow.contains(&"Bash(git status)".to_string()));
+        assert!(doc
+            .permissions()
+            .allow
+            .contains(&"Bash(git status)".to_string()));
         assert!(doc.remove_rule(PermissionKind::Allow, "Bash(git status)"));
         assert!(doc.permissions().allow.is_empty());
     }
@@ -318,10 +324,8 @@ mod tests {
     #[test]
     fn render_preserves_key_order_and_indent() {
         let doc = SettingsDoc::from_value(
-            serde_json::from_str(
-                r#"{"theme":"dark","permissions":{"allow":["a"],"deny":[]}}"#,
-            )
-            .unwrap(),
+            serde_json::from_str(r#"{"theme":"dark","permissions":{"allow":["a"],"deny":[]}}"#)
+                .unwrap(),
             Indent::Spaces(4),
         );
         let out = doc.render();

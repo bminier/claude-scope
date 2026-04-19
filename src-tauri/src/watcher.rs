@@ -31,9 +31,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use notify_debouncer_mini::{
-    new_debouncer, notify::RecursiveMode, DebounceEventResult, Debouncer,
-};
+use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, DebounceEventResult, Debouncer};
 use tauri::{AppHandle, Emitter};
 
 use crate::scope::ScopePaths;
@@ -106,10 +104,7 @@ impl WatchState {
             // the old watcher — there's explicitly nothing to replace it
             // with. Recover from a poisoned mutex so one bad panic in the
             // callback thread doesn't permanently disable install/uninstall.
-            let mut guard = self
-                .debouncer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut guard = self.debouncer.lock().unwrap_or_else(|e| e.into_inner());
             guard.take();
             return Ok(());
         }
@@ -165,8 +160,7 @@ impl WatchState {
                         .path
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .map(|n| FILENAME_ALLOWLIST.iter().any(|w| *w == n))
-                        .unwrap_or(false);
+                        .is_some_and(|n| FILENAME_ALLOWLIST.contains(&n));
                     if !name_ok {
                         return false;
                     }
@@ -205,10 +199,7 @@ impl WatchState {
         // Swap-then-drop: the new debouncer is fully constructed and watching
         // at this point, so replacing the slot is atomic. The old value is
         // dropped when the guard goes out of scope, stopping its threads.
-        let mut guard = self
-            .debouncer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.debouncer.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(debouncer);
         Ok(())
     }
@@ -239,7 +230,9 @@ fn compute_watch_plan(paths: &ScopePaths) -> WatchPlan {
     let mut plan = WatchPlan::default();
     for scope_path in &scope_paths {
         plan.match_paths.insert(scope_path.clone());
-        let Some(parent) = scope_path.parent() else { continue };
+        let Some(parent) = scope_path.parent() else {
+            continue;
+        };
         // `is_dir()` (not `exists()`) — a stray regular file named `.claude`
         // would satisfy `exists()` but can't be watched as a directory, so
         // we fall through to the grandparent watch instead and wait for it
@@ -321,7 +314,11 @@ fn recent_self_write(slot: &Arc<Mutex<Instant>>) -> bool {
 mod tests {
     use super::*;
 
-    fn scope_paths_from(local: Option<PathBuf>, project: Option<PathBuf>, user: Option<PathBuf>) -> ScopePaths {
+    fn scope_paths_from(
+        local: Option<PathBuf>,
+        project: Option<PathBuf>,
+        user: Option<PathBuf>,
+    ) -> ScopePaths {
         ScopePaths {
             project_dir: PathBuf::from("/tmp/unused"),
             local,
@@ -338,8 +335,14 @@ mod tests {
         let settings = claude_dir.join("settings.json");
 
         let plan = compute_watch_plan(&scope_paths_from(None, Some(settings.clone()), None));
-        assert!(plan.roots.contains(&claude_dir), "should watch .claude/ when it exists");
-        assert!(plan.match_paths.contains(&settings), "scope path is always in match set");
+        assert!(
+            plan.roots.contains(&claude_dir),
+            "should watch .claude/ when it exists"
+        );
+        assert!(
+            plan.match_paths.contains(&settings),
+            "scope path is always in match set"
+        );
         // Parent of .claude/ is NOT a root in this case — we don't need it.
         assert!(!plan.roots.contains(tmp.path()));
     }
@@ -393,7 +396,10 @@ mod tests {
         // A fabricated path that has no existing ancestor on the system.
         let ghost = PathBuf::from("/nonexistent-claudescope-root/x/.claude/settings.json");
         let plan = compute_watch_plan(&scope_paths_from(None, Some(ghost.clone()), None));
-        assert!(plan.roots.is_empty(), "no existing ancestor => no watch roots");
+        assert!(
+            plan.roots.is_empty(),
+            "no existing ancestor => no watch roots"
+        );
         assert!(
             plan.match_paths.contains(&ghost),
             "match set still contains the scope path for future re-installs",
