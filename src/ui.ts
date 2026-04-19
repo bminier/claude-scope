@@ -8,6 +8,7 @@ import type {
   ScopeView,
 } from "./types.ts";
 import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
+import { lintRule } from "./lint.ts";
 
 interface AppProps {
   scopes: LoadedScopes | null;
@@ -196,14 +197,42 @@ function effectivePanel(
         : `${KIND_LABELS[kind]} (${matched.length}/${all.length})`;
     group.appendChild(label);
     for (const rule of matched) {
+      // Chip + optional badge wrap as a single flex item. Without the
+      // wrapper, the badge can break onto a new line without its chip
+      // because `.eff-group` uses `flex-wrap: wrap`, and it would then
+      // be ambiguous which rule the warning belongs to.
+      const chipWrap = document.createElement("span");
+      chipWrap.className = "chip-wrap";
       const chip = document.createElement("code");
       chip.className = "chip";
       chip.textContent = rule;
-      group.appendChild(chip);
+      chipWrap.appendChild(chip);
+      const badge = lintBadge(rule);
+      if (badge) chipWrap.appendChild(badge);
+      group.appendChild(chipWrap);
     }
     panel.appendChild(group);
   }
   return panel;
+}
+
+/**
+ * Returns a small warning element when the rule fails shape lint, or null
+ * when the rule looks well-formed. The lint is intentionally lenient — we
+ * can't match Claude Code's real parser precisely — so we flag rather than
+ * block.
+ */
+function lintBadge(rule: string): HTMLElement | null {
+  const result = lintRule(rule);
+  if (result.ok) return null;
+  const warn = document.createElement("span");
+  warn.className = "lint-warn";
+  warn.textContent = "⚠";
+  warn.setAttribute("role", "img");
+  const reason = result.reason ?? "Rule shape not recognized.";
+  warn.setAttribute("aria-label", `Rule warning: ${reason}`);
+  warn.title = reason;
+  return warn;
 }
 
 function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
@@ -308,6 +337,9 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
   code.className = "rule-text";
   code.textContent = rule;
   row.appendChild(code);
+
+  const badge = lintBadge(rule);
+  if (badge) row.appendChild(badge);
 
   const moveBtns = document.createElement("div");
   moveBtns.className = "rule-moves";

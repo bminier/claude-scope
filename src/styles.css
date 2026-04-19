@@ -472,3 +472,32 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 }
+
+/* Keeps the chip + ⚠ badge together as a single flex item inside
+   `.eff-group`; without this they can wrap to separate lines and orphan
+   the warning. */
+.chip-wrap {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Shape-lint warning badge — rendered next to rule strings that don't
+   match a recognized Claude Code permission-rule shape. Intentionally
+   subtle: we flag, we don't block. */
+.lint-warn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-left: 6px;
+  color: var(--ask);
+  font-size: 12px;
+  cursor: help;
+  flex-shrink: 0;
+}
+
+.chip + .lint-warn {
+  margin-left: -2px;
+  margin-right: 4px;
+}
