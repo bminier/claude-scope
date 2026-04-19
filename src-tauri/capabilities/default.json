@@ -3,8 +3,5 @@
   "identifier": "default",
   "description": "default permissions",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "dialog:default"
-  ]
+  "permissions": ["core:default", "dialog:default"]
 }

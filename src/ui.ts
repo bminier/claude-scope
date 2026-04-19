@@ -1,3 +1,4 @@
+import { lintRule } from "./lint.ts";
 import type {
   LoadedScopes,
   MovePreview,
@@ -8,7 +9,6 @@ import type {
   ScopeView,
 } from "./types.ts";
 import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
-import { lintRule } from "./lint.ts";
 
 interface AppProps {
   scopes: LoadedScopes | null;
@@ -47,10 +47,9 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   // the input becomes unusable.
   const active = document.activeElement;
   const preserveSearchFocus = active instanceof HTMLInputElement && active.id === SEARCH_INPUT_ID;
-  const caret =
-    preserveSearchFocus
-      ? { start: active.selectionStart, end: active.selectionEnd }
-      : null;
+  const caret = preserveSearchFocus
+    ? { start: active.selectionStart, end: active.selectionEnd }
+    : null;
 
   root.innerHTML = "";
   root.appendChild(header(props));
@@ -96,7 +95,8 @@ function header(props: AppProps): HTMLElement {
 
   const title = document.createElement("div");
   title.className = "title";
-  title.innerHTML = "<strong>ClaudeScope</strong><span class='subtitle'>Promote Claude Code settings between scopes</span>";
+  title.innerHTML =
+    "<strong>ClaudeScope</strong><span class='subtitle'>Promote Claude Code settings between scopes</span>";
   bar.appendChild(title);
 
   const dir = document.createElement("div");
@@ -168,11 +168,7 @@ function searchBox(props: AppProps): HTMLElement {
   return wrap;
 }
 
-function effectivePanel(
-  loaded: LoadedScopes,
-  query: string,
-  lowerQuery: string,
-): HTMLElement {
+function effectivePanel(loaded: LoadedScopes, query: string, lowerQuery: string): HTMLElement {
   const panel = document.createElement("section");
   panel.className = "effective";
   const title = document.createElement("h2");
@@ -238,8 +234,14 @@ function lintBadge(rule: string): HTMLElement | null {
 function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
   const grid = document.createElement("section");
   grid.className = "grid";
+  // `renderApp` already bailed when props.scopes is null, so this is
+  // effectively an assert — but narrow locally rather than lean on `!` so
+  // a future caller can't crash at runtime.
+  const loaded = props.scopes;
+  if (!loaded) return grid;
   for (const scope of SCOPES) {
-    const view = props.scopes!.scopes.find((s) => s.scope === scope)!;
+    const view = loaded.scopes.find((s) => s.scope === scope);
+    if (!view) continue;
     grid.appendChild(scopeColumn(view, props, lowerQuery));
   }
   return grid;
@@ -270,9 +272,7 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
     status.classList.add("muted");
   } else {
     const totals =
-      view.permissions.allow.length +
-      view.permissions.deny.length +
-      view.permissions.ask.length;
+      view.permissions.allow.length + view.permissions.deny.length + view.permissions.ask.length;
     status.textContent = `${totals} permission rule${totals === 1 ? "" : "s"}`;
   }
   head.appendChild(status);
@@ -284,8 +284,7 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
   // view and the column-level "no matches" placeholder without re-filtering.
   const groups = kinds.map((kind) => {
     const rules = view.permissions[kind];
-    const matched =
-      isFiltering ? rules.filter((r) => matchesLoweredQuery(r, lowerQuery)) : rules;
+    const matched = isFiltering ? rules.filter((r) => matchesLoweredQuery(r, lowerQuery)) : rules;
     return { kind, rules, matched };
   });
   const totalAll = groups.reduce((s, g) => s + g.rules.length, 0);
@@ -354,10 +353,7 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
     );
     btn.disabled = props.busy;
     btn.onclick = (e) =>
-      props.onMove(
-        { rule, kind, from: scope, to: target },
-        e.currentTarget as HTMLElement,
-      );
+      props.onMove({ rule, kind, from: scope, to: target }, e.currentTarget as HTMLElement);
     moveBtns.appendChild(btn);
   }
   row.appendChild(moveBtns);
@@ -378,10 +374,7 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
  * If `trigger` is passed and still live in the DOM when the dialog closes,
  * focus is returned to it.
  */
-export function confirmMove(
-  preview: MovePreview,
-  trigger?: HTMLElement | null,
-): Promise<boolean> {
+export function confirmMove(preview: MovePreview, trigger?: HTMLElement | null): Promise<boolean> {
   return new Promise((resolve) => {
     const backdrop = document.createElement("div");
     backdrop.className = "modal-backdrop";
@@ -406,7 +399,11 @@ export function confirmMove(
     ruleCode.className = "chip";
     ruleCode.textContent = preview.rule;
     subtitle.appendChild(ruleCode);
-    subtitle.appendChild(document.createTextNode(` from ${SCOPE_LABELS[preview.from.scope]} to ${SCOPE_LABELS[preview.to.scope]}`));
+    subtitle.appendChild(
+      document.createTextNode(
+        ` from ${SCOPE_LABELS[preview.from.scope]} to ${SCOPE_LABELS[preview.to.scope]}`,
+      ),
+    );
     panel.appendChild(subtitle);
 
     const diff = document.createElement("div");
@@ -454,9 +451,7 @@ export function confirmMove(
         return;
       }
       if (e.key === "Tab") {
-        const focusables = Array.from(
-          panel.querySelectorAll<HTMLElement>(focusableSelector),
-        );
+        const focusables = Array.from(panel.querySelectorAll<HTMLElement>(focusableSelector));
         if (focusables.length === 0) {
           e.preventDefault();
           return;

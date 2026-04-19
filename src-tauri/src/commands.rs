@@ -192,9 +192,7 @@ fn diff_move_impl(
     let from_doc = match io_atomic::load(from_path)? {
         Some(d) => d,
         None => {
-            return Err(
-                format!("source file {} does not exist", from_path.display()).into(),
-            );
+            return Err(format!("source file {} does not exist", from_path.display()).into());
         }
     };
     let from_before = from_doc.permissions().get(req.kind).to_vec();
@@ -314,7 +312,9 @@ fn apply_move_impl(
             }
             watch.note_self_write();
         }
-        return Err(format!("source save failed and destination was rolled back: {source_err}").into());
+        return Err(
+            format!("source save failed and destination was rolled back: {source_err}").into(),
+        );
     }
     watch.note_self_write();
     Ok(())
@@ -379,11 +379,18 @@ mod tests {
         )
         .unwrap();
 
-        let project_doc = io_atomic::load(paths.project.as_ref().unwrap()).unwrap().unwrap();
-        assert_eq!(project_doc.permissions().allow, vec!["Read(**)".to_string()]);
+        let project_doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            project_doc.permissions().allow,
+            vec!["Read(**)".to_string()]
+        );
         assert!(project_doc.top_level_keys().iter().any(|k| k == "theme"));
 
-        let user_doc = io_atomic::load(paths.user.as_ref().unwrap()).unwrap().unwrap();
+        let user_doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             user_doc.permissions().allow,
             vec!["Bash(git status)".to_string()]
@@ -441,9 +448,17 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!preview.to.will_write, "dest doesn't need a write when rule already there");
+        assert!(
+            !preview.to.will_write,
+            "dest doesn't need a write when rule already there"
+        );
         assert_eq!(preview.to.rules_before, preview.to.rules_after);
-        assert!(preview.to.note.as_deref().unwrap().contains("Already present"));
+        assert!(preview
+            .to
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("Already present"));
     }
 
     #[test]
@@ -509,12 +524,16 @@ mod tests {
         )
         .unwrap();
 
-        let local_doc = io_atomic::load(paths.local.as_ref().unwrap()).unwrap().unwrap();
+        let local_doc = io_atomic::load(paths.local.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             local_doc.permissions().deny,
             vec!["WebFetch(domain:evil.example)".to_string()]
         );
-        let project_doc = io_atomic::load(paths.project.as_ref().unwrap()).unwrap().unwrap();
+        let project_doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
         assert!(project_doc.permissions().deny.is_empty());
     }
 
@@ -571,7 +590,9 @@ mod tests {
         .unwrap();
 
         // Source still loses the rule.
-        let project_doc = io_atomic::load(paths.project.as_ref().unwrap()).unwrap().unwrap();
+        let project_doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
         assert!(project_doc.permissions().allow.is_empty());
         // Destination was not rewritten, so no .bak should have been created.
         assert!(
@@ -584,7 +605,10 @@ mod tests {
     fn move_missing_rule_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());
-        write(paths.project.as_ref().unwrap(), r#"{"permissions":{"allow":[]}}"#);
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":[]}}"#,
+        );
         let err = apply_move_impl(
             &paths,
             &MoveRequest {
