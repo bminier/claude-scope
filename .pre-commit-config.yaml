@@ -14,9 +14,6 @@ repos:
       - id: check-added-large-files
         args: ["--maxkb=512"]
       - id: check-json
-        # Biome handles the project's JSON (lint + format); this is a
-        # safety net for files outside the Biome scope.
-        exclude: ^(biome\.json|package-lock\.json|src-tauri/Cargo\.lock|src-tauri/tauri\.conf\.json|src-tauri/capabilities/)
       - id: check-toml
       - id: check-yaml
       - id: detect-private-key

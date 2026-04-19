@@ -120,7 +120,11 @@ jobs:
           node-version: "20"
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pin to the declared MSRV so the set of clippy lints is deterministic.
+      # `stable` advances over time and new clippy lints can start failing
+      # CI with no code change — we'd rather bump the pin explicitly when
+      # we want newer signal.
+      - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
 
