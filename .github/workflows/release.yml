@@ -37,7 +37,7 @@ jobs:
   # matrix leg in `release` builds from the same commit and uploads to the
   # same draft release. On tag push both are just the tag. On
   # workflow_dispatch, an input tag wins; otherwise we synthesize a
-  # disposable `nightly-<short-sha>` draft off the dispatched branch.
+  # disposable `nightly-<full-sha>` draft off the dispatched branch.
   setup:
     runs-on: ubuntu-24.04
     outputs:
