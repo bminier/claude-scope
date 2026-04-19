@@ -1,0 +1,25 @@
+# EditorConfig helps maintain consistent coding style across editors.
+# Biome owns the enforcement for TS/JS/JSON/CSS (see biome.json); rustfmt
+# owns Rust (.rustfmt.toml — we use defaults). This file fills the gap
+# for everything else so editors don't silently introduce drift.
+# https://editorconfig.org
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.rs]
+indent_size = 4
+
+[*.md]
+# Markdown uses trailing whitespace for intentional line breaks.
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab
