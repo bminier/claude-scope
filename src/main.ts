@@ -3,11 +3,18 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 import { confirmMove, renderApp } from "./ui.ts";
 import type { LoadedScopes, MovePreview, MoveRequest } from "./types.ts";
+import { SEARCH_INPUT_ID } from "./types.ts";
 
-const state: { scopes: LoadedScopes | null; projectDir: string | null; busy: boolean } = {
+const state: {
+  scopes: LoadedScopes | null;
+  projectDir: string | null;
+  busy: boolean;
+  query: string;
+} = {
   scopes: null,
   projectDir: null,
   busy: false,
+  query: "",
 };
 
 async function load(projectDir: string | null): Promise<void> {
@@ -37,6 +44,11 @@ async function pickProject(): Promise<void> {
   if (moveInFlight) return;
   const picked = await openDialog({ directory: true, multiple: false });
   if (typeof picked === "string") {
+    // Reset the filter when the user explicitly picks a different project —
+    // a query that matched rules in the old project would silently hide the
+    // new project's rules otherwise. Plain Reload keeps the filter intact
+    // so move → reload flows don't clobber the user's context.
+    state.query = "";
     await load(picked);
   }
 }
@@ -83,6 +95,12 @@ async function moveRule(req: MoveRequest, trigger?: HTMLElement): Promise<void> 
   }
 }
 
+function setQuery(next: string): void {
+  if (state.query === next) return;
+  state.query = next;
+  render();
+}
+
 function render(): void {
   const root = document.getElementById("app");
   if (!root) return;
@@ -90,10 +108,39 @@ function render(): void {
     scopes: state.scopes,
     projectDir: state.projectDir,
     busy: state.busy,
+    query: state.query,
     onPickProject: pickProject,
     onReload: reload,
     onMove: moveRule,
+    onQueryChange: setQuery,
   });
 }
+
+// Pressing "/" anywhere focuses the rule-search input, GitHub / Gmail style —
+// but skip when the user is already typing in a text field or interacting
+// with a modal, so we don't steal their keystroke.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "/" || e.ctrlKey || e.metaKey || e.altKey) return;
+  // Bail out if something else already handled this keystroke so we don't
+  // hijack future shortcuts that happen to include "/".
+  if (e.defaultPrevented) return;
+  const target = e.target as HTMLElement | null;
+  if (
+    target &&
+    (target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.isContentEditable)
+  ) {
+    return;
+  }
+  if (document.querySelector(".modal-backdrop")) return;
+  const search = document.getElementById(SEARCH_INPUT_ID) as HTMLInputElement | null;
+  // Don't swallow the keystroke if the input is missing or currently
+  // disabled (e.g. before any project has loaded).
+  if (!search || search.disabled) return;
+  e.preventDefault();
+  search.focus();
+  search.select();
+});
 
 load(null);

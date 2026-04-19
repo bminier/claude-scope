@@ -40,6 +40,89 @@ body {
   padding: 12px 16px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.search {
+  position: relative;
+  flex: 0 1 320px;
+  min-width: 180px;
+}
+
+.search-input {
+  width: 100%;
+  padding: 6px 28px 6px 10px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+}
+
+.search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Keyboard users get a stronger, theme-independent ring so focus stays
+   visible even where the border-color shift alone washes out (e.g. high
+   contrast modes). Mouse users still fall back to the quieter :focus. */
+.search-input:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px rgba(122, 162, 247, 0.25);
+}
+
+.search-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.search-input::placeholder {
+  color: var(--muted);
+}
+
+/* Hide WebKit's built-in cancel affordance for type=search — we render our
+   own × button so users don't see two stacked clear controls. */
+.search-input[type="search"]::-webkit-search-cancel-button,
+.search-input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.search-clear {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  padding: 0 6px;
+  line-height: 1;
+  font-size: 16px;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.search-clear:hover {
+  color: var(--text);
+}
+
+.search-clear:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+  color: var(--text);
+}
+
+.col-no-matches {
+  padding: 12px 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: italic;
+  text-align: center;
 }
 
 .title strong {

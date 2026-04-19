@@ -7,15 +7,22 @@ import type {
   Scope,
   ScopeView,
 } from "./types.ts";
-import { SCOPES } from "./types.ts";
+import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
 
 interface AppProps {
   scopes: LoadedScopes | null;
   projectDir: string | null;
   busy: boolean;
+  query: string;
   onPickProject: () => void;
   onReload: () => void;
   onMove: (req: MoveRequest, trigger?: HTMLElement) => void;
+  onQueryChange: (next: string) => void;
+}
+
+function matchesLoweredQuery(rule: string, lowerQuery: string): boolean {
+  if (lowerQuery === "") return true;
+  return rule.toLowerCase().includes(lowerQuery);
 }
 
 const SCOPE_LABELS: Record<Scope, string> = {
@@ -33,6 +40,17 @@ const KIND_LABELS: Record<PermissionKind, string> = {
 let modalIdCounter = 0;
 
 export function renderApp(root: HTMLElement, props: AppProps): void {
+  // Full re-render destroys the DOM, including the search input the user
+  // is typing into. Snapshot its focus + selection before we wipe, restore
+  // after we rebuild — otherwise focus jumps to body on every keystroke and
+  // the input becomes unusable.
+  const active = document.activeElement;
+  const preserveSearchFocus = active instanceof HTMLInputElement && active.id === SEARCH_INPUT_ID;
+  const caret =
+    preserveSearchFocus
+      ? { start: active.selectionStart, end: active.selectionEnd }
+      : null;
+
   root.innerHTML = "";
   root.appendChild(header(props));
 
@@ -41,11 +59,34 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
     empty.className = "empty";
     empty.textContent = props.busy ? "Loading…" : "No settings loaded.";
     root.appendChild(empty);
+    restoreSearchFocus(preserveSearchFocus, caret);
     return;
   }
 
-  root.appendChild(effectivePanel(props.scopes));
-  root.appendChild(scopeGrid(props));
+  // Lowercase the query once per render instead of per rule; scopeGrid/
+  // effectivePanel push this down into every filter call.
+  const lowerQuery = props.query.toLowerCase();
+  root.appendChild(effectivePanel(props.scopes, props.query, lowerQuery));
+  root.appendChild(scopeGrid(props, lowerQuery));
+  restoreSearchFocus(preserveSearchFocus, caret);
+}
+
+function restoreSearchFocus(
+  shouldRestore: boolean,
+  caret: { start: number | null; end: number | null } | null,
+): void {
+  if (!shouldRestore) return;
+  const input = document.getElementById(SEARCH_INPUT_ID) as HTMLInputElement | null;
+  if (!input) return;
+  input.focus();
+  if (caret && caret.start !== null && caret.end !== null) {
+    try {
+      input.setSelectionRange(caret.start, caret.end);
+    } catch {
+      // `type="search"` supports this on all major browsers, but some
+      // embedded webviews might not — fall through silently.
+    }
+  }
 }
 
 function header(props: AppProps): HTMLElement {
@@ -61,6 +102,8 @@ function header(props: AppProps): HTMLElement {
   dir.className = "project-dir";
   dir.textContent = props.projectDir ? `Project: ${props.projectDir}` : "No project selected";
   bar.appendChild(dir);
+
+  bar.appendChild(searchBox(props));
 
   const actions = document.createElement("div");
   actions.className = "actions";
@@ -81,7 +124,54 @@ function header(props: AppProps): HTMLElement {
   return bar;
 }
 
-function effectivePanel(loaded: LoadedScopes): HTMLElement {
+function searchBox(props: AppProps): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.className = "search";
+
+  const input = document.createElement("input");
+  input.type = "search";
+  input.className = "search-input";
+  input.id = SEARCH_INPUT_ID;
+  input.placeholder = "Filter rules…  (press / to focus)";
+  input.value = props.query;
+  input.setAttribute("aria-label", "Filter permission rules across scopes");
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.disabled = !props.scopes;
+  input.addEventListener("input", () => props.onQueryChange(input.value));
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && input.value !== "") {
+      e.preventDefault();
+      input.value = "";
+      props.onQueryChange("");
+    }
+  });
+  wrap.appendChild(input);
+
+  if (props.query !== "") {
+    const clear = document.createElement("button");
+    clear.type = "button";
+    clear.className = "search-clear";
+    clear.setAttribute("aria-label", "Clear filter");
+    clear.textContent = "×";
+    clear.onclick = () => {
+      // Focus the input first so the pre-render snapshot in renderApp() sees
+      // it as the active element and restores focus there — otherwise focus
+      // jumps to body after the clear.
+      input.focus();
+      props.onQueryChange("");
+    };
+    wrap.appendChild(clear);
+  }
+
+  return wrap;
+}
+
+function effectivePanel(
+  loaded: LoadedScopes,
+  query: string,
+  lowerQuery: string,
+): HTMLElement {
   const panel = document.createElement("section");
   panel.className = "effective";
   const title = document.createElement("h2");
@@ -90,13 +180,22 @@ function effectivePanel(loaded: LoadedScopes): HTMLElement {
 
   const kinds: PermissionKind[] = ["allow", "deny", "ask"];
   for (const kind of kinds) {
+    const all = loaded.effective_permissions[kind];
+    // Fast path when the filter is empty — no allocation, no iteration.
+    const matched = lowerQuery === "" ? all : all.filter((r) => matchesLoweredQuery(r, lowerQuery));
     const group = document.createElement("div");
     group.className = `eff-group eff-${kind}`;
     const label = document.createElement("span");
     label.className = "eff-label";
-    label.textContent = `${KIND_LABELS[kind]} (${loaded.effective_permissions[kind].length})`;
+    // Show matched/total when a filter is active AND the group isn't empty —
+    // otherwise "(0/0)" reads as noise. Unfiltered groups and empty groups
+    // fall back to the plain "(N)" format.
+    label.textContent =
+      query === "" || all.length === 0
+        ? `${KIND_LABELS[kind]} (${all.length})`
+        : `${KIND_LABELS[kind]} (${matched.length}/${all.length})`;
     group.appendChild(label);
-    for (const rule of loaded.effective_permissions[kind]) {
+    for (const rule of matched) {
       const chip = document.createElement("code");
       chip.className = "chip";
       chip.textContent = rule;
@@ -107,17 +206,17 @@ function effectivePanel(loaded: LoadedScopes): HTMLElement {
   return panel;
 }
 
-function scopeGrid(props: AppProps): HTMLElement {
+function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
   const grid = document.createElement("section");
   grid.className = "grid";
   for (const scope of SCOPES) {
     const view = props.scopes!.scopes.find((s) => s.scope === scope)!;
-    grid.appendChild(scopeColumn(view, props));
+    grid.appendChild(scopeColumn(view, props, lowerQuery));
   }
   return grid;
 }
 
-function scopeColumn(view: ScopeView, props: AppProps): HTMLElement {
+function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTMLElement {
   const col = document.createElement("div");
   col.className = "col";
 
@@ -151,18 +250,44 @@ function scopeColumn(view: ScopeView, props: AppProps): HTMLElement {
   col.appendChild(head);
 
   const kinds: PermissionKind[] = ["allow", "deny", "ask"];
-  for (const kind of kinds) {
+  const isFiltering = lowerQuery !== "";
+  // Compute all the groups up front so we can decide between the per-kind
+  // view and the column-level "no matches" placeholder without re-filtering.
+  const groups = kinds.map((kind) => {
     const rules = view.permissions[kind];
-    if (rules.length === 0) continue;
-    const section = document.createElement("div");
-    section.className = `rule-group rule-${kind}`;
-    const label = document.createElement("h4");
-    label.textContent = `${KIND_LABELS[kind]} (${rules.length})`;
-    section.appendChild(label);
-    for (const rule of rules) {
-      section.appendChild(ruleRow(view.scope, kind, rule, props));
+    const matched =
+      isFiltering ? rules.filter((r) => matchesLoweredQuery(r, lowerQuery)) : rules;
+    return { kind, rules, matched };
+  });
+  const totalAll = groups.reduce((s, g) => s + g.rules.length, 0);
+  const totalMatched = groups.reduce((s, g) => s + g.matched.length, 0);
+
+  if (isFiltering && totalAll > 0 && totalMatched === 0) {
+    // Nothing matched anywhere in this scope — replace the group headers with
+    // a single column-level placeholder so the user doesn't see three empty
+    // "(0/N)" headers stacked on top of each other.
+    const none = document.createElement("div");
+    none.className = "col-no-matches";
+    none.textContent = `No rules match “${props.query}”.`;
+    col.appendChild(none);
+  } else {
+    for (const { kind, rules, matched } of groups) {
+      // Skip empty kinds outright. When filtering, kinds that exist but
+      // have 0 matches still render a header so the m/n count makes the
+      // hidden rules visible to the user.
+      if (rules.length === 0) continue;
+      const section = document.createElement("div");
+      section.className = `rule-group rule-${kind}`;
+      const label = document.createElement("h4");
+      label.textContent = isFiltering
+        ? `${KIND_LABELS[kind]} (${matched.length}/${rules.length})`
+        : `${KIND_LABELS[kind]} (${rules.length})`;
+      section.appendChild(label);
+      for (const rule of matched) {
+        section.appendChild(ruleRow(view.scope, kind, rule, props));
+      }
+      col.appendChild(section);
     }
-    col.appendChild(section);
   }
 
   if (view.other_keys.length > 0) {
