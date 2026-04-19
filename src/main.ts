@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 import { confirmMove, renderApp } from "./ui.ts";
@@ -17,6 +18,13 @@ const state: {
   query: "",
 };
 
+// Set by the scopes-changed listener when it fires while another load or
+// move is already in flight. The load that finishes last checks this flag
+// in its finally block and kicks off one deferred reload, so we don't miss
+// external edits that happen during a load without needing a full job
+// queue.
+let externalReloadPending = false;
+
 async function load(projectDir: string | null): Promise<void> {
   state.busy = true;
   render();
@@ -29,6 +37,10 @@ async function load(projectDir: string | null): Promise<void> {
   } finally {
     state.busy = false;
     render();
+    if (externalReloadPending && !moveInFlight) {
+      externalReloadPending = false;
+      void load(state.projectDir);
+    }
   }
 }
 
@@ -92,6 +104,15 @@ async function moveRule(req: MoveRequest, trigger?: HTMLElement): Promise<void> 
     }
   } finally {
     moveInFlight = false;
+    // A scopes-changed event that landed while the diff modal was open
+    // set externalReloadPending but couldn't trigger its own load (we
+    // were in the middle of a move). Drain it here so an external edit
+    // during the confirm step still gets picked up after the modal
+    // closes. load()'s finally does the same thing for the load case.
+    if (externalReloadPending && !state.busy) {
+      externalReloadPending = false;
+      void load(state.projectDir);
+    }
   }
 }
 
@@ -141,6 +162,35 @@ document.addEventListener("keydown", (e) => {
   e.preventDefault();
   search.focus();
   search.select();
+});
+
+// The Rust watcher (`src-tauri/src/watcher.rs`) emits `scopes-changed` when
+// any of the three settings files mutates externally. Reload the data so the
+// UI mirrors what's on disk.
+//
+// If a load or move is already in flight, skip this reload but set a sticky
+// flag — the current load's finally block will drain it with a single
+// follow-up reload. That prevents overlapping `load_scopes` invokes and the
+// out-of-order state writes that would come with them, without needing a
+// full job queue.
+listen("scopes-changed", () => {
+  if (moveInFlight || state.busy) {
+    externalReloadPending = true;
+    return;
+  }
+  void load(state.projectDir);
+}).catch((err) => {
+  console.error("failed to register scopes-changed listener", err);
+});
+
+// Backend emits this when the file watcher fails to install — auto-reload is
+// a non-fatal nice-to-have, so we just log to devtools rather than hijacking
+// the UI with an alert. Windows release builds discard stderr, so this is
+// how the failure stays observable in production.
+listen<string>("watcher-error", (evt) => {
+  console.warn("ClaudeScope watcher install failed:", evt.payload);
+}).catch((err) => {
+  console.error("failed to register watcher-error listener", err);
 });
 
 load(null);

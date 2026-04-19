@@ -4,10 +4,12 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::io_atomic::{self, BackupTracker};
 use crate::model::{PermissionKind, PermissionRules, SettingsDoc};
 use crate::scope::{self, Scope, ScopePaths};
+use crate::watcher::WatchState;
 
 /// Process-global backup tracker so we only write one `.bak` per file per
 /// session, regardless of which command triggered the first write.
@@ -69,10 +71,25 @@ pub struct MoveSide {
 }
 
 #[tauri::command]
-pub fn load_scopes(project_dir: Option<String>) -> Result<LoadedScopes, String> {
+pub fn load_scopes(
+    project_dir: Option<String>,
+    app: AppHandle,
+    watch: State<'_, WatchState>,
+) -> Result<LoadedScopes, String> {
     let start = project_dir.as_ref().map(Path::new);
     let paths = scope::resolve(start).map_err(|e| e.to_string())?;
-    build_loaded(&paths).map_err(|e| e.to_string())
+    let loaded = build_loaded(&paths).map_err(|e| e.to_string())?;
+    // (Re)install the watcher every time we load. This handles both first
+    // load and project-switch with no extra command surface area for the
+    // front-end to keep in sync. Watcher errors are non-fatal — auto-reload
+    // is a nice-to-have, the load itself succeeded. Surface the failure as
+    // a Tauri event instead of eprintln!() so it's observable from the
+    // front-end: on Windows release builds we set windows_subsystem =
+    // "windows", which discards stderr entirely.
+    if let Err(err) = watch.install(app.clone(), &paths) {
+        let _ = app.emit("watcher-error", err);
+    }
+    Ok(loaded)
 }
 
 #[tauri::command]
@@ -83,10 +100,14 @@ pub fn diff_move(req: MoveRequest, project_dir: Option<String>) -> Result<MovePr
 }
 
 #[tauri::command]
-pub fn apply_move(req: MoveRequest, project_dir: Option<String>) -> Result<(), String> {
+pub fn apply_move(
+    req: MoveRequest,
+    project_dir: Option<String>,
+    watch: State<'_, WatchState>,
+) -> Result<(), String> {
     let start = project_dir.as_ref().map(Path::new);
     let paths = scope::resolve(start).map_err(|e| e.to_string())?;
-    apply_move_impl(&paths, &req, backups()).map_err(|e| e.to_string())
+    apply_move_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
 }
 
 fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::Error>> {
@@ -241,6 +262,7 @@ fn apply_move_impl(
     paths: &ScopePaths,
     req: &MoveRequest,
     backups: &BackupTracker,
+    watch: &WatchState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if req.from == req.to {
         return Err("source and destination scopes must differ".into());
@@ -269,8 +291,15 @@ fn apply_move_impl(
     // Destination first, then source. If the destination already had the rule
     // there's nothing to write there; skipping the save also avoids creating
     // a spurious `.bak` for a file we aren't actually changing.
+    //
+    // `note_self_write` is called *after* each successful save, not before:
+    // a failed save means no filesystem event will arrive, so suppressing a
+    // would-be-legitimate external change would leave the UI stale for no
+    // reason. The 200ms debouncer gives us a comfortable window to record
+    // the write before the notify callback fires.
     if dest_mutated {
         io_atomic::save(&to_path, &to_doc, backups)?;
+        watch.note_self_write();
     }
     // If the source write fails after the destination was updated, roll back
     // the destination so the rule doesn't end up duplicated in both scopes.
@@ -283,9 +312,11 @@ fn apply_move_impl(
                 )
                 .into());
             }
+            watch.note_self_write();
         }
         return Err(format!("source save failed and destination was rolled back: {source_err}").into());
     }
+    watch.note_self_write();
     Ok(())
 }
 
@@ -344,6 +375,7 @@ mod tests {
                 to: Scope::User,
             },
             &backups,
+            &WatchState::default(),
         )
         .unwrap();
 
@@ -473,6 +505,7 @@ mod tests {
                 to: Scope::Local,
             },
             &backups,
+            &WatchState::default(),
         )
         .unwrap();
 
@@ -498,6 +531,7 @@ mod tests {
                 to: Scope::Project,
             },
             &BackupTracker::new(),
+            &WatchState::default(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("must differ"));
@@ -532,6 +566,7 @@ mod tests {
                 to: Scope::User,
             },
             &backups,
+            &WatchState::default(),
         )
         .unwrap();
 
@@ -559,6 +594,7 @@ mod tests {
                 to: Scope::User,
             },
             &BackupTracker::new(),
+            &WatchState::default(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("not found"));
