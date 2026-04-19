@@ -260,14 +260,26 @@ jobs:
             # release might pick — but excludes `new_name` itself, which
             # the idempotency check above already settled.
             #
-            # `first(…) // empty` picks the first match and yields no
-            # output on miss, so shell sees an empty string — no literal
-            # "null" leak that would slip past the `-z` check below.
-            match=$(echo "$assets_json" | jq -c --arg product "$product" \
-              'first(.[] | select(.name | startswith($product) and endswith(".app.tar.gz"))) // empty')
-            if [ -n "$match" ]; then
-              asset_id=$(echo "$match" | jq -r '.id')
-              matched_name=$(echo "$match" | jq -r '.name')
+            # Collect all matches and branch on the count: exactly one is
+            # the normal case, zero means keep retrying, and two-or-more
+            # means a rerun across tauri-action versions left both the
+            # legacy and new on-wire names on the draft. In that case we
+            # refuse to pick one arbitrarily — an orphan with a different
+            # name would defeat the whole point of this step. Maintainer
+            # needs to delete the stale asset in the GitHub UI and re-run.
+            matches=$(echo "$assets_json" | jq -c --arg product "$product" \
+              '[.[] | select(.name | startswith($product) and endswith(".app.tar.gz"))]')
+            match_count=$(echo "$matches" | jq 'length')
+
+            if [ "$match_count" -gt 1 ]; then
+              dupe_names=$(echo "$matches" | jq -r '.[].name' | paste -sd ", " -)
+              echo "::error::multiple assets match ${product}*.app.tar.gz on release ${RELEASE_TAG}: ${dupe_names}. Refusing to rename one and leave the other orphaned. Delete the stale asset(s) in the GitHub UI and re-run this workflow."
+              exit 1
+            fi
+
+            if [ "$match_count" -eq 1 ]; then
+              asset_id=$(echo "$matches" | jq -r '.[0].id')
+              matched_name=$(echo "$matches" | jq -r '.[0].name')
               break
             fi
 
