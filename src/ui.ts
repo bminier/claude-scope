@@ -30,6 +30,8 @@ const KIND_LABELS: Record<PermissionKind, string> = {
   ask: "ask",
 };
 
+let modalIdCounter = 0;
+
 export function renderApp(root: HTMLElement, props: AppProps): void {
   root.innerHTML = "";
   root.appendChild(header(props));
@@ -220,14 +222,16 @@ export function confirmMove(
     const backdrop = document.createElement("div");
     backdrop.className = "modal-backdrop";
 
+    const titleId = `modal-title-${++modalIdCounter}`;
+
     const panel = document.createElement("div");
     panel.className = "modal";
     panel.setAttribute("role", "dialog");
     panel.setAttribute("aria-modal", "true");
-    panel.setAttribute("aria-labelledby", "modal-title");
+    panel.setAttribute("aria-labelledby", titleId);
 
     const title = document.createElement("h2");
-    title.id = "modal-title";
+    title.id = titleId;
     title.className = "modal-title";
     title.textContent = `Move ${KIND_LABELS[preview.kind]} rule`;
     panel.appendChild(title);
@@ -336,16 +340,21 @@ function diffSide(side: MoveSide, mode: "add" | "remove", movingRule: string): H
   path.textContent = side.path;
   head.appendChild(path);
 
+  // Derive the verdict from the actual list lengths so duplicates (the
+  // backend removes *every* occurrence) and any future changes to the move
+  // semantics stay in sync with what the modal claims will happen.
+  const delta = side.rules_after.length - side.rules_before.length;
   const verdict = document.createElement("div");
   verdict.className = "modal-side-verdict";
-  if (!side.will_write) {
+  if (delta === 0) {
     verdict.textContent = "(no change)";
     verdict.classList.add("muted");
-  } else if (mode === "add") {
-    verdict.textContent = "+1 rule";
+  } else if (delta > 0) {
+    verdict.textContent = `+${delta} rule${delta === 1 ? "" : "s"}`;
     verdict.classList.add("added");
   } else {
-    verdict.textContent = "−1 rule";
+    const n = -delta;
+    verdict.textContent = `−${n} rule${n === 1 ? "" : "s"}`;
     verdict.classList.add("removed");
   }
   head.appendChild(verdict);

@@ -32,32 +32,45 @@ async function pickProject(): Promise<void> {
   }
 }
 
+// Guards against a second move flow starting while one is still running
+// (e.g. double-click on a button). Lives outside `state` because flipping it
+// must NOT trigger a re-render — re-rendering would destroy the trigger
+// button confirmMove() needs alive for focus restoration.
+let moveInFlight = false;
+
 async function moveRule(req: MoveRequest, trigger?: HTMLElement): Promise<void> {
-  const projectDir = state.projectDir;
-  // Intentionally *don't* flip busy/re-render before diff_move: it's fast,
-  // the modal itself blocks interaction once open, and keeping the triggering
-  // button alive lets confirmMove restore focus to it on Cancel/Esc.
-  let preview: MovePreview;
+  if (moveInFlight) return;
+  moveInFlight = true;
   try {
-    preview = await invoke<MovePreview>("diff_move", { req, project_dir: projectDir });
-  } catch (err) {
-    alert(`Move failed: ${err}`);
-    return;
-  }
+    const projectDir = state.projectDir;
+    // Intentionally *don't* flip state.busy / re-render before diff_move:
+    // it's fast, the modal itself blocks interaction once open, and keeping
+    // the triggering button alive lets confirmMove restore focus to it on
+    // Cancel/Esc.
+    let preview: MovePreview;
+    try {
+      preview = await invoke<MovePreview>("diff_move", { req, project_dir: projectDir });
+    } catch (err) {
+      alert(`Move failed: ${err}`);
+      return;
+    }
 
-  const apply = await confirmMove(preview, trigger);
-  if (!apply) return;
+    const apply = await confirmMove(preview, trigger);
+    if (!apply) return;
 
-  state.busy = true;
-  render();
-  try {
-    await invoke("apply_move", { req, project_dir: projectDir });
-    await load(projectDir);
-  } catch (err) {
-    alert(`Move failed: ${err}`);
-  } finally {
-    state.busy = false;
+    state.busy = true;
     render();
+    try {
+      await invoke("apply_move", { req, project_dir: projectDir });
+      await load(projectDir);
+    } catch (err) {
+      alert(`Move failed: ${err}`);
+    } finally {
+      state.busy = false;
+      render();
+    }
+  } finally {
+    moveInFlight = false;
   }
 }
 
