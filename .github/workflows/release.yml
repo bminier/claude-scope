@@ -112,7 +112,7 @@ jobs:
       # Pull the exact ref the `setup` job resolved — for tag pushes this is
       # the tag, for dispatch-with-input this is the named tag, and for
       # dispatch-without-input this is the dispatched branch HEAD.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.setup.outputs.checkout_ref }}
 
