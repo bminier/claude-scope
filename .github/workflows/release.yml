@@ -226,8 +226,12 @@ jobs:
           #     `jq --slurp` so the filter sees every page as a single
           #     stream (otherwise a match on page N+1 after a miss on
           #     page N would produce a multi-line asset_id).
-          #   * `limit(1; …)` inside jq picks the first match without a
-          #     SIGPIPE race (`jq | head -n1` would die under pipefail).
+          #   * `first(...) // empty` inside jq picks the first match and
+          #     yields no output on miss — so shell sees an empty string,
+          #     never the literal "null" that would slip past `-z` checks.
+          #     Both short-circuit semantics are important: `first` stops
+          #     consuming the generator after one hit, avoiding the
+          #     SIGPIPE race `jq | head -n1` has under pipefail.
           #   * RELEASE_TAG / product / new_name come from tauri.conf.json —
           #     pass via `--arg` so embedded quotes/backslashes can't break
           #     jq parsing.
@@ -256,9 +260,9 @@ jobs:
             # release might pick — but excludes `new_name` itself, which
             # the idempotency check above already settled.
             #
-            # Using `find(...) // empty` both picks the first match and
-            # yields no output on miss, so shell sees empty — no `null`
-            # string leak.
+            # `first(…) // empty` picks the first match and yields no
+            # output on miss, so shell sees an empty string — no literal
+            # "null" leak that would slip past the `-z` check below.
             match=$(echo "$assets_json" | jq -c --arg product "$product" \
               'first(.[] | select(.name | startswith($product) and endswith(".app.tar.gz"))) // empty')
             if [ -n "$match" ]; then
