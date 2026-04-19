@@ -47,10 +47,6 @@ impl PermissionRules {
             PermissionKind::Ask => &self.ask,
         }
     }
-
-    pub fn contains(&self, kind: PermissionKind, rule: &str) -> bool {
-        self.get(kind).iter().any(|r| r == rule)
-    }
 }
 
 #[derive(Debug, Clone)]

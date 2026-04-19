@@ -1,4 +1,12 @@
-import type { LoadedScopes, MoveRequest, PermissionKind, Scope, ScopeView } from "./types.ts";
+import type {
+  LoadedScopes,
+  MovePreview,
+  MoveRequest,
+  MoveSide,
+  PermissionKind,
+  Scope,
+  ScopeView,
+} from "./types.ts";
 import { SCOPES } from "./types.ts";
 
 interface AppProps {
@@ -7,7 +15,7 @@ interface AppProps {
   busy: boolean;
   onPickProject: () => void;
   onReload: () => void;
-  onMove: (req: MoveRequest) => void;
+  onMove: (req: MoveRequest, trigger?: HTMLElement) => void;
 }
 
 const SCOPE_LABELS: Record<Scope, string> = {
@@ -21,6 +29,8 @@ const KIND_LABELS: Record<PermissionKind, string> = {
   deny: "deny",
   ask: "ask",
 };
+
+let modalIdCounter = 0;
 
 export function renderApp(root: HTMLElement, props: AppProps): void {
   root.innerHTML = "";
@@ -186,10 +196,214 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
       `Move ${KIND_LABELS[kind]} rule ${rule} from ${SCOPE_LABELS[scope]} to ${SCOPE_LABELS[target]}`,
     );
     btn.disabled = props.busy;
-    btn.onclick = () => props.onMove({ rule, kind, from: scope, to: target });
+    btn.onclick = (e) =>
+      props.onMove(
+        { rule, kind, from: scope, to: target },
+        e.currentTarget as HTMLElement,
+      );
     moveBtns.appendChild(btn);
   }
   row.appendChild(moveBtns);
 
   return row;
+}
+
+/**
+ * Show a modal diff confirm and resolve to whether the user applied the move.
+ *
+ * Keyboard:
+ *   - Escape cancels.
+ *   - Enter activates the focused button (Apply by default, since that's the
+ *     initial focus — but Tab-to-Cancel followed by Enter cancels, matching
+ *     platform button convention).
+ *   - Tab / Shift+Tab cycle focus within the dialog.
+ *
+ * If `trigger` is passed and still live in the DOM when the dialog closes,
+ * focus is returned to it.
+ */
+export function confirmMove(
+  preview: MovePreview,
+  trigger?: HTMLElement | null,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+
+    const titleId = `modal-title-${++modalIdCounter}`;
+
+    const panel = document.createElement("div");
+    panel.className = "modal";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-labelledby", titleId);
+
+    const title = document.createElement("h2");
+    title.id = titleId;
+    title.className = "modal-title";
+    title.textContent = `Move ${KIND_LABELS[preview.kind]} rule`;
+    panel.appendChild(title);
+
+    const subtitle = document.createElement("div");
+    subtitle.className = "modal-subtitle";
+    const ruleCode = document.createElement("code");
+    ruleCode.className = "chip";
+    ruleCode.textContent = preview.rule;
+    subtitle.appendChild(ruleCode);
+    subtitle.appendChild(document.createTextNode(` from ${SCOPE_LABELS[preview.from.scope]} to ${SCOPE_LABELS[preview.to.scope]}`));
+    panel.appendChild(subtitle);
+
+    const diff = document.createElement("div");
+    diff.className = "modal-diff";
+    diff.appendChild(diffSide(preview.from, "remove", preview.rule));
+    diff.appendChild(diffSide(preview.to, "add", preview.rule));
+    panel.appendChild(diff);
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.textContent = "Cancel";
+    cancel.className = "btn-cancel";
+    const apply = document.createElement("button");
+    apply.textContent = "Apply";
+    apply.className = "btn-apply";
+    actions.append(cancel, apply);
+    panel.appendChild(actions);
+
+    backdrop.appendChild(panel);
+
+    const close = (result: boolean) => {
+      document.removeEventListener("keydown", onKey);
+      backdrop.remove();
+      if (trigger && document.body.contains(trigger)) {
+        trigger.focus();
+      }
+      resolve(result);
+    };
+    const focusableSelector =
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close(false);
+        return;
+      }
+      if (e.key === "Enter") {
+        // Only treat Enter as "apply" when it isn't already activating a
+        // focused button — otherwise the button's own click handler fires.
+        if (!(document.activeElement instanceof HTMLButtonElement)) {
+          e.preventDefault();
+          close(true);
+        }
+        return;
+      }
+      if (e.key === "Tab") {
+        const focusables = Array.from(
+          panel.querySelectorAll<HTMLElement>(focusableSelector),
+        );
+        if (focusables.length === 0) {
+          e.preventDefault();
+          return;
+        }
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const active = document.activeElement as HTMLElement | null;
+        if (e.shiftKey) {
+          if (active === first || !panel.contains(active)) {
+            e.preventDefault();
+            last.focus();
+          }
+        } else {
+          if (active === last || !panel.contains(active)) {
+            e.preventDefault();
+            first.focus();
+          }
+        }
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    backdrop.addEventListener("click", (e) => {
+      if (e.target === backdrop) close(false);
+    });
+    cancel.addEventListener("click", () => close(false));
+    apply.addEventListener("click", () => close(true));
+
+    document.body.appendChild(backdrop);
+    apply.focus();
+  });
+}
+
+function diffSide(side: MoveSide, mode: "add" | "remove", movingRule: string): HTMLElement {
+  const col = document.createElement("div");
+  col.className = `modal-side modal-side-${mode}`;
+
+  const head = document.createElement("div");
+  head.className = "modal-side-head";
+  const label = document.createElement("h3");
+  label.textContent = SCOPE_LABELS[side.scope];
+  head.appendChild(label);
+
+  const path = document.createElement("div");
+  path.className = "modal-side-path";
+  path.textContent = side.path;
+  head.appendChild(path);
+
+  // Derive the verdict from the actual list lengths so duplicates (the
+  // backend removes *every* occurrence) and any future changes to the move
+  // semantics stay in sync with what the modal claims will happen.
+  const delta = side.rules_after.length - side.rules_before.length;
+  const verdict = document.createElement("div");
+  verdict.className = "modal-side-verdict";
+  if (delta === 0) {
+    verdict.textContent = "(no change)";
+    verdict.classList.add("muted");
+  } else if (delta > 0) {
+    verdict.textContent = `+${delta} rule${delta === 1 ? "" : "s"}`;
+    verdict.classList.add("added");
+  } else {
+    const n = -delta;
+    verdict.textContent = `−${n} rule${n === 1 ? "" : "s"}`;
+    verdict.classList.add("removed");
+  }
+  head.appendChild(verdict);
+  col.appendChild(head);
+
+  if (side.note) {
+    const note = document.createElement("div");
+    note.className = "modal-side-note";
+    note.textContent = side.note;
+    col.appendChild(note);
+  }
+
+  // Remove side shows the pre-move list with the moved rule struck through
+  // (diff context, not the post-write contents — apply_move will actually
+  // persist rules_after there). Add side shows the backend's rules_after so
+  // the dest column mirrors exactly what will be written.
+  const rules = mode === "remove" ? side.rules_before : side.rules_after;
+  const list = document.createElement("ul");
+  list.className = "modal-diff-list";
+  for (const rule of rules) {
+    const li = document.createElement("li");
+    const code = document.createElement("code");
+    code.textContent = rule;
+    if (rule === movingRule) {
+      if (mode === "remove") {
+        li.className = "diff-removed";
+      } else if (side.will_write) {
+        // will_write=false means the rule was already present on the dest;
+        // render it neutrally so it doesn't look like a fresh addition.
+        li.className = "diff-added";
+      }
+    }
+    li.appendChild(code);
+    list.appendChild(li);
+  }
+  if (list.children.length === 0) {
+    const li = document.createElement("li");
+    li.className = "diff-empty";
+    li.textContent = "(empty)";
+    list.appendChild(li);
+  }
+  col.appendChild(list);
+
+  return col;
 }

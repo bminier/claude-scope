@@ -31,3 +31,20 @@ export interface MoveRequest {
   from: Scope;
   to: Scope;
 }
+
+export interface MoveSide {
+  scope: Scope;
+  path: string;
+  path_exists: boolean;
+  rules_before: string[];
+  rules_after: string[];
+  will_write: boolean;
+  note: string | null;
+}
+
+export interface MovePreview {
+  rule: string;
+  kind: PermissionKind;
+  from: MoveSide;
+  to: MoveSide;
+}

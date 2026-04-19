@@ -42,6 +42,32 @@ pub struct MoveRequest {
     pub to: Scope,
 }
 
+/// Structured preview of a pending move, built so the front-end can render a
+/// real before/after diff instead of a plain-text confirmation dialog.
+#[derive(Debug, Serialize)]
+pub struct MovePreview {
+    pub rule: String,
+    pub kind: PermissionKind,
+    pub from: MoveSide,
+    pub to: MoveSide,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MoveSide {
+    pub scope: Scope,
+    pub path: String,
+    pub path_exists: bool,
+    pub rules_before: Vec<String>,
+    pub rules_after: Vec<String>,
+    /// True when `apply_move` will actually write this side's file. False on
+    /// the destination when the rule is already present (no-op), and always
+    /// true on the source (we need to remove the rule).
+    pub will_write: bool,
+    /// Optional human-readable note (e.g. "destination file will be created"
+    /// or "already present; source copy will simply be removed").
+    pub note: Option<String>,
+}
+
 #[tauri::command]
 pub fn load_scopes(project_dir: Option<String>) -> Result<LoadedScopes, String> {
     let start = project_dir.as_ref().map(Path::new);
@@ -50,7 +76,7 @@ pub fn load_scopes(project_dir: Option<String>) -> Result<LoadedScopes, String> 
 }
 
 #[tauri::command]
-pub fn diff_move(req: MoveRequest, project_dir: Option<String>) -> Result<String, String> {
+pub fn diff_move(req: MoveRequest, project_dir: Option<String>) -> Result<MovePreview, String> {
     let start = project_dir.as_ref().map(Path::new);
     let paths = scope::resolve(start).map_err(|e| e.to_string())?;
     diff_move_impl(&paths, &req).map_err(|e| e.to_string())
@@ -131,33 +157,84 @@ fn effective_permissions(views: &[ScopeView]) -> PermissionRules {
 fn diff_move_impl(
     paths: &ScopePaths,
     req: &MoveRequest,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<MovePreview, Box<dyn std::error::Error>> {
     if req.from == req.to {
         return Err("source and destination scopes must differ".into());
     }
     let from_path = require_path(paths, req.from)?;
     let to_path = require_path(paths, req.to)?;
 
-    let mut out = String::new();
-    out.push_str(&format!(
-        "Move {kind} rule `{rule}`\n  from {from_label}: {from}\n    to {to_label}: {to}\n",
-        kind = req.kind.key(),
-        rule = req.rule,
-        from_label = req.from.label(),
-        from = from_path.display(),
-        to_label = req.to.label(),
-        to = to_path.display(),
-    ));
-
-    if to_path.exists() {
-        let existing = io_atomic::load(to_path)?.unwrap_or_else(SettingsDoc::empty);
-        if existing.permissions().contains(req.kind, &req.rule) {
-            out.push_str("(destination already has this rule; source copy will simply be removed)\n");
+    // Source side: file must exist and the rule must currently be there.
+    // Match apply_move_impl's error wording so the preview path doesn't
+    // produce a different message than the one the user would see if they
+    // somehow skipped the preview.
+    let from_doc = match io_atomic::load(from_path)? {
+        Some(d) => d,
+        None => {
+            return Err(
+                format!("source file {} does not exist", from_path.display()).into(),
+            );
         }
-    } else {
-        out.push_str("(destination file will be created)\n");
+    };
+    let from_before = from_doc.permissions().get(req.kind).to_vec();
+    if !from_before.iter().any(|r| r == &req.rule) {
+        return Err(format!(
+            "rule `{}` not found in {} {}",
+            req.rule,
+            req.from.label(),
+            from_path.display()
+        )
+        .into());
     }
-    Ok(out)
+    let from_after: Vec<String> = from_before
+        .iter()
+        .filter(|r| r.as_str() != req.rule)
+        .cloned()
+        .collect();
+
+    // Destination side: may or may not already have it.
+    let to_path_exists = to_path.exists();
+    let to_doc = io_atomic::load(to_path)?.unwrap_or_else(SettingsDoc::empty);
+    let to_before = to_doc.permissions().get(req.kind).to_vec();
+    let already_present = to_before.iter().any(|r| r == &req.rule);
+    let to_after: Vec<String> = if already_present {
+        to_before.clone()
+    } else {
+        let mut v = to_before.clone();
+        v.push(req.rule.clone());
+        v
+    };
+
+    let to_note = if already_present {
+        Some("Already present; source copy will simply be removed.".to_string())
+    } else if !to_path_exists {
+        Some("Destination file will be created.".to_string())
+    } else {
+        None
+    };
+
+    Ok(MovePreview {
+        rule: req.rule.clone(),
+        kind: req.kind,
+        from: MoveSide {
+            scope: req.from,
+            path: from_path.display().to_string(),
+            path_exists: from_path.exists(),
+            rules_before: from_before,
+            rules_after: from_after,
+            will_write: true,
+            note: None,
+        },
+        to: MoveSide {
+            scope: req.to,
+            path: to_path.display().to_string(),
+            path_exists: to_path_exists,
+            rules_before: to_before,
+            rules_after: to_after,
+            will_write: !already_present,
+            note: to_note,
+        },
+    })
 }
 
 fn apply_move_impl(
@@ -279,6 +356,101 @@ mod tests {
             user_doc.permissions().allow,
             vec!["Bash(git status)".to_string()]
         );
+    }
+
+    #[test]
+    fn diff_move_builds_structured_preview() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(git status)","Read(**)"]}}"#,
+        );
+        let preview = diff_move_impl(
+            &paths,
+            &MoveRequest {
+                rule: "Bash(git status)".into(),
+                kind: PermissionKind::Allow,
+                from: Scope::Project,
+                to: Scope::User,
+            },
+        )
+        .unwrap();
+        assert_eq!(preview.rule, "Bash(git status)");
+        assert_eq!(preview.from.rules_before.len(), 2);
+        assert_eq!(preview.from.rules_after, vec!["Read(**)".to_string()]);
+        assert!(preview.from.will_write);
+        // User file doesn't exist yet.
+        assert!(!preview.to.path_exists);
+        assert!(preview.to.will_write);
+        assert_eq!(preview.to.rules_after, vec!["Bash(git status)".to_string()]);
+        assert!(preview.to.note.as_deref() == Some("Destination file will be created."));
+    }
+
+    #[test]
+    fn diff_move_flags_already_present_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(git status)"]}}"#,
+        );
+        write(
+            paths.user.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(git status)"]}}"#,
+        );
+        let preview = diff_move_impl(
+            &paths,
+            &MoveRequest {
+                rule: "Bash(git status)".into(),
+                kind: PermissionKind::Allow,
+                from: Scope::Project,
+                to: Scope::User,
+            },
+        )
+        .unwrap();
+        assert!(!preview.to.will_write, "dest doesn't need a write when rule already there");
+        assert_eq!(preview.to.rules_before, preview.to.rules_after);
+        assert!(preview.to.note.as_deref().unwrap().contains("Already present"));
+    }
+
+    #[test]
+    fn diff_move_errors_when_source_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        // Source file intentionally never written.
+        let err = diff_move_impl(
+            &paths,
+            &MoveRequest {
+                rule: "Bash(git status)".into(),
+                kind: PermissionKind::Allow,
+                from: Scope::Project,
+                to: Scope::User,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn diff_move_errors_when_source_lacks_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":[]}}"#,
+        );
+        let err = diff_move_impl(
+            &paths,
+            &MoveRequest {
+                rule: "Bash(nope)".into(),
+                kind: PermissionKind::Allow,
+                from: Scope::Project,
+                to: Scope::User,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 
     #[test]
