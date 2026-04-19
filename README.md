@@ -66,7 +66,12 @@ claude-scope/
 
 ### Prerequisites
 
-- **Rust** — stable, 1.88+ (imposed by Tauri 2.10's transitive deps — `darling`, `serde_with`, `time`)
+- **Rust** — stable, 1.88+ (imposed by Tauri 2.10's transitive deps).
+  Install via [rustup](https://rustup.rs):
+  - **Windows:** `winget install Rustlang.Rustup` (then restart your terminal)
+  - **macOS / Linux:** `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+
+  > The Tauri CLI is bundled as an npm dev dependency — `cargo install tauri-cli` is **not** needed. Use `npm run tauri dev` (not `cargo tauri dev`).
 - **Node.js** 20+ and **npm**
 - **Linux build deps** (only on Linux):
   ```sh
