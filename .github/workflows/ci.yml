@@ -161,6 +161,16 @@ jobs:
     # pipeline.
     name: security
     runs-on: ubuntu-24.04
+    # `rustsec/audit-check` publishes a check-run with the advisory
+    # summary when there are warnings (unmaintained / unsound crates).
+    # That POST needs `checks: write`; without it we get
+    # "Resource not accessible by integration" the moment a transitive
+    # dep gets a fresh advisory. `contents: read` is the workflow-default
+    # we'd otherwise inherit; declared here so this job's permissions are
+    # self-contained and not a side-effect of repo defaults.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v6
 
