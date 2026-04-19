@@ -58,6 +58,16 @@ export function lintRule(raw: string): LintResult {
 
   // MCP tool rules: `mcp__<server>__<tool>` or `mcp__<server>__*`.
   if (rule.startsWith("mcp__")) {
+    // An MCP rule is an identifier chain; parens or whitespace in there are
+    // almost always the user mixing it up with the `Bash(...)` / `Read(...)`
+    // shape (e.g. `mcp__github__list_issues()`), so flag those explicitly
+    // before the segment check passes them through.
+    if (/[\s()]/.test(rule)) {
+      return {
+        ok: false,
+        reason: "MCP rule shouldn't contain parentheses or whitespace; use `mcp__<server>__<tool>`.",
+      };
+    }
     const parts = rule.split("__");
     // Expect at least: ["mcp", "<server>", "<tool-or-*>"]; more segments are
     // tolerated because tool names can contain underscores too (the split is
