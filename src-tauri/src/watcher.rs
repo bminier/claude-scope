@@ -197,7 +197,12 @@ fn compute_watch_plan(paths: &ScopePaths) -> WatchPlan {
 }
 
 fn recent_self_write(slot: &Arc<Mutex<Instant>>) -> bool {
-    let Ok(guard) = slot.lock() else { return false };
+    // If the mutex is poisoned, the inner value is still the last timestamp
+    // we successfully wrote — recovering via into_inner() keeps suppression
+    // working. Returning false on poison would disable echo suppression
+    // after any panic in a watcher callback, which reintroduces phantom
+    // reloads on self-writes. `note_self_write` recovers the same way.
+    let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
     Instant::now().duration_since(*guard) < Duration::from_millis(SELF_WRITE_GRACE_MS)
 }
 

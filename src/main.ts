@@ -183,4 +183,14 @@ listen("scopes-changed", () => {
   console.error("failed to register scopes-changed listener", err);
 });
 
+// Backend emits this when the file watcher fails to install — auto-reload is
+// a non-fatal nice-to-have, so we just log to devtools rather than hijacking
+// the UI with an alert. Windows release builds discard stderr, so this is
+// how the failure stays observable in production.
+listen<string>("watcher-error", (evt) => {
+  console.warn("ClaudeScope watcher install failed:", evt.payload);
+}).catch((err) => {
+  console.error("failed to register watcher-error listener", err);
+});
+
 load(null);

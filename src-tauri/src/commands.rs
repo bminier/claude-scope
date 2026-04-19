@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::io_atomic::{self, BackupTracker};
 use crate::model::{PermissionKind, PermissionRules, SettingsDoc};
@@ -82,9 +82,12 @@ pub fn load_scopes(
     // (Re)install the watcher every time we load. This handles both first
     // load and project-switch with no extra command surface area for the
     // front-end to keep in sync. Watcher errors are non-fatal — auto-reload
-    // is a nice-to-have, the load itself succeeded.
-    if let Err(err) = watch.install(app, &paths) {
-        eprintln!("watcher install failed: {err}");
+    // is a nice-to-have, the load itself succeeded. Surface the failure as
+    // a Tauri event instead of eprintln!() so it's observable from the
+    // front-end: on Windows release builds we set windows_subsystem =
+    // "windows", which discards stderr entirely.
+    if let Err(err) = watch.install(app.clone(), &paths) {
+        let _ = app.emit("watcher-error", err);
     }
     Ok(loaded)
 }
