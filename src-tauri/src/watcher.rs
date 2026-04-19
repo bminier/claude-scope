@@ -44,6 +44,15 @@ const SELF_WRITE_GRACE_MS: u64 = 500;
 /// otherwise fire one per debounced batch and flood the devtools console.
 const ERROR_EMIT_COOLDOWN_MS: u64 = 5_000;
 
+/// Cheap pre-filter applied to every incoming event before we do anything
+/// more expensive: unless the filename looks interesting, there's no way
+/// the event can match one of our scope paths or the `.claude/` dir we're
+/// waiting to see created, so we short-circuit before any canonicalize()
+/// syscall. Especially important in the "missing .claude/" fallback
+/// where the watch root is the project dir and unrelated source-file
+/// events can be frequent.
+const FILENAME_ALLOWLIST: &[&str] = &["settings.json", "settings.local.json", ".claude"];
+
 /// Tauri-managed state. `WatchState::default()` is a no-op watcher; call
 /// `install` to wire up actual paths.
 pub struct WatchState {
@@ -109,12 +118,16 @@ impl WatchState {
         // platforms with symlinked parents (macOS `/var` -> `/private/var`)
         // notify can report either spelling, so a straight PathBuf equality
         // check against a set of just-raw paths would miss legit events.
+        // canonicalize_with_fallback() canonicalizes the nearest existing
+        // ancestor and re-appends the remaining components, so paths whose
+        // leaves don't exist yet (e.g. the `.claude/` we're waiting on)
+        // still get a canonical form precomputed.
         let match_paths_for_cb: HashSet<PathBuf> = plan
             .match_paths
             .iter()
             .flat_map(|p| {
                 let mut forms = vec![p.clone()];
-                if let Ok(canon) = std::fs::canonicalize(p) {
+                if let Some(canon) = canonicalize_with_fallback(p) {
                     if canon != *p {
                         forms.push(canon);
                     }
@@ -145,13 +158,28 @@ impl WatchState {
                 // inserted, so unrelated `settings.json` files elsewhere
                 // in the tree can't fire a spurious reload.
                 let interesting = events.iter().any(|ev| {
+                    // Cheap filename pre-filter — rejects the overwhelming
+                    // majority of events (editor swaps, build outputs,
+                    // etc.) without touching the filesystem.
+                    let name_ok = ev
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| FILENAME_ALLOWLIST.iter().any(|w| *w == n))
+                        .unwrap_or(false);
+                    if !name_ok {
+                        return false;
+                    }
                     if match_paths_for_cb.contains(&ev.path) {
                         return true;
                     }
-                    // Fallback: canonicalize the incoming event path and
-                    // check again. Handles the inverse of the install-time
-                    // canonicalization (raw-in-match-set, canonical event)
-                    // and any other late-resolving symlink cases.
+                    // Last-resort: canonicalize the incoming event path
+                    // and check again. Handles the inverse of the
+                    // install-time canonicalization (raw-in-match-set,
+                    // canonical event) and any other late-resolving
+                    // symlink cases. The filename pre-filter above
+                    // guarantees we only pay the syscall for plausibly-
+                    // relevant paths.
                     std::fs::canonicalize(&ev.path)
                         .map(|c| match_paths_for_cb.contains(&c))
                         .unwrap_or(false)
@@ -251,6 +279,32 @@ fn emit_watcher_error_rate_limited(
     }
     *guard = Some(now);
     let _ = app.emit("watcher-error", error.to_string());
+}
+
+/// Canonicalize `p` when possible, preserving any non-existent trailing
+/// components. Walks up to find the nearest existing ancestor, canonicalizes
+/// that, then re-appends the bits we stripped. Lets us precompute canonical
+/// forms for paths whose leaves (e.g. a not-yet-created `.claude/` or
+/// `settings.json`) don't exist yet, which matters on platforms where
+/// notify reports canonical spellings for later creation events.
+fn canonicalize_with_fallback(p: &std::path::Path) -> Option<PathBuf> {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = p.to_path_buf();
+    loop {
+        if cursor.exists() {
+            break;
+        }
+        let name = cursor.file_name().map(ToOwned::to_owned)?;
+        tail.push(name);
+        if !cursor.pop() {
+            return None;
+        }
+    }
+    let mut canon = std::fs::canonicalize(&cursor).ok()?;
+    for name in tail.iter().rev() {
+        canon.push(name);
+    }
+    Some(canon)
 }
 
 fn recent_self_write(slot: &Arc<Mutex<Instant>>) -> bool {
@@ -364,6 +418,18 @@ mod tests {
         assert_eq!(plan.roots.len(), 1);
         assert!(plan.match_paths.contains(&settings));
         assert!(plan.match_paths.contains(&local));
+    }
+
+    #[test]
+    fn canonicalize_with_fallback_resolves_ancestor_for_missing_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap();
+        // Ancestor exists, but `.claude/settings.json` does not.
+        let missing = tmp.path().join(".claude").join("settings.json");
+
+        let canonical = canonicalize_with_fallback(&missing).expect("has existing ancestor");
+        let expected = real.join(".claude").join("settings.json");
+        assert_eq!(canonical, expected);
     }
 
     #[test]
