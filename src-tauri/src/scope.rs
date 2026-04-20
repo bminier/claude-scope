@@ -88,8 +88,14 @@ pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
 
     let mut cursor = start.clone();
     loop {
-        if cursor.join(".claude").is_dir() {
-            return Ok(cursor);
+        // Mirror the `.git` pass: ENOENT keeps walking, genuine I/O errors
+        // propagate. We need metadata() (not try_exists()) so we can also
+        // reject a `.claude` that's a regular file.
+        match cursor.join(".claude").metadata() {
+            Ok(md) if md.is_dir() => return Ok(cursor),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
         if !cursor.pop() {
             // Reached filesystem root without finding .git or .claude; fall
@@ -101,8 +107,9 @@ pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
 }
 
 /// Resolve the file paths for every recognized scope given a starting
-/// directory. The starting directory becomes the project dir after walking
-/// upward for `.claude/`.
+/// directory. The starting directory becomes the project dir after
+/// [`find_project_root`] walks upward looking for a `.git` entry (preferred)
+/// and then a `.claude/` directory.
 pub fn resolve(start: Option<&Path>) -> std::io::Result<ScopePaths> {
     let project_dir = find_project_root(start)?;
     let local = Some(project_dir.join(".claude").join("settings.local.json"));
