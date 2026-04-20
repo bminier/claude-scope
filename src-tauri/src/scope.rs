@@ -53,12 +53,12 @@ impl ScopePaths {
     }
 }
 
-/// Walks up from `start` (or the current working directory if `None`) looking
-/// for the nearest `.claude/` directory. The search stops at the first match
-/// or at the filesystem root. Returns the directory that *contains* `.claude/`
-/// so callers can treat it as the "project dir"; if no match is found, the
-/// starting directory itself is returned (caller can decide to create
-/// `.claude/` there later).
+/// Walks up from `start` (or the current working directory if `None`) to find
+/// the project root. Prefers the nearest ancestor containing `.git/` (the VCS
+/// boundary), falling back to the nearest ancestor containing `.claude/`, and
+/// finally to `start` itself. `.git/` takes precedence so that running from a
+/// sub-crate like `src-tauri/` still resolves to the repo root, even if that
+/// sub-crate happens to contain its own stray `.claude/`.
 pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
     let start_buf;
     let start = match start {
@@ -68,14 +68,28 @@ pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
             &start_buf
         }
     };
+
+    // .git may be a directory (normal repo) or a file (worktree / submodule),
+    // so check existence rather than is_dir().
+    let mut cursor = start.to_path_buf();
+    loop {
+        if cursor.join(".git").exists() {
+            return Ok(cursor);
+        }
+        if !cursor.pop() {
+            break;
+        }
+    }
+
     let mut cursor = start.to_path_buf();
     loop {
         if cursor.join(".claude").is_dir() {
             return Ok(cursor);
         }
         if !cursor.pop() {
-            // Reached filesystem root without finding .claude; fall back to
-            // the starting directory so the UI can still render empty scopes.
+            // Reached filesystem root without finding .git or .claude; fall
+            // back to the starting directory so the UI can still render empty
+            // scopes.
             return Ok(start.to_path_buf());
         }
     }
@@ -112,6 +126,22 @@ mod tests {
         // filesystem-level symlink.
         let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
         let got = canon(find_project_root(Some(&nested)).unwrap());
+        let want = canon(tmp.path().to_path_buf());
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn prefers_git_root_over_nested_dot_claude() {
+        // Mirrors the real-world case where `tauri dev` starts in
+        // `src-tauri/` and that directory has picked up its own stray
+        // `.claude/`. The repo root (marked by `.git/`) should still win.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("src-tauri");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::create_dir_all(sub.join(".claude")).unwrap();
+        let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+        let got = canon(find_project_root(Some(&sub)).unwrap());
         let want = canon(tmp.path().to_path_buf());
         assert_eq!(got, want);
     }
