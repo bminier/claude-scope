@@ -125,7 +125,21 @@ pub fn resolve(start: Option<&Path>) -> std::io::Result<ScopePaths> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    // Serialize tests that mutate the process CWD so they don't race the
+    // other tests (which read CWD indirectly via find_project_root's
+    // normalization branch). Poisoning is benign — we only restore CWD.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
 
     #[test]
     fn finds_project_root_when_dot_claude_exists() {
@@ -181,6 +195,35 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         let got = find_project_root(Some(&nested)).unwrap();
         assert_eq!(got, nested);
+    }
+
+    #[test]
+    fn normalizes_relative_start_against_cwd() {
+        // Regression: without normalization, passing a relative `start` lets
+        // `cursor.pop()` bottom out at an empty relative path, and the next
+        // `.git` probe resolves against the process CWD — so a `.git` that
+        // happens to sit in CWD would hijack the walk-up even though it
+        // isn't an ancestor of `start`. Here CWD=tmp has a `.git`, but the
+        // true ancestor chain of `tmp/work` runs up into tmp too, so the
+        // correct answer is tmp either way — the discriminating detail is
+        // that without the fix the returned path is an empty PathBuf (the
+        // bug), whereas the fix returns an absolute tmp path.
+        let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CwdGuard(std::env::current_dir().unwrap());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let got = find_project_root(Some(Path::new("work"))).unwrap();
+        assert!(
+            got.is_absolute(),
+            "expected absolute path, got relative: {got:?}"
+        );
+        let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+        assert_eq!(canon(got), canon(tmp.path().to_path_buf()));
     }
 
     #[test]
