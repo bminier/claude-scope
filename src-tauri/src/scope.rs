@@ -72,10 +72,13 @@ pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
     };
 
     // .git may be a directory (normal repo) or a file (worktree / submodule),
-    // so check existence rather than is_dir().
+    // so check existence rather than is_dir(). try_exists() distinguishes
+    // "not found" from real I/O errors (e.g., permission denied) — the former
+    // continues the walk, the latter propagates instead of silently falling
+    // through to .claude/start.
     let mut cursor = start.clone();
     loop {
-        if cursor.join(".git").exists() {
+        if cursor.join(".git").try_exists()? {
             return Ok(cursor);
         }
         if !cursor.pop() {
