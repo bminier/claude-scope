@@ -63,8 +63,8 @@ impl ScopePaths {
 pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
     // Normalize to an absolute path so the walk-up terminates at the real
     // filesystem root. A relative `start` would otherwise `.pop()` down to
-    // "", and `"".join(".git").exists()` silently checks paths relative to
-    // the process CWD — masking a missing-ancestor as a match.
+    // an empty relative path, and joining `.git` onto that would probe
+    // relative to the process CWD — masking a missing ancestor as a match.
     let start = match start {
         Some(p) if p.is_absolute() => p.to_path_buf(),
         Some(p) => std::env::current_dir()?.join(p),
@@ -154,8 +154,8 @@ mod tests {
     #[test]
     fn prefers_git_file_root_over_nested_dot_claude() {
         // Worktrees and submodules represent `.git` as a file rather than a
-        // directory. Keep this case covered so the `exists()` behavior stays
-        // regression-tested.
+        // directory. Keep this case covered so the `.git` existence check
+        // stays regression-tested.
         let tmp = tempfile::tempdir().unwrap();
         let sub = tmp.path().join("src-tauri");
         std::fs::create_dir_all(&sub).unwrap();
