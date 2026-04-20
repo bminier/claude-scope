@@ -239,8 +239,11 @@ function lintBadge(rule: string): HTMLElement | null {
   btn.className = "lint-warn";
   btn.textContent = "⚠";
   btn.setAttribute("aria-label", `Rule warning: ${reason}`);
-  btn.setAttribute("aria-expanded", "false");
-  btn.setAttribute("aria-controls", popoverId);
+  // `aria-describedby` is the canonical tooltip relationship. No
+  // `aria-expanded` / `aria-controls` — the popover is revealed by hover
+  // and focus as well as click, so a disclosure-style expanded flag would
+  // go out of sync with the visible state for keyboard users.
+  btn.setAttribute("aria-describedby", popoverId);
 
   const pop = document.createElement("span");
   pop.id = popoverId;
@@ -252,7 +255,6 @@ function lintBadge(rule: string): HTMLElement | null {
     e.stopPropagation();
     if (openLintWrap && openLintWrap !== wrap) closeLintPopover();
     const isOpen = wrap.classList.toggle("is-open");
-    btn.setAttribute("aria-expanded", isOpen ? "true" : "false");
     if (isOpen) {
       openLintWrap = wrap;
       ensureLintGlobalListeners();
@@ -275,8 +277,6 @@ let lintGlobalListenersAttached = false;
 function closeLintPopover(): void {
   if (!openLintWrap) return;
   openLintWrap.classList.remove("is-open");
-  const btn = openLintWrap.querySelector<HTMLButtonElement>(".lint-warn");
-  btn?.setAttribute("aria-expanded", "false");
   openLintWrap = null;
 }
 
@@ -289,6 +289,9 @@ function ensureLintGlobalListeners(): void {
   });
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape" || !openLintWrap) return;
+    // A visible modal owns Escape — otherwise closing a pinned popover
+    // here would consume the keystroke and the dialog would stay open.
+    if (document.querySelector(".modal-backdrop")) return;
     const btn = openLintWrap.querySelector<HTMLButtonElement>(".lint-warn");
     closeLintPopover();
     btn?.focus();
