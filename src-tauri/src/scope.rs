@@ -54,11 +54,12 @@ impl ScopePaths {
 }
 
 /// Walks up from `start` (or the current working directory if `None`) to find
-/// the project root. Prefers the nearest ancestor containing `.git/` (the VCS
-/// boundary), falling back to the nearest ancestor containing `.claude/`, and
-/// finally to `start` itself. `.git/` takes precedence so that running from a
-/// sub-crate like `src-tauri/` still resolves to the repo root, even if that
-/// sub-crate happens to contain its own stray `.claude/`.
+/// the project root. Prefers the nearest ancestor containing a `.git` entry
+/// (directory or file, marking the VCS boundary), falling back to the nearest
+/// ancestor containing `.claude/`, and finally to `start` itself. A `.git`
+/// entry takes precedence so that running from a sub-crate like `src-tauri/`
+/// still resolves to the repo root, even if that sub-crate happens to contain
+/// its own stray `.claude/`.
 pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
     let start_buf;
     let start = match start {
@@ -139,6 +140,22 @@ mod tests {
         let sub = tmp.path().join("src-tauri");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::create_dir_all(sub.join(".claude")).unwrap();
+        let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+        let got = canon(find_project_root(Some(&sub)).unwrap());
+        let want = canon(tmp.path().to_path_buf());
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn prefers_git_file_root_over_nested_dot_claude() {
+        // Worktrees and submodules represent `.git` as a file rather than a
+        // directory. Keep this case covered so the `exists()` behavior stays
+        // regression-tested.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("src-tauri");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(tmp.path().join(".git"), "gitdir: ../.git/modules/repo\n").unwrap();
         std::fs::create_dir_all(sub.join(".claude")).unwrap();
         let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
         let got = canon(find_project_root(Some(&sub)).unwrap());
