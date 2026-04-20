@@ -61,18 +61,19 @@ impl ScopePaths {
 /// still resolves to the repo root, even if that sub-crate happens to contain
 /// its own stray `.claude/`.
 pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
-    let start_buf;
+    // Normalize to an absolute path so the walk-up terminates at the real
+    // filesystem root. A relative `start` would otherwise `.pop()` down to
+    // "", and `"".join(".git").exists()` silently checks paths relative to
+    // the process CWD — masking a missing-ancestor as a match.
     let start = match start {
-        Some(p) => p,
-        None => {
-            start_buf = std::env::current_dir()?;
-            &start_buf
-        }
+        Some(p) if p.is_absolute() => p.to_path_buf(),
+        Some(p) => std::env::current_dir()?.join(p),
+        None => std::env::current_dir()?,
     };
 
     // .git may be a directory (normal repo) or a file (worktree / submodule),
     // so check existence rather than is_dir().
-    let mut cursor = start.to_path_buf();
+    let mut cursor = start.clone();
     loop {
         if cursor.join(".git").exists() {
             return Ok(cursor);
@@ -82,7 +83,7 @@ pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
         }
     }
 
-    let mut cursor = start.to_path_buf();
+    let mut cursor = start.clone();
     loop {
         if cursor.join(".claude").is_dir() {
             return Ok(cursor);
@@ -91,7 +92,7 @@ pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
             // Reached filesystem root without finding .git or .claude; fall
             // back to the starting directory so the UI can still render empty
             // scopes.
-            return Ok(start.to_path_buf());
+            return Ok(start);
         }
     }
 }
