@@ -217,18 +217,82 @@ function effectivePanel(loaded: LoadedScopes, query: string, lowerQuery: string)
  * when the rule looks well-formed. The lint is intentionally lenient — we
  * can't match Claude Code's real parser precisely — so we flag rather than
  * block.
+ *
+ * The badge is a focusable button paired with an inline popover so the help
+ * text surfaces consistently across platforms (the old `title=` tooltip was
+ * at the mercy of each OS's implementation and easy to miss). The popover
+ * opens on hover, focus, and click; click pins it, and Escape or an outside
+ * click closes it.
  */
 function lintBadge(rule: string): HTMLElement | null {
   const result = lintRule(rule);
   if (result.ok) return null;
-  const warn = document.createElement("span");
-  warn.className = "lint-warn";
-  warn.textContent = "⚠";
-  warn.setAttribute("role", "img");
   const reason = result.reason ?? "Rule shape not recognized.";
-  warn.setAttribute("aria-label", `Rule warning: ${reason}`);
-  warn.title = reason;
-  return warn;
+
+  const wrap = document.createElement("span");
+  wrap.className = "lint-warn-wrap";
+
+  const popoverId = `lint-popover-${++lintPopoverSeq}`;
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "lint-warn";
+  btn.textContent = "⚠";
+  btn.setAttribute("aria-label", `Rule warning: ${reason}`);
+  btn.setAttribute("aria-expanded", "false");
+  btn.setAttribute("aria-controls", popoverId);
+
+  const pop = document.createElement("span");
+  pop.id = popoverId;
+  pop.className = "lint-warn-popover";
+  pop.setAttribute("role", "tooltip");
+  pop.textContent = reason;
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (openLintWrap && openLintWrap !== wrap) closeLintPopover();
+    const isOpen = wrap.classList.toggle("is-open");
+    btn.setAttribute("aria-expanded", isOpen ? "true" : "false");
+    if (isOpen) {
+      openLintWrap = wrap;
+      ensureLintGlobalListeners();
+    } else if (openLintWrap === wrap) {
+      openLintWrap = null;
+    }
+  });
+
+  wrap.appendChild(btn);
+  wrap.appendChild(pop);
+  return wrap;
+}
+
+// Pinned-popover state. Hover/focus reveals are handled purely in CSS; this
+// state only tracks popovers that the user clicked to keep open.
+let lintPopoverSeq = 0;
+let openLintWrap: HTMLElement | null = null;
+let lintGlobalListenersAttached = false;
+
+function closeLintPopover(): void {
+  if (!openLintWrap) return;
+  openLintWrap.classList.remove("is-open");
+  const btn = openLintWrap.querySelector<HTMLButtonElement>(".lint-warn");
+  btn?.setAttribute("aria-expanded", "false");
+  openLintWrap = null;
+}
+
+function ensureLintGlobalListeners(): void {
+  if (lintGlobalListenersAttached) return;
+  lintGlobalListenersAttached = true;
+  document.addEventListener("click", (e) => {
+    if (!openLintWrap) return;
+    if (!openLintWrap.contains(e.target as Node)) closeLintPopover();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || !openLintWrap) return;
+    const btn = openLintWrap.querySelector<HTMLButtonElement>(".lint-warn");
+    closeLintPopover();
+    btn?.focus();
+  });
 }
 
 function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
