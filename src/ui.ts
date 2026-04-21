@@ -58,6 +58,13 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   // tracking state so a stale `openLintWrap` doesn't survive re-render and
   // confuse the next outside-click / Escape.
   closeLintPopover();
+  // Project changed (or first load) — drop any tree-view expansions from
+  // the previous project so they don't bleed across into a new tree where
+  // the same scope+path could mean something different.
+  if (props.projectDir !== lastRenderedProjectDir) {
+    openTreeNodes.clear();
+    lastRenderedProjectDir = props.projectDir;
+  }
   root.appendChild(header(props));
 
   if (!props.scopes) {
@@ -317,12 +324,18 @@ function ensureLintGlobalListeners(): void {
 }
 
 // Tracks which tree-view branches the user has expanded. The set is keyed by
-// "<scope>:<dot-joined-path>" so state survives a full renderApp rebuild (the
-// DOM is thrown away but this module-level set isn't).
+// "<scope>:<JSON-encoded path>" so state survives a full renderApp rebuild
+// (the DOM is thrown away but this module-level set isn't). JSON encoding
+// disambiguates string keys from numeric indices and tolerates dots in keys
+// (e.g. env var names like "FOO.BAR"); a naive join would conflate them.
 const openTreeNodes = new Set<string>();
 
+// Project-scoped: clearing on pickProject avoids restoring stale expansions
+// in a different project that happens to share scope+path strings.
+let lastRenderedProjectDir: string | null = null;
+
 function treeKey(scope: Scope, path: (string | number)[]): string {
-  return `${scope}:${path.join(".")}`;
+  return `${scope}:${JSON.stringify(path)}`;
 }
 
 function treeNode(
