@@ -239,7 +239,10 @@ button:disabled {
   padding: 12px;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  /* No `overflow: hidden` here — lint-warning popovers inside `.rule` rows
+     are absolutely positioned and need to escape the column bounds,
+     especially near the bottom edge. Children that truncate (`.col-path`,
+     `.rule-text`) set their own overflow. */
 }
 
 .col-head h3 {
@@ -545,12 +548,16 @@ button:disabled {
 
 .lint-warn:hover,
 .lint-warn-wrap.is-open > .lint-warn {
+  /* The global `button:hover` rule recolors buttons with --accent; pin the
+     warning color explicitly so the badge stays in its lint palette. */
+  color: var(--ask);
   border-color: var(--ask);
   background: rgba(232, 195, 116, 0.12);
 }
 
 .lint-warn:focus-visible {
   outline: none;
+  color: var(--ask);
   border-color: var(--ask);
   box-shadow: 0 0 0 2px rgba(232, 195, 116, 0.35);
 }
