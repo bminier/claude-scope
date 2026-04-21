@@ -1,7 +1,9 @@
 export type Scope = "local" | "project" | "user_local" | "user";
 
-// Ordered by precedence, highest first — matches `Scope::ALL` on the Rust
-// side and drives the effective-permissions union order.
+// UI-side scope order (column rendering + move-target button order), highest
+// precedence first. The effective-permissions union is computed on the Rust
+// side from `Scope::ALL`; keep this array in sync with that list so the UI
+// order matches what `LoadedScopes.scopes` returns.
 export const SCOPES: readonly Scope[] = ["local", "project", "user_local", "user"] as const;
 
 export interface ScopeView {
