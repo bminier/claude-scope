@@ -539,6 +539,93 @@ mod tests {
     }
 
     #[test]
+    fn diff_and_move_round_trip_through_user_local() {
+        // Regression for #23: UserLocal participates end-to-end — both as a
+        // destination that needs creating from scratch and as a source for a
+        // subsequent promotion. Covers diff_move_impl preview shape plus
+        // apply_move_impl backup + creation semantics for the new scope.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.user.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(git status)","Read(**)"]}}"#,
+        );
+        // user_local file does not exist yet — first move should create it.
+        assert!(!paths.user_local.as_ref().unwrap().exists());
+
+        // Preview: User → UserLocal.
+        let preview = diff_move_impl(
+            &paths,
+            &MoveRequest {
+                rule: "Bash(git status)".into(),
+                kind: PermissionKind::Allow,
+                from: Scope::User,
+                to: Scope::UserLocal,
+            },
+        )
+        .unwrap();
+        assert_eq!(preview.from.scope, Scope::User);
+        assert_eq!(preview.to.scope, Scope::UserLocal);
+        assert!(!preview.to.path_exists);
+        assert!(preview.to.will_write);
+        assert_eq!(preview.to.rules_after, vec!["Bash(git status)".to_string()]);
+
+        let backups = BackupTracker::new();
+        apply_move_impl(
+            &paths,
+            &MoveRequest {
+                rule: "Bash(git status)".into(),
+                kind: PermissionKind::Allow,
+                from: Scope::User,
+                to: Scope::UserLocal,
+            },
+            &backups,
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        let user_doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(user_doc.permissions().allow, vec!["Read(**)".to_string()]);
+
+        let user_local_doc = io_atomic::load(paths.user_local.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            user_local_doc.permissions().allow,
+            vec!["Bash(git status)".to_string()]
+        );
+
+        // Now promote it outward: UserLocal → Project.
+        apply_move_impl(
+            &paths,
+            &MoveRequest {
+                rule: "Bash(git status)".into(),
+                kind: PermissionKind::Allow,
+                from: Scope::UserLocal,
+                to: Scope::Project,
+            },
+            &backups,
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        let user_local_doc = io_atomic::load(paths.user_local.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(user_local_doc.permissions().allow.is_empty());
+
+        let project_doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            project_doc.permissions().allow,
+            vec!["Bash(git status)".to_string()]
+        );
+    }
+
+    #[test]
     fn move_same_scope_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());

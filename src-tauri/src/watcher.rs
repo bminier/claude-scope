@@ -394,6 +394,40 @@ mod tests {
     }
 
     #[test]
+    fn plan_includes_user_local_alongside_user() {
+        // Regression for #23: `~/.claude/settings.local.json` is a real
+        // scope, so the watcher plan has to see its path as both a watch
+        // root (when the dir exists) and a match path, mirroring how the
+        // project/user scopes are handled.
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let user = claude_dir.join("settings.json");
+        let user_local = claude_dir.join("settings.local.json");
+
+        let paths = ScopePaths {
+            project_dir: PathBuf::from("/tmp/unused"),
+            local: None,
+            project: None,
+            user_local: Some(user_local.clone()),
+            user: Some(user.clone()),
+        };
+        let plan = compute_watch_plan(&paths);
+        assert!(
+            plan.roots.contains(&claude_dir),
+            "user_local shares .claude/ with user; one watch root covers both"
+        );
+        assert!(
+            plan.match_paths.contains(&user_local),
+            "user_local scope path must be in the match set"
+        );
+        assert!(
+            plan.match_paths.contains(&user),
+            "user scope path must stay in the match set",
+        );
+    }
+
+    #[test]
     fn plan_empty_when_no_ancestor_exists() {
         // A fabricated path that has no existing ancestor on the system.
         let ghost = PathBuf::from("/nonexistent-claudescope-root/x/.claude/settings.json");
