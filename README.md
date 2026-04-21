@@ -9,11 +9,11 @@ Desktop GUI for promoting [Claude Code](https://docs.claude.com/en/docs/claude-c
 
 ## What it does
 
-Claude Code reads settings from JSON files at several scopes. Moving a permission rule from Project to User (or anywhere else) today means editing both JSON files by hand, which is tedious and drops formatting. ClaudeScope shows every rule across the three recognized scopes (Local / Project / User) side-by-side and moves rules between them with a click.
+Claude Code reads settings from JSON files at several scopes. Moving a permission rule from Project to User (or anywhere else) today means editing both JSON files by hand, which is tedious and drops formatting. ClaudeScope shows every rule across the four recognized scopes (User / User-Local / Project / Local) side-by-side and moves rules between them with a click.
 
 ### Features
 
-- **Three-column scope view** — Local / Project / User, with the "effective" merged view on top
+- **Four-column scope view** — User / User-Local / Project / Local, laid out broadest-on-the-left, with the "effective" merged view on top
 - **Atomic, safe writes** — serialize → JSON-revalidate → tempfile + rename, with one-shot `.bak` backup per file per session
 - **Diff preview modal** — shows before/after for both sides of a move with a proper diff, Esc/Enter/Tab-trap keyboard handling, focus restored to the triggering button on close
 - **Rule search / filter** — press `/` anywhere to focus, case-insensitive substring, `m/n` match counts per group
@@ -25,7 +25,6 @@ Claude Code reads settings from JSON files at several scopes. Moving a permissio
 - Writes are atomic: serialize → revalidate JSON → tempfile in the same directory → `rename` over target.
 - On the first write of a given file per session, the original is copied to `<file>.bak`. Existing `.bak` files from previous runs are preserved, not clobbered.
 - A move writes the destination first, then removes from the source. If the source write fails, the destination write is rolled back so the rule ends up in exactly one scope rather than being lost *or* duplicated. If the rollback itself fails the user sees an explicit error.
-- `~/.claude/settings.local.json` is **not** treated as a scope.
 
 ## Stack
 

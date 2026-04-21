@@ -1,0 +1,82 @@
+# ClaudeScope — Copilot Instructions
+
+Desktop GUI (Tauri 2) for promoting Claude Code permission rules between scopes.
+
+## Commands
+
+```bash
+# Dev (full app) — from repo root. Tauri CLI is an npm dev dep; do NOT use `cargo tauri`.
+npm run tauri dev
+
+# Frontend only
+npm run dev                # Vite dev server (no Tauri shell)
+npm run lint               # Biome check
+npm run format             # Biome format --write
+
+# Rust (from src-tauri/)
+cargo test                 # all tests
+cargo test <test_name>     # single test, e.g. `cargo test finds_project_root`
+cargo clippy -- -D warnings
+
+# Production build (from repo root)
+npm run tauri build
+```
+
+## Architecture
+
+**Two halves: Rust backend (`src-tauri/src/`) + TypeScript frontend (`src/`).**
+
+### Rust modules
+
+| File | Responsibility |
+|------|---------------|
+| `scope.rs` | Scope discovery — walks the filesystem upward for `.claude/`, resolves the four scope file paths |
+| `model.rs` | `SettingsDoc` — wraps `serde_json::Value` with preserved key order; `add_rule` / `remove_rule` / `render` |
+| `io_atomic.rs` | Atomic writes: serialize → revalidate JSON → backup → tempfile → rename; `BackupTracker` for once-per-session `.bak` files |
+| `commands.rs` | Three Tauri commands: `load_scopes`, `diff_move`, `apply_move`; process-global `BackupTracker` via `OnceLock` |
+| `watcher.rs` | `notify-debouncer-mini` watcher; emits `scopes-changed` event; self-write echo suppression via grace window |
+| `lib.rs` | Tauri builder wiring |
+
+### Frontend files
+
+| File | Responsibility |
+|------|---------------|
+| `types.ts` | Shared TypeScript types (`Scope`, `PermissionKind`, `LoadedScopes`, `MoveRequest`, etc.) and `SEARCH_INPUT_ID` constant |
+| `main.ts` | State machine: `state` object + `moveInFlight` bool + `externalReloadPending` flag; calls `invoke` and drives renders |
+| `ui.ts` | Full DOM re-render via `renderApp` (clears `innerHTML` each call); `confirmMove` modal |
+| `lint.ts` | Shape-only lint for permission rule strings; never blocks — warn-only badges |
+
+## Key Conventions
+
+### Claude Code scopes (precedence order, highest first)
+1. **Local** — `./.claude/settings.local.json` (project-local, gitignored)
+2. **Project** — `./.claude/settings.json` (committed)
+3. **User-Local** — `~/.claude/settings.local.json` (machine-local override; Claude Code creates and uses it when `~` is itself inside a git repo)
+4. **User** — `~/.claude/settings.json` (machine-global)
+
+Managed (enterprise) settings sit above all of these but are out of scope for this project. In the UI the four scopes are laid out broadest-on-the-left: User / User-Local / Project / Local.
+
+### Write path invariants
+- `serde_json` must use the `preserve_order` feature so key order round-trips intact.
+- Every write goes through `io_atomic::save`: serialize → re-parse to validate → backup → tempfile → rename.
+- `BackupTracker` (process-global `OnceLock`) ensures only one `.bak` is created per file per session.
+- `apply_move` calls `watch.note_self_write()` *after* each successful save so the watcher's self-write grace window suppresses the echo.
+
+### Frontend rendering
+- `renderApp` does a full DOM wipe + rebuild on every state change. It snapshots search input focus/caret before wiping and restores it after, so the search box stays usable while typing.
+- `moveInFlight` lives **outside** `state` intentionally — flipping it must not trigger a re-render (doing so would destroy the trigger button that `confirmMove` needs for focus restoration).
+- `externalReloadPending` defers `scopes-changed` reloads that arrive during an in-flight move or load. The in-flight operation's `finally` block drains it with one follow-up `load()`.
+
+### Tauri events (Rust → JS)
+- `scopes-changed` — any watched scope file mutated externally; triggers a reload.
+- `watcher-error` — watcher install failed (non-fatal); logged to devtools only.
+
+### Biome (TS/JS/CSS/HTML)
+- 2-space indent, double quotes, semicolons, trailing commas, LF line endings, 100-char line width.
+- `biome.json` excludes `dist/`, `node_modules/`, `src-tauri/target/`, `src-tauri/gen/`, and `src-tauri/Cargo.lock`.
+
+### Git / CI
+- Default branch: `dev`. PRs target `dev`. Follow Conventional Commits.
+- CI triggers on pushes to `dev` and PRs targeting `dev`.
+- MSRV: Rust 1.88 (enforced by a dedicated CI `msrv` job).
+- Release workflow fires on `v*.*.*` tag push and uploads Tauri installers to a draft GitHub Release.
