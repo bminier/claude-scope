@@ -60,10 +60,14 @@ pub fn load() -> Preferences {
     serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
-/// Save preferences atomically (tempfile + rename). Creates the parent
-/// directory if it doesn't exist yet. Errors propagate so the caller can
-/// surface them to the user; silent failure here would be a confusing
-/// "my toggle didn't stick."
+/// Save preferences atomically. Creates the parent directory if needed and
+/// writes via `tempfile::NamedTempFile` + `persist()` — the same pattern
+/// `io_atomic::save` uses — for two reasons:
+///   - `NamedTempFile` gives each in-flight save a unique filename, so a
+///     call that races with another can't scribble over its tempfile.
+///   - `persist()` uses platform-appropriate atomic replace semantics;
+///     `std::fs::rename` alone refuses to overwrite an existing destination
+///     on Windows, which would break every save after the first.
 pub fn save(prefs: &Preferences) -> std::io::Result<()> {
     let path = config_path().ok_or_else(|| {
         std::io::Error::new(
@@ -71,19 +75,21 @@ pub fn save(prefs: &Preferences) -> std::io::Result<()> {
             "no OS config directory available",
         )
     })?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config path has no parent directory",
+        ));
+    };
+    std::fs::create_dir_all(parent)?;
 
     let body = serde_json::to_vec_pretty(prefs)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    // Atomic write: tempfile next to the target, rename over. Rename is
-    // atomic on the same filesystem, so a crash mid-write can't leave the
-    // config half-written.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &body)?;
-    std::fs::rename(&tmp, &path)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::Write::write_all(&mut tmp, &body)?;
+    tmp.as_file_mut().sync_all()?;
+    tmp.persist(&path).map_err(|e| e.error)?;
     Ok(())
 }
 
@@ -122,5 +128,42 @@ mod tests {
         let json = serde_json::to_string(&prefs).unwrap();
         let parsed: Preferences = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, prefs);
+    }
+
+    /// Exercise the save path against a real filesystem so the
+    /// `NamedTempFile::persist()` replace succeeds both on first write and
+    /// when a previous config file already exists — that second case is
+    /// the Windows regression that plain `fs::rename` would fail on.
+    #[test]
+    fn save_path_overwrites_existing_file_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("claude-scope").join("config.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let first = Preferences {
+            visible_scopes: vec![Scope::Local],
+        };
+        let body = serde_json::to_vec_pretty(&first).unwrap();
+        let parent = target.parent().unwrap();
+        let mut tmpfile = tempfile::NamedTempFile::new_in(parent).unwrap();
+        std::io::Write::write_all(&mut tmpfile, &body).unwrap();
+        tmpfile.as_file_mut().sync_all().unwrap();
+        tmpfile.persist(&target).unwrap();
+        assert!(target.exists());
+
+        // Second write overwrites the first — this is where `fs::rename`
+        // alone would fail on Windows.
+        let second = Preferences {
+            visible_scopes: vec![Scope::Project, Scope::User],
+        };
+        let body2 = serde_json::to_vec_pretty(&second).unwrap();
+        let mut tmpfile2 = tempfile::NamedTempFile::new_in(parent).unwrap();
+        std::io::Write::write_all(&mut tmpfile2, &body2).unwrap();
+        tmpfile2.as_file_mut().sync_all().unwrap();
+        tmpfile2.persist(&target).unwrap();
+
+        let round_trip: Preferences =
+            serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(round_trip, second);
     }
 }

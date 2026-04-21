@@ -174,17 +174,37 @@ function setQuery(next: string): void {
   render();
 }
 
+// Serialize preference saves: at most one in-flight call, with the latest
+// pending state always winning. Without this, rapid toggles could produce
+// overlapping `save_preferences` invokes whose completion order isn't
+// guaranteed to match UI order — so a slower earlier save resolving after
+// a faster later save would leave disk out of sync with the visible state.
+let preferencesSaveInFlight: Promise<void> | null = null;
+let pendingPreferencesSave: Preferences | null = null;
+
 async function persistPreferences(next: Preferences): Promise<void> {
   // Update state + render immediately so the UI feels instant; persist in
   // the background. If the save fails, warn the user — stale in-memory
   // state is easier to reason about than a silent mismatch with disk.
   state.preferences = next;
   render();
-  try {
-    await invoke("save_preferences", { prefs: next });
-  } catch (err) {
-    alert(`Failed to save preferences: ${err}`);
-  }
+  pendingPreferencesSave = next;
+  if (preferencesSaveInFlight) return;
+  preferencesSaveInFlight = (async () => {
+    try {
+      while (pendingPreferencesSave) {
+        const prefs = pendingPreferencesSave;
+        pendingPreferencesSave = null;
+        try {
+          await invoke("save_preferences", { prefs });
+        } catch (err) {
+          alert(`Failed to save preferences: ${err}`);
+        }
+      }
+    } finally {
+      preferencesSaveInFlight = null;
+    }
+  })();
 }
 
 function onToggleScopeVisibility(scope: Scope, visible: boolean): void {
