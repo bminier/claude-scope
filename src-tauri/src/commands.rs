@@ -25,7 +25,10 @@ pub struct ScopeView {
     pub path: Option<String>,
     pub exists: bool,
     pub permissions: PermissionRules,
-    pub other_keys: Vec<String>,
+    /// Non-permission top-level keys with their raw JSON values, in the
+    /// order they appear on disk. Drives the UI tree view for `env`,
+    /// `hooks`, `theme`, etc.
+    pub other_values: serde_json::Map<String, serde_json::Value>,
     pub parse_error: Option<String>,
 }
 
@@ -117,23 +120,33 @@ fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::
         let path = paths.path_for(scope);
         let (exists, perms, other, err) = match path {
             Some(p) => match io_atomic::load(p) {
-                Ok(Some(doc)) => (true, doc.permissions(), doc.other_keys(), None),
-                Ok(None) => (false, PermissionRules::default(), vec![], None),
+                Ok(Some(doc)) => (true, doc.permissions(), doc.other_entries(), None),
+                Ok(None) => (
+                    false,
+                    PermissionRules::default(),
+                    serde_json::Map::new(),
+                    None,
+                ),
                 Err(e) => (
                     p.exists(),
                     PermissionRules::default(),
-                    vec![],
+                    serde_json::Map::new(),
                     Some(e.to_string()),
                 ),
             },
-            None => (false, PermissionRules::default(), vec![], None),
+            None => (
+                false,
+                PermissionRules::default(),
+                serde_json::Map::new(),
+                None,
+            ),
         };
         views.push(ScopeView {
             scope,
             path: path.map(|p| p.display().to_string()),
             exists,
             permissions: perms,
-            other_keys: other,
+            other_values: other,
             parse_error: err,
         });
     }
@@ -724,7 +737,7 @@ mod tests {
                     deny: vec![],
                     ask: vec![],
                 },
-                other_keys: vec![],
+                other_values: serde_json::Map::new(),
                 parse_error: None,
             },
             ScopeView {
@@ -736,7 +749,7 @@ mod tests {
                     deny: vec!["WebFetch(domain:evil.example)".into()],
                     ask: vec![],
                 },
-                other_keys: vec![],
+                other_values: serde_json::Map::new(),
                 parse_error: None,
             },
             ScopeView {
@@ -744,7 +757,7 @@ mod tests {
                 path: None,
                 exists: false,
                 permissions: PermissionRules::default(),
-                other_keys: vec![],
+                other_values: serde_json::Map::new(),
                 parse_error: None,
             },
         ];

@@ -331,12 +331,97 @@ button:disabled {
   padding: 2px 6px;
 }
 
-.other-keys {
+/* Tree view for non-permission top-level keys (env, hooks, theme, …).
+   Uses native <details>/<summary> so expand/collapse and keyboard
+   interaction work without extra JS. Default-collapsed; expansion state
+   is persisted across re-renders in `openTreeNodes`. */
+.other-tree {
   margin-top: 12px;
   padding-top: 8px;
   border-top: 1px dashed var(--border);
+  font-size: 12px;
+}
+
+.other-tree-heading {
+  margin: 0 0 4px 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+}
+
+.tree-node {
+  padding: 2px 0 2px 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.tree-branch > .tree-summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+.tree-branch > .tree-summary::-webkit-details-marker {
+  display: none;
+}
+.tree-branch > .tree-summary::before {
+  content: "▶";
+  font-size: 9px;
+  color: var(--muted);
+  transition: transform 120ms ease;
+  display: inline-block;
+}
+.tree-branch[open] > .tree-summary::before {
+  transform: rotate(90deg);
+}
+.tree-branch > .tree-summary:hover {
+  background: var(--panel-2);
+}
+.tree-branch > .tree-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.tree-children {
+  margin-left: 10px;
+  padding-left: 8px;
+  border-left: 1px dashed var(--border);
+}
+
+.tree-key {
+  color: var(--text);
+}
+
+.tree-peek {
   color: var(--muted);
   font-size: 11px;
+}
+
+.tree-leaf {
+  display: flex;
+  gap: 6px;
+  padding-left: 15px;
+}
+.tree-leaf .tree-key::after {
+  content: ":";
+  color: var(--muted);
+}
+
+.tree-value-str {
+  color: var(--allow);
+}
+.tree-value-num,
+.tree-value-bool {
+  color: var(--accent);
+}
+.tree-value-null {
+  color: var(--muted);
+  font-style: italic;
 }
 
 /* ------- Diff confirm modal ------- */

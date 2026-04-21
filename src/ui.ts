@@ -1,5 +1,6 @@
 import { lintRule } from "./lint.ts";
 import type {
+  JsonValue,
   LoadedScopes,
   MovePreview,
   MoveRequest,
@@ -315,6 +316,96 @@ function ensureLintGlobalListeners(): void {
   });
 }
 
+// Tracks which tree-view branches the user has expanded. The set is keyed by
+// "<scope>:<dot-joined-path>" so state survives a full renderApp rebuild (the
+// DOM is thrown away but this module-level set isn't).
+const openTreeNodes = new Set<string>();
+
+function treeKey(scope: Scope, path: (string | number)[]): string {
+  return `${scope}:${path.join(".")}`;
+}
+
+function treeNode(
+  scope: Scope,
+  path: (string | number)[],
+  label: string,
+  value: JsonValue,
+): HTMLElement {
+  if (value !== null && typeof value === "object") {
+    return treeBranch(scope, path, label, value);
+  }
+  return treeLeaf(label, value);
+}
+
+function treeBranch(
+  scope: Scope,
+  path: (string | number)[],
+  label: string,
+  value: JsonValue[] | { [key: string]: JsonValue },
+): HTMLElement {
+  const details = document.createElement("details");
+  details.className = "tree-node tree-branch";
+  const key = treeKey(scope, path);
+  if (openTreeNodes.has(key)) details.open = true;
+  details.addEventListener("toggle", () => {
+    if (details.open) openTreeNodes.add(key);
+    else openTreeNodes.delete(key);
+  });
+
+  const summary = document.createElement("summary");
+  summary.className = "tree-summary";
+  const name = document.createElement("span");
+  name.className = "tree-key";
+  name.textContent = label;
+  summary.appendChild(name);
+  const peek = document.createElement("span");
+  peek.className = "tree-peek";
+  peek.textContent = Array.isArray(value) ? `[${value.length}]` : `{${Object.keys(value).length}}`;
+  summary.appendChild(peek);
+  details.appendChild(summary);
+
+  const children = document.createElement("div");
+  children.className = "tree-children";
+  if (Array.isArray(value)) {
+    value.forEach((child, i) => {
+      children.appendChild(treeNode(scope, [...path, i], `[${i}]`, child));
+    });
+  } else {
+    for (const [k, v] of Object.entries(value)) {
+      children.appendChild(treeNode(scope, [...path, k], k, v));
+    }
+  }
+  details.appendChild(children);
+  return details;
+}
+
+function treeLeaf(label: string, value: JsonValue): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "tree-node tree-leaf";
+  const name = document.createElement("span");
+  name.className = "tree-key";
+  name.textContent = label;
+  row.appendChild(name);
+  const val = document.createElement("span");
+  val.className = `tree-value tree-value-${leafType(value)}`;
+  val.textContent = formatLeaf(value);
+  row.appendChild(val);
+  return row;
+}
+
+function leafType(value: JsonValue): string {
+  if (value === null) return "null";
+  if (typeof value === "boolean") return "bool";
+  if (typeof value === "number") return "num";
+  return "str";
+}
+
+function formatLeaf(value: JsonValue): string {
+  if (value === null) return "null";
+  if (typeof value === "string") return JSON.stringify(value);
+  return String(value);
+}
+
 function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
   const grid = document.createElement("section");
   grid.className = "grid";
@@ -402,11 +493,18 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
     }
   }
 
-  if (view.other_keys.length > 0) {
-    const other = document.createElement("div");
-    other.className = "other-keys";
-    other.textContent = `Other keys: ${view.other_keys.join(", ")}`;
-    col.appendChild(other);
+  const otherKeys = Object.keys(view.other_values);
+  if (otherKeys.length > 0) {
+    const tree = document.createElement("div");
+    tree.className = "other-tree";
+    const heading = document.createElement("h4");
+    heading.className = "other-tree-heading";
+    heading.textContent = "Other settings";
+    tree.appendChild(heading);
+    for (const key of otherKeys) {
+      tree.appendChild(treeNode(view.scope, [key], key, view.other_values[key]));
+    }
+    col.appendChild(tree);
   }
 
   return col;

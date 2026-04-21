@@ -8,12 +8,22 @@ export type Scope = "local" | "project" | "user_local" | "user";
 // rendering and move-target buttons cover the full set.
 export const SCOPES: readonly Scope[] = ["user", "user_local", "project", "local"] as const;
 
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
 export interface ScopeView {
   scope: Scope;
   path: string | null;
   exists: boolean;
   permissions: PermissionRules;
-  other_keys: string[];
+  // Non-permission top-level keys with their raw JSON values, in the order
+  // they appear on disk. Rendered as a collapsible tree in the UI.
+  other_values: { [key: string]: JsonValue };
   parse_error: string | null;
 }
 
