@@ -735,3 +735,54 @@ button:disabled {
   visibility: visible;
   pointer-events: auto;
 }
+
+/* Settings dialog — reuses `.modal` shell with a different body layout.
+   The modal defaults to a wide 2-column diff for moves; the settings
+   body is narrower and vertical, so size + padding are tuned here. */
+.modal-settings {
+  max-width: 420px;
+  padding: 20px;
+}
+
+.settings-section {
+  margin-bottom: 12px;
+}
+
+.settings-heading {
+  margin: 0 0 6px 0;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+}
+
+.settings-hint {
+  margin: 0 0 10px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.settings-checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.settings-check:hover {
+  background: var(--panel-2);
+}
+
+.settings-check input[type="checkbox"] {
+  cursor: pointer;
+  accent-color: var(--accent);
+}

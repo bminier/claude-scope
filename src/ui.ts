@@ -9,6 +9,7 @@ import type {
   MoveRequest,
   MoveSide,
   PermissionKind,
+  Preferences,
   Scope,
   ScopeView,
 } from "./types.ts";
@@ -19,10 +20,12 @@ interface AppProps {
   projectDir: string | null;
   busy: boolean;
   query: string;
+  preferences: Preferences;
   onPickProject: () => void;
   onReload: () => void;
   onMove: (req: MoveRequest, trigger?: HTMLElement) => void;
   onMoveKey: (req: MoveKeyRequest, trigger?: HTMLElement) => void;
+  onOpenSettings: (trigger?: HTMLElement) => void;
   onQueryChange: (next: string) => void;
 }
 
@@ -137,6 +140,12 @@ function header(props: AppProps): HTMLElement {
   reload.onclick = props.onReload;
   reload.disabled = props.busy || !props.scopes;
   actions.appendChild(reload);
+
+  const settings = document.createElement("button");
+  settings.textContent = "Settings";
+  settings.setAttribute("aria-label", "Open settings");
+  settings.onclick = (e) => props.onOpenSettings(e.currentTarget as HTMLElement);
+  actions.appendChild(settings);
 
   bar.appendChild(actions);
   return bar;
@@ -493,7 +502,9 @@ function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
   // a future caller can't crash at runtime.
   const loaded = props.scopes;
   if (!loaded) return grid;
+  const visible = new Set(props.preferences.visible_scopes);
   for (const scope of SCOPES) {
+    if (!visible.has(scope)) continue;
     const view = loaded.scopes.find((s) => s.scope === scope);
     if (!view) continue;
     grid.appendChild(scopeColumn(view, props, lowerQuery));
@@ -847,6 +858,141 @@ function formatValue(v: JsonValue | undefined): string {
   // JSON `null` should stringify as "null", not collapse to "(absent)".
   if (v === undefined) return "(absent)";
   return JSON.stringify(v, null, 2);
+}
+
+interface SettingsProps {
+  preferences: Preferences;
+  onToggleScopeVisibility: (scope: Scope, visible: boolean) => void;
+}
+
+/**
+ * Open the settings dialog. Changes persist as the user clicks — there's no
+ * Apply/Cancel dance here, so the dialog only exposes a single "Close"
+ * action. Focus is restored to `trigger` when the dialog closes, like the
+ * rule-move confirm flow.
+ */
+export function openSettings(props: SettingsProps, trigger?: HTMLElement | null): void {
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+
+  const titleId = `modal-title-${++modalIdCounter}`;
+
+  const panel = document.createElement("div");
+  panel.className = "modal modal-settings";
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", titleId);
+
+  const title = document.createElement("h2");
+  title.id = titleId;
+  title.className = "modal-title";
+  title.textContent = "Settings";
+  panel.appendChild(title);
+
+  panel.appendChild(settingsColumnsSection(props));
+
+  const actions = document.createElement("div");
+  actions.className = "modal-actions";
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "Close";
+  closeBtn.className = "btn-apply";
+  actions.appendChild(closeBtn);
+  panel.appendChild(actions);
+
+  backdrop.appendChild(panel);
+
+  const focusableSelector =
+    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+  const close = () => {
+    document.removeEventListener("keydown", onKey);
+    backdrop.remove();
+    if (trigger && document.body.contains(trigger)) {
+      trigger.focus();
+    }
+  };
+
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+      return;
+    }
+    if (e.key === "Tab") {
+      const focusables = Array.from(panel.querySelectorAll<HTMLElement>(focusableSelector));
+      if (focusables.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      if (e.shiftKey) {
+        if (active === first || !panel.contains(active)) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else {
+        if (active === last || !panel.contains(active)) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    }
+  };
+  document.addEventListener("keydown", onKey);
+  backdrop.addEventListener("click", (e) => {
+    if (e.target === backdrop) close();
+  });
+  closeBtn.addEventListener("click", close);
+
+  document.body.appendChild(backdrop);
+  closeBtn.focus();
+}
+
+function settingsColumnsSection(props: SettingsProps): HTMLElement {
+  const section = document.createElement("section");
+  section.className = "settings-section";
+
+  const heading = document.createElement("h3");
+  heading.className = "settings-heading";
+  heading.textContent = "Scope columns";
+  section.appendChild(heading);
+
+  const hint = document.createElement("p");
+  hint.className = "settings-hint";
+  hint.textContent = "Hide scope columns you don't need. Preferences persist across launches.";
+  section.appendChild(hint);
+
+  const visible = new Set(props.preferences.visible_scopes);
+  const list = document.createElement("div");
+  list.className = "settings-checklist";
+  for (const scope of SCOPES) {
+    const row = document.createElement("label");
+    row.className = "settings-check";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = visible.has(scope);
+    // Guard: don't let the user uncheck the last visible column. The grid
+    // would otherwise render empty with no obvious way back from inside the
+    // dialog.
+    cb.addEventListener("change", () => {
+      if (!cb.checked && visible.size === 1 && visible.has(scope)) {
+        cb.checked = true;
+        return;
+      }
+      if (cb.checked) visible.add(scope);
+      else visible.delete(scope);
+      props.onToggleScopeVisibility(scope, cb.checked);
+    });
+    row.appendChild(cb);
+    const label = document.createElement("span");
+    label.textContent = SCOPE_LABELS[scope];
+    row.appendChild(label);
+    list.appendChild(row);
+  }
+  section.appendChild(list);
+  return section;
 }
 
 function diffSide(side: MoveSide, mode: "add" | "remove", movingRule: string): HTMLElement {

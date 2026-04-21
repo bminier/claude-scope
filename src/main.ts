@@ -8,20 +8,31 @@ import type {
   MoveKeyRequest,
   MovePreview,
   MoveRequest,
+  Preferences,
+  Scope,
 } from "./types.ts";
 import { SEARCH_INPUT_ID } from "./types.ts";
-import { confirmMove, confirmMoveKey, renderApp } from "./ui.ts";
+import { confirmMove, confirmMoveKey, openSettings, renderApp } from "./ui.ts";
+
+// Mirror of the Rust `Preferences::default()` — used until the real payload
+// arrives from the backend so renders before load_preferences() resolves
+// still have something complete to work with.
+const DEFAULT_PREFERENCES: Preferences = {
+  visible_scopes: ["local", "project", "user_local", "user"],
+};
 
 const state: {
   scopes: LoadedScopes | null;
   projectDir: string | null;
   busy: boolean;
   query: string;
+  preferences: Preferences;
 } = {
   scopes: null,
   projectDir: null,
   busy: false,
   query: "",
+  preferences: DEFAULT_PREFERENCES,
 };
 
 // Set by the scopes-changed listener when it fires while another load or
@@ -163,6 +174,37 @@ function setQuery(next: string): void {
   render();
 }
 
+async function persistPreferences(next: Preferences): Promise<void> {
+  // Update state + render immediately so the UI feels instant; persist in
+  // the background. If the save fails, warn the user — stale in-memory
+  // state is easier to reason about than a silent mismatch with disk.
+  state.preferences = next;
+  render();
+  try {
+    await invoke("save_preferences", { prefs: next });
+  } catch (err) {
+    alert(`Failed to save preferences: ${err}`);
+  }
+}
+
+function onToggleScopeVisibility(scope: Scope, visible: boolean): void {
+  const cur = state.preferences.visible_scopes;
+  const next = visible
+    ? [...cur, scope].filter((s, i, a) => a.indexOf(s) === i)
+    : cur.filter((s) => s !== scope);
+  void persistPreferences({ ...state.preferences, visible_scopes: next });
+}
+
+function onOpenSettings(trigger?: HTMLElement): void {
+  void openSettings(
+    {
+      preferences: state.preferences,
+      onToggleScopeVisibility,
+    },
+    trigger,
+  );
+}
+
 function render(): void {
   const root = document.getElementById("app");
   if (!root) return;
@@ -171,10 +213,12 @@ function render(): void {
     projectDir: state.projectDir,
     busy: state.busy,
     query: state.query,
+    preferences: state.preferences,
     onPickProject: pickProject,
     onReload: reload,
     onMove: moveRule,
     onMoveKey: moveKey,
+    onOpenSettings,
     onQueryChange: setQuery,
   });
 }
@@ -233,4 +277,17 @@ listen<string>("watcher-error", (evt) => {
   console.error("failed to register watcher-error listener", err);
 });
 
-load(null);
+async function bootstrap(): Promise<void> {
+  // Load preferences before the first scope load so the initial render
+  // applies them (e.g. column visibility) instead of flashing defaults
+  // first and then switching. A failed load falls back to defaults;
+  // there's no useful user action on "couldn't read config file."
+  try {
+    state.preferences = await invoke<Preferences>("load_preferences");
+  } catch (err) {
+    console.warn("failed to load preferences, using defaults:", err);
+  }
+  await load(null);
+}
+
+void bootstrap();

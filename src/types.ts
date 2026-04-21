@@ -101,3 +101,12 @@ export interface MoveKeyPreview {
  * shortcut (main.ts looks it up) need to agree.
  */
 export const SEARCH_INPUT_ID = "rule-search";
+
+/**
+ * User preferences persisted to the OS config dir. Schema mirrors the Rust
+ * `Preferences` struct; the backend fills in defaults for missing fields,
+ * so this is always complete as read from the IPC.
+ */
+export interface Preferences {
+  visible_scopes: Scope[];
+}

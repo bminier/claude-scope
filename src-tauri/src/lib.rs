@@ -1,6 +1,7 @@
 mod commands;
 mod io_atomic;
 mod model;
+mod preferences;
 mod scope;
 mod watcher;
 
@@ -15,6 +16,8 @@ pub fn run() {
             commands::apply_move,
             commands::diff_move_key,
             commands::apply_move_key,
+            commands::load_preferences,
+            commands::save_preferences,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -8,6 +8,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::io_atomic::{self, BackupTracker};
 use crate::model::{PermissionKind, PermissionRules, SettingsDoc};
+use crate::preferences::{self, Preferences};
 use crate::scope::{self, Scope, ScopePaths};
 use crate::watcher::WatchState;
 
@@ -171,6 +172,22 @@ pub fn apply_move_key(
     let start = project_dir.as_ref().map(Path::new);
     let paths = scope::resolve(start).map_err(|e| e.to_string())?;
     apply_move_key_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
+}
+
+/// Read user preferences. A missing / malformed config file falls back to
+/// defaults — see `preferences::load`.
+#[tauri::command]
+pub fn load_preferences() -> Preferences {
+    preferences::load()
+}
+
+/// Persist user preferences to the OS config dir. Unlike the permission
+/// save path, this has no `.bak` trail — the preferences file is cheap to
+/// regenerate if something goes wrong, and keeping backup files out of the
+/// user's config dir is the less surprising default.
+#[tauri::command]
+pub fn save_preferences(prefs: Preferences) -> Result<(), String> {
+    preferences::save(&prefs).map_err(|e| e.to_string())
 }
 
 fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::Error>> {
