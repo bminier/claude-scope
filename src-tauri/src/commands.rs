@@ -97,11 +97,16 @@ pub struct MoveKeySide {
     pub scope: Scope,
     pub path: String,
     pub path_exists: bool,
-    /// The raw JSON value stored at this key before the move. `None` when the
-    /// key isn't present (common on the destination when the key is new).
+    /// The raw JSON value stored at this key before the move. Omitted from
+    /// the serialized payload when the key isn't present — distinguishing
+    /// absence from a key explicitly set to JSON `null`, which is a valid
+    /// value and would otherwise collide at the wire level.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub value_before: Option<serde_json::Value>,
     /// The JSON value this side will have after the move is applied. `None`
-    /// on the source (the key is removed).
+    /// on the source (the key is removed); same absence-vs-null skip as
+    /// `value_before`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub value_after: Option<serde_json::Value>,
     pub will_write: bool,
     pub note: Option<String>,

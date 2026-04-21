@@ -404,6 +404,7 @@ button:disabled {
 
 .tree-leaf {
   display: flex;
+  align-items: center;
   gap: 6px;
   padding-left: 15px;
 }
@@ -430,9 +431,6 @@ button:disabled {
 .tree-key-moves {
   margin-left: auto;
   gap: 4px;
-}
-.tree-leaf {
-  align-items: center;
 }
 
 /* ------- Diff confirm modal ------- */

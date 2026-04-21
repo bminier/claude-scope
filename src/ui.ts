@@ -815,7 +815,10 @@ function keyDiffSide(side: MoveKeySide, mode: "add" | "remove"): HTMLElement {
     verdict.textContent = "key removed";
     verdict.classList.add("removed");
   } else {
-    verdict.textContent = side.value_before === null ? "key added" : "key merged";
+    // `undefined` means the backend skipped the field because the key was
+    // absent; a present-but-null value arrives as `null` and counts as a
+    // real existing value to merge against.
+    verdict.textContent = side.value_before === undefined ? "key added" : "key merged";
     verdict.classList.add("added");
   }
   head.appendChild(verdict);
@@ -839,8 +842,10 @@ function keyDiffSide(side: MoveKeySide, mode: "add" | "remove"): HTMLElement {
   return col;
 }
 
-function formatValue(v: JsonValue | null): string {
-  if (v === null) return "(absent)";
+function formatValue(v: JsonValue | undefined): string {
+  // `undefined` is the absence sentinel (Rust skipped the field); a literal
+  // JSON `null` should stringify as "null", not collapse to "(absent)".
+  if (v === undefined) return "(absent)";
   return JSON.stringify(v, null, 2);
 }
 

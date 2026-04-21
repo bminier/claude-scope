@@ -79,8 +79,12 @@ export interface MoveKeySide {
   scope: Scope;
   path: string;
   path_exists: boolean;
-  value_before: JsonValue | null;
-  value_after: JsonValue | null;
+  // The Rust side omits `value_before` / `value_after` entirely when the key
+  // is absent (see `#[serde(skip_serializing_if = "Option::is_none")]`), so
+  // `undefined` means "absent" while `null` is a real JSON null value. The
+  // UI relies on that distinction when rendering verdicts and values.
+  value_before?: JsonValue;
+  value_after?: JsonValue;
   will_write: boolean;
   note: string | null;
 }
