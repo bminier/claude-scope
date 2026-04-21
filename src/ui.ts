@@ -359,11 +359,6 @@ function treeBranch(
   const details = document.createElement("details");
   details.className = "tree-node tree-branch";
   const key = treeKey(scope, path);
-  if (openTreeNodes.has(key)) details.open = true;
-  details.addEventListener("toggle", () => {
-    if (details.open) openTreeNodes.add(key);
-    else openTreeNodes.delete(key);
-  });
 
   const summary = document.createElement("summary");
   summary.className = "tree-summary";
@@ -379,16 +374,40 @@ function treeBranch(
 
   const children = document.createElement("div");
   children.className = "tree-children";
-  if (Array.isArray(value)) {
-    value.forEach((child, i) => {
-      children.appendChild(treeNode(scope, [...path, i], `[${i}]`, child));
-    });
-  } else {
-    for (const [k, v] of Object.entries(value)) {
-      children.appendChild(treeNode(scope, [...path, k], k, v));
+  details.appendChild(children);
+
+  // Lazy-render children: defer DOM construction until the branch is first
+  // opened. Keeps initial render cheap for large `env` / `hooks` payloads —
+  // a deeply nested object that's collapsed contributes only the summary
+  // row to the DOM, not its full subtree.
+  let populated = false;
+  function populate(): void {
+    if (populated) return;
+    populated = true;
+    if (Array.isArray(value)) {
+      value.forEach((child, i) => {
+        children.appendChild(treeNode(scope, [...path, i], `[${i}]`, child));
+      });
+    } else {
+      for (const [k, v] of Object.entries(value)) {
+        children.appendChild(treeNode(scope, [...path, k], k, v));
+      }
     }
   }
-  details.appendChild(children);
+
+  if (openTreeNodes.has(key)) {
+    details.open = true;
+    populate();
+  }
+  details.addEventListener("toggle", () => {
+    if (details.open) {
+      openTreeNodes.add(key);
+      populate();
+    } else {
+      openTreeNodes.delete(key);
+    }
+  });
+
   return details;
 }
 

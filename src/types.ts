@@ -21,8 +21,12 @@ export interface ScopeView {
   path: string | null;
   exists: boolean;
   permissions: PermissionRules;
-  // Non-permission top-level keys with their raw JSON values, in the order
-  // they appear on disk. Rendered as a collapsible tree in the UI.
+  // Non-permission top-level keys with their raw JSON values. Rust preserves
+  // on-disk key order via serde_json's `preserve_order` feature; JS preserves
+  // insertion order too for string keys, *except* it shuffles integer-like
+  // keys ("0", "1", …) to the front. For Claude Code's settings shape
+  // (env var names, hook event names, theme scalar) that's a non-issue —
+  // none of the realistic top-level or nested keys are integer-like.
   other_values: { [key: string]: JsonValue };
   parse_error: string | null;
 }
