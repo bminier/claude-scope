@@ -52,6 +52,10 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
     : null;
 
   root.innerHTML = "";
+  // The full DOM wipe just destroyed any pinned lint popover; clear the
+  // tracking state so a stale `openLintWrap` doesn't survive re-render and
+  // confuse the next outside-click / Escape.
+  closeLintPopover();
   root.appendChild(header(props));
 
   if (!props.scopes) {
@@ -279,7 +283,9 @@ let lintGlobalListenersAttached = false;
 
 function closeLintPopover(): void {
   if (!openLintWrap) return;
-  openLintWrap.classList.remove("is-open");
+  // The wrap may already be detached (e.g. after a renderApp() rebuild);
+  // touching classList is harmless but the state still needs nulling.
+  if (openLintWrap.isConnected) openLintWrap.classList.remove("is-open");
   openLintWrap = null;
 }
 
@@ -301,7 +307,10 @@ function ensureLintGlobalListeners(): void {
     if (document.querySelector(".modal-backdrop")) return;
     const btn = openLintWrap.querySelector<HTMLButtonElement>(".lint-warn");
     closeLintPopover();
-    btn?.focus();
+    // Skip focus restore if the badge was torn down by a re-render between
+    // pin and Escape — focusing a detached node is a no-op in some
+    // browsers and a stray scroll/focus jump in others.
+    if (btn?.isConnected) btn.focus();
   });
 }
 
