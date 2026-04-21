@@ -484,6 +484,10 @@ fn apply_move_key_impl(
         },
     )?;
 
+    // Snapshot whether the destination file existed on disk before we
+    // touched it, so a later rollback can tell "restore the old contents"
+    // apart from "we created this file, so removing it is the rollback."
+    let to_existed_before = to_path.exists();
     let to_doc_before = io_atomic::load(&to_path)?.unwrap_or_else(SettingsDoc::empty);
     let to_before = to_doc_before.get_top_level(&req.key).cloned();
     let mut to_doc = to_doc_before.clone();
@@ -502,9 +506,16 @@ fn apply_move_key_impl(
     }
     if let Err(source_err) = io_atomic::save(&from_path, &from_doc, backups) {
         if dest_mutated {
-            // Roll back the destination to its pre-merge state. Re-save the
-            // snapshot we took before mutating to_doc.
-            if let Err(rollback_err) = io_atomic::save(&to_path, &to_doc_before, backups) {
+            // Roll back the destination. If the file already existed before
+            // we wrote to it, restore the pre-merge snapshot. If the save
+            // newly created the file, delete it outright — re-saving the
+            // empty snapshot would leave a stray `{}` file behind.
+            let rollback_result: Result<(), Box<dyn std::error::Error>> = if to_existed_before {
+                io_atomic::save(&to_path, &to_doc_before, backups).map_err(Into::into)
+            } else {
+                std::fs::remove_file(&to_path).map_err(Into::into)
+            };
+            if let Err(rollback_err) = rollback_result {
                 return Err(format!(
                     "source save failed: {source_err}; destination rollback also failed: {rollback_err}"
                 )
