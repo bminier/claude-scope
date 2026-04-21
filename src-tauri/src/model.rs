@@ -70,14 +70,6 @@ impl SettingsDoc {
         Self { root, indent }
     }
 
-    /// Top-level keys in the order they were written on disk.
-    pub fn top_level_keys(&self) -> Vec<String> {
-        self.root
-            .as_object()
-            .map(|o| o.keys().cloned().collect())
-            .unwrap_or_default()
-    }
-
     /// Top-level non-permission entries (key + value) in the order they were
     /// written on disk. Used by the UI tree-view so it can show what's in
     /// `env`, `hooks`, `theme`, and any future keys — not just their names.

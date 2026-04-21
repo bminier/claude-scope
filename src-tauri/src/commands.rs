@@ -117,38 +117,7 @@ fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::
     let mut views = Vec::with_capacity(Scope::ALL.len());
 
     for scope in Scope::ALL {
-        let path = paths.path_for(scope);
-        let (exists, perms, other, err) = match path {
-            Some(p) => match io_atomic::load(p) {
-                Ok(Some(doc)) => (true, doc.permissions(), doc.other_entries(), None),
-                Ok(None) => (
-                    false,
-                    PermissionRules::default(),
-                    serde_json::Map::new(),
-                    None,
-                ),
-                Err(e) => (
-                    p.exists(),
-                    PermissionRules::default(),
-                    serde_json::Map::new(),
-                    Some(e.to_string()),
-                ),
-            },
-            None => (
-                false,
-                PermissionRules::default(),
-                serde_json::Map::new(),
-                None,
-            ),
-        };
-        views.push(ScopeView {
-            scope,
-            path: path.map(|p| p.display().to_string()),
-            exists,
-            permissions: perms,
-            other_values: other,
-            parse_error: err,
-        });
+        views.push(load_scope_view(scope, paths.path_for(scope)));
     }
 
     let effective = effective_permissions(&views);
@@ -158,6 +127,33 @@ fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::
         scopes: views,
         effective_permissions: effective,
     })
+}
+
+fn load_scope_view(scope: Scope, path: Option<&Path>) -> ScopeView {
+    let mut view = ScopeView {
+        scope,
+        path: path.map(|p| p.display().to_string()),
+        exists: false,
+        permissions: PermissionRules::default(),
+        other_values: serde_json::Map::new(),
+        parse_error: None,
+    };
+    let Some(p) = path else {
+        return view;
+    };
+    match io_atomic::load(p) {
+        Ok(Some(doc)) => {
+            view.exists = true;
+            view.permissions = doc.permissions();
+            view.other_values = doc.other_entries();
+        }
+        Ok(None) => {}
+        Err(e) => {
+            view.exists = p.exists();
+            view.parse_error = Some(e.to_string());
+        }
+    }
+    view
 }
 
 /// Build the effective permission view. For v1 we union `allow` / `deny` /
@@ -400,7 +396,7 @@ mod tests {
             project_doc.permissions().allow,
             vec!["Read(**)".to_string()]
         );
-        assert!(project_doc.top_level_keys().iter().any(|k| k == "theme"));
+        assert!(project_doc.other_entries().contains_key("theme"));
 
         let user_doc = io_atomic::load(paths.user.as_ref().unwrap())
             .unwrap()
