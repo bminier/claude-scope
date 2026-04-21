@@ -458,8 +458,12 @@ function treeLeaf(
 function keyMoveButtons(scope: Scope, key: string, props: AppProps): HTMLElement {
   const moveBtns = document.createElement("div");
   moveBtns.className = "rule-moves tree-key-moves";
+  const visible = new Set(props.preferences.visible_scopes);
   for (const target of SCOPES) {
     if (target === scope) continue;
+    // Mirror scopeGrid: don't offer moves into columns the user hid — the
+    // result would land in a column they can't see without re-enabling it.
+    if (!visible.has(target)) continue;
     const btn = document.createElement("button");
     btn.className = "move-btn";
     btn.type = "button";
@@ -614,8 +618,12 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
 
   const moveBtns = document.createElement("div");
   moveBtns.className = "rule-moves";
+  const visible = new Set(props.preferences.visible_scopes);
   for (const target of SCOPES) {
     if (target === scope) continue;
+    // Same reasoning as `keyMoveButtons`: hidden columns can't be move
+    // targets, since the result would be immediately invisible.
+    if (!visible.has(target)) continue;
     const btn = document.createElement("button");
     btn.className = "move-btn";
     btn.textContent = `→ ${SCOPE_LABELS[target]}`;
