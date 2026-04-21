@@ -116,8 +116,9 @@ for validation. Keep the JSON parse lenient, the write path paranoid.
 
 - Launches on Windows (`cargo tauri dev` works; `cargo tauri build` produces a
   runnable binary).
-- Opens to a multi-column view covering every recognized scope
-  (Local / Project / User-Local / User).
+- Opens to a multi-column view covering every recognized scope, laid out
+  broadest-on-the-left to narrowest-on-the-right (User / User-Local /
+  Project / Local).
 - User can drag or click-to-move a permission rule from one column to another,
   and the backing JSON files update atomically with a `.bak` backup.
 - Round-trip test: after a move, `claude` reads the new effective config
