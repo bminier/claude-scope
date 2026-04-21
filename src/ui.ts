@@ -29,6 +29,7 @@ function matchesLoweredQuery(rule: string, lowerQuery: string): boolean {
 const SCOPE_LABELS: Record<Scope, string> = {
   local: "Local",
   project: "Project",
+  user_local: "User-Local",
   user: "User",
 };
 

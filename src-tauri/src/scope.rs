@@ -1,32 +1,37 @@
 //! Scope discovery.
 //!
 //! Claude Code recognizes these scopes (highest precedence first):
-//!   1. Managed (enterprise, out of scope for this tool)
-//!   2. Local   — <project>/.claude/settings.local.json
-//!   3. Project — <project>/.claude/settings.json
-//!   4. User    — ~/.claude/settings.json
+//!   1. Managed    — enterprise, out of scope for this tool
+//!   2. Local      — <project>/.claude/settings.local.json
+//!   3. Project    — <project>/.claude/settings.json
+//!   4. UserLocal  — ~/.claude/settings.local.json
+//!   5. User       — ~/.claude/settings.json
 //!
-//! `~/.claude/settings.local.json` is NOT a recognized scope.
+//! `~/.claude/settings.local.json` was originally excluded, but Claude Code
+//! is observed to create and use it when the user's home directory is itself
+//! inside a git repo, so it's treated as a real scope on par with the others.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Scope {
     Local,
     Project,
+    UserLocal,
     User,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 3] = [Scope::Local, Scope::Project, Scope::User];
+    pub const ALL: [Scope; 4] = [Scope::Local, Scope::Project, Scope::UserLocal, Scope::User];
 
     pub fn label(self) -> &'static str {
         match self {
             Scope::Local => "local",
             Scope::Project => "project",
+            Scope::UserLocal => "user-local",
             Scope::User => "user",
         }
     }
@@ -40,6 +45,7 @@ pub struct ScopePaths {
     pub project_dir: PathBuf,
     pub local: Option<PathBuf>,
     pub project: Option<PathBuf>,
+    pub user_local: Option<PathBuf>,
     pub user: Option<PathBuf>,
 }
 
@@ -48,6 +54,7 @@ impl ScopePaths {
         match scope {
             Scope::Local => self.local.as_deref(),
             Scope::Project => self.project.as_deref(),
+            Scope::UserLocal => self.user_local.as_deref(),
             Scope::User => self.user.as_deref(),
         }
     }
@@ -114,11 +121,16 @@ pub fn resolve(start: Option<&Path>) -> std::io::Result<ScopePaths> {
     let project_dir = find_project_root(start)?;
     let local = Some(project_dir.join(".claude").join("settings.local.json"));
     let project = Some(project_dir.join(".claude").join("settings.json"));
-    let user = dirs::home_dir().map(|h| h.join(".claude").join("settings.json"));
+    let home = dirs::home_dir();
+    let user_local = home
+        .as_ref()
+        .map(|h| h.join(".claude").join("settings.local.json"));
+    let user = home.map(|h| h.join(".claude").join("settings.json"));
     Ok(ScopePaths {
         project_dir,
         local,
         project,
+        user_local,
         user,
     })
 }
@@ -238,6 +250,34 @@ mod tests {
         assert_eq!(
             paths.project.as_deref().unwrap().file_name().unwrap(),
             "settings.json"
+        );
+    }
+
+    #[test]
+    fn resolve_builds_user_local_path_alongside_user() {
+        // Regression for #23: ~/.claude/settings.local.json needs to be a
+        // first-class scope, not hidden under the shared home-dir path
+        // computation.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = resolve(Some(tmp.path())).unwrap();
+        if let (Some(ul), Some(u)) = (paths.user_local.as_deref(), paths.user.as_deref()) {
+            assert_eq!(ul.file_name().unwrap(), "settings.local.json");
+            assert_eq!(u.file_name().unwrap(), "settings.json");
+            assert_eq!(ul.parent(), u.parent());
+        } else {
+            // dirs::home_dir() returned None (no $HOME in the test env);
+            // then both must be None together.
+            assert!(paths.user_local.is_none() && paths.user.is_none());
+        }
+    }
+
+    #[test]
+    fn scope_all_includes_user_local_between_project_and_user() {
+        // Precedence: highest first. UserLocal sits above User so that the
+        // effective-permissions union iterates in the right order.
+        assert_eq!(
+            Scope::ALL,
+            [Scope::Local, Scope::Project, Scope::UserLocal, Scope::User]
         );
     }
 }

@@ -220,6 +220,7 @@ fn compute_watch_plan(paths: &ScopePaths) -> WatchPlan {
     let scope_paths: Vec<PathBuf> = [
         paths.local.as_ref(),
         paths.project.as_ref(),
+        paths.user_local.as_ref(),
         paths.user.as_ref(),
     ]
     .into_iter()

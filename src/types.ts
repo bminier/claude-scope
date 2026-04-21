@@ -1,6 +1,8 @@
-export type Scope = "local" | "project" | "user";
+export type Scope = "local" | "project" | "user_local" | "user";
 
-export const SCOPES: readonly Scope[] = ["local", "project", "user"] as const;
+// Ordered by precedence, highest first — matches `Scope::ALL` on the Rust
+// side and drives the effective-permissions union order.
+export const SCOPES: readonly Scope[] = ["local", "project", "user_local", "user"] as const;
 
 export interface ScopeView {
   scope: Scope;

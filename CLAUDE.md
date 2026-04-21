@@ -31,10 +31,13 @@ The scopes (in precedence order, highest first) are:
 1. **Managed** — enterprise-deployed (out of scope for this project)
 2. **Local** — `./.claude/settings.local.json` (project-local, gitignored)
 3. **Project** — `./.claude/settings.json` (committed with the project)
-4. **User** — `~/.claude/settings.json` (machine-global)
+4. **User-Local** — `~/.claude/settings.local.json` (machine-local override)
+5. **User** — `~/.claude/settings.json` (machine-global)
 
-`~/.claude/settings.local.json` is **not** a recognized scope. Do not treat it
-as one.
+`~/.claude/settings.local.json` was originally excluded here, but Claude Code
+is observed to create and use it when the user's home directory is itself
+inside a git repo, so ClaudeScope treats it as a first-class scope on par
+with the other three.
 
 Moving a rule from one scope to another today requires hand-editing the JSON in
 each file, which is tedious, easy to break, and loses JSON comments / ordering.
@@ -81,7 +84,6 @@ Primary user: Brian. Primary machine: Windows 11. Secondary: macOS.
 ## Non-goals for v1
 
 - Editing managed (enterprise) settings.
-- Modifying `~/.claude/settings.local.json` (not a recognized scope).
 - Authoring new permissions from scratch — that can come later; v1 is a
   **promote/demote** tool.
 - Multi-user / cloud sync.
@@ -114,7 +116,8 @@ for validation. Keep the JSON parse lenient, the write path paranoid.
 
 - Launches on Windows (`cargo tauri dev` works; `cargo tauri build` produces a
   runnable binary).
-- Opens to a three-column (or three-panel) view: Local / Project / User.
+- Opens to a multi-column view covering every recognized scope
+  (Local / Project / User-Local / User).
 - User can drag or click-to-move a permission rule from one column to another,
   and the backing JSON files update atomically with a `.bak` backup.
 - Round-trip test: after a move, `claude` reads the new effective config

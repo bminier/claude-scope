@@ -111,7 +111,7 @@ pub fn apply_move(
 }
 
 fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::Error>> {
-    let mut views = Vec::with_capacity(3);
+    let mut views = Vec::with_capacity(Scope::ALL.len());
 
     for scope in Scope::ALL {
         let path = paths.path_for(scope);
@@ -148,11 +148,11 @@ fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::
 }
 
 /// Build the effective permission view. For v1 we union `allow` / `deny` /
-/// `ask` across the three recognized scopes and deduplicate while preserving
-/// the order Local → Project → User (highest precedence first). That's a
-/// faithful first approximation of "what Claude Code sees" for list-valued
-/// rule sets; precedence-sensitive semantics like conflict resolution are a
-/// future concern.
+/// `ask` across the recognized scopes and deduplicate while preserving the
+/// order Local → Project → UserLocal → User (highest precedence first).
+/// That's a faithful first approximation of "what Claude Code sees" for
+/// list-valued rule sets; precedence-sensitive semantics like conflict
+/// resolution are a future concern.
 fn effective_permissions(views: &[ScopeView]) -> PermissionRules {
     let mut out = PermissionRules::default();
     for view in views {
