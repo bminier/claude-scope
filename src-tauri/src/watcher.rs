@@ -324,6 +324,7 @@ mod tests {
             project_dir: PathBuf::from("/tmp/unused"),
             local,
             project,
+            user_local: None,
             user,
         }
     }

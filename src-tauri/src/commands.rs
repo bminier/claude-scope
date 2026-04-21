@@ -349,6 +349,7 @@ mod tests {
             project_dir: project.clone(),
             local: Some(project.join(".claude").join("settings.local.json")),
             project: Some(project.join(".claude").join("settings.json")),
+            user_local: Some(user_home.join(".claude").join("settings.local.json")),
             user: Some(user_home.join(".claude").join("settings.json")),
         }
     }
