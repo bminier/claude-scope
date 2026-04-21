@@ -11,14 +11,15 @@ import type {
   Preferences,
   Scope,
 } from "./types.ts";
-import { SEARCH_INPUT_ID } from "./types.ts";
+import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
 import { confirmMove, confirmMoveKey, openSettings, renderApp } from "./ui.ts";
 
 // Mirror of the Rust `Preferences::default()` — used until the real payload
 // arrives from the backend so renders before load_preferences() resolves
-// still have something complete to work with.
+// still have something complete to work with. Derived from SCOPES so adding
+// a new scope can't leave this list out of sync.
 const DEFAULT_PREFERENCES: Preferences = {
-  visible_scopes: ["local", "project", "user_local", "user"],
+  visible_scopes: [...SCOPES],
 };
 
 const state: {

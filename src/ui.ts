@@ -49,6 +49,16 @@ const KIND_LABELS: Record<PermissionKind, string> = {
 
 let modalIdCounter = 0;
 
+// Set at the top of every `renderApp` call so the tree walkers can cheaply
+// check "should this scope be rendered?" without each one rebuilding a Set
+// from the visible_scopes array. Rendering is synchronous, so this
+// module-level variable is effectively render-scoped.
+let currentVisibleScopes: Set<Scope> = new Set();
+
+function isScopeVisible(scope: Scope): boolean {
+  return currentVisibleScopes.has(scope);
+}
+
 export function renderApp(root: HTMLElement, props: AppProps): void {
   // Full re-render destroys the DOM, including the search input the user
   // is typing into. Snapshot its focus + selection before we wipe, restore
@@ -65,6 +75,10 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   // tracking state so a stale `openLintWrap` doesn't survive re-render and
   // confuse the next outside-click / Escape.
   closeLintPopover();
+  // Compute the visible-scope set once here — every helper below reads
+  // `isScopeVisible` instead of rebuilding this Set per scope/rule/tree
+  // node, which mattered for payloads with many rules.
+  currentVisibleScopes = new Set(props.preferences.visible_scopes);
   // Project changed (or first load) — drop any tree-view expansions from
   // the previous project so they don't bleed across into a new tree where
   // the same scope+path could mean something different.
@@ -458,12 +472,11 @@ function treeLeaf(
 function keyMoveButtons(scope: Scope, key: string, props: AppProps): HTMLElement {
   const moveBtns = document.createElement("div");
   moveBtns.className = "rule-moves tree-key-moves";
-  const visible = new Set(props.preferences.visible_scopes);
   for (const target of SCOPES) {
     if (target === scope) continue;
     // Mirror scopeGrid: don't offer moves into columns the user hid — the
     // result would land in a column they can't see without re-enabling it.
-    if (!visible.has(target)) continue;
+    if (!isScopeVisible(target)) continue;
     const btn = document.createElement("button");
     btn.className = "move-btn";
     btn.type = "button";
@@ -506,9 +519,8 @@ function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
   // a future caller can't crash at runtime.
   const loaded = props.scopes;
   if (!loaded) return grid;
-  const visible = new Set(props.preferences.visible_scopes);
   for (const scope of SCOPES) {
-    if (!visible.has(scope)) continue;
+    if (!isScopeVisible(scope)) continue;
     const view = loaded.scopes.find((s) => s.scope === scope);
     if (!view) continue;
     grid.appendChild(scopeColumn(view, props, lowerQuery));
@@ -618,12 +630,11 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
 
   const moveBtns = document.createElement("div");
   moveBtns.className = "rule-moves";
-  const visible = new Set(props.preferences.visible_scopes);
   for (const target of SCOPES) {
     if (target === scope) continue;
     // Same reasoning as `keyMoveButtons`: hidden columns can't be move
     // targets, since the result would be immediately invisible.
-    if (!visible.has(target)) continue;
+    if (!isScopeVisible(target)) continue;
     const btn = document.createElement("button");
     btn.className = "move-btn";
     btn.textContent = `→ ${SCOPE_LABELS[target]}`;
@@ -714,100 +725,194 @@ function openConfirmModal(opts: {
   trigger?: HTMLElement | null;
 }): Promise<boolean> {
   return new Promise((resolve) => {
-    const backdrop = document.createElement("div");
-    backdrop.className = "modal-backdrop";
+    let resolved = false;
+    const resolveOnce = (result: boolean) => {
+      if (resolved) return;
+      resolved = true;
+      resolve(result);
+    };
+    openModal({
+      titleText: opts.titleText,
+      subtitle: opts.subtitle,
+      body: opts.body,
+      trigger: opts.trigger,
+      actions: [
+        {
+          label: "Cancel",
+          className: "btn-cancel",
+          activate: (close) => {
+            resolveOnce(false);
+            close();
+          },
+        },
+        {
+          label: "Apply",
+          className: "btn-apply",
+          focus: true,
+          activate: (close) => {
+            resolveOnce(true);
+            close();
+          },
+        },
+      ],
+      onEscape: (close) => {
+        resolveOnce(false);
+        close();
+      },
+      onEnter: (close) => {
+        resolveOnce(true);
+        close();
+      },
+      onBackdropClick: (close) => {
+        resolveOnce(false);
+        close();
+      },
+      onClose: () => resolveOnce(false),
+    });
+  });
+}
 
-    const titleId = `modal-title-${++modalIdCounter}`;
+/**
+ * Shared modal shell. Handles backdrop, panel ARIA wiring, keyboard trap,
+ * Escape / backdrop-click / Enter behavior, and focus restoration — so
+ * callers only supply the body and the action buttons they need.
+ *
+ * The goal is to keep `confirmMove` / `confirmMoveKey` / `openSettings`
+ * from drifting on accessibility details over time. Each caller passes
+ * its own activation callbacks that receive a `close` function; the
+ * helper never closes on its own except when the caller asks it to.
+ */
+interface ModalAction {
+  label: string;
+  className?: string;
+  /** Mark the button that should receive initial focus. Falls back to the
+   *  first action if no button is flagged. */
+  focus?: boolean;
+  activate: (close: () => void) => void;
+}
 
-    const panel = document.createElement("div");
-    panel.className = "modal";
-    panel.setAttribute("role", "dialog");
-    panel.setAttribute("aria-modal", "true");
-    panel.setAttribute("aria-labelledby", titleId);
+function openModal(opts: {
+  titleText: string;
+  subtitle?: Node;
+  body: HTMLElement;
+  actions: ModalAction[];
+  trigger?: HTMLElement | null;
+  panelClassName?: string;
+  /** Defaults to closing the modal. */
+  onEscape?: (close: () => void) => void;
+  /** Defaults to a no-op so Enter doesn't unexpectedly activate anything
+   *  when the modal has no obvious "default" action. */
+  onEnter?: (close: () => void) => void;
+  /** Defaults to closing the modal. */
+  onBackdropClick?: (close: () => void) => void;
+  /** Fired when the modal closes for any reason, after DOM teardown. Useful
+   *  when the caller needs to resolve a pending promise that the actions
+   *  might not have resolved (e.g. the user dismisses without picking). */
+  onClose?: () => void;
+}): void {
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
 
-    const title = document.createElement("h2");
-    title.id = titleId;
-    title.className = "modal-title";
-    title.textContent = opts.titleText;
-    panel.appendChild(title);
+  const titleId = `modal-title-${++modalIdCounter}`;
 
+  const panel = document.createElement("div");
+  panel.className = opts.panelClassName ? `modal ${opts.panelClassName}` : "modal";
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", titleId);
+
+  const title = document.createElement("h2");
+  title.id = titleId;
+  title.className = "modal-title";
+  title.textContent = opts.titleText;
+  panel.appendChild(title);
+
+  if (opts.subtitle) {
     const subtitle = document.createElement("div");
     subtitle.className = "modal-subtitle";
     subtitle.appendChild(opts.subtitle);
     panel.appendChild(subtitle);
+  }
 
-    panel.appendChild(opts.body);
+  panel.appendChild(opts.body);
 
-    const actions = document.createElement("div");
-    actions.className = "modal-actions";
-    const cancel = document.createElement("button");
-    cancel.textContent = "Cancel";
-    cancel.className = "btn-cancel";
-    const apply = document.createElement("button");
-    apply.textContent = "Apply";
-    apply.className = "btn-apply";
-    actions.append(cancel, apply);
-    panel.appendChild(actions);
+  const actionsEl = document.createElement("div");
+  actionsEl.className = "modal-actions";
+  const actionButtons: HTMLButtonElement[] = [];
+  for (const action of opts.actions) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = action.label;
+    if (action.className) btn.className = action.className;
+    btn.addEventListener("click", () => action.activate(close));
+    actionsEl.appendChild(btn);
+    actionButtons.push(btn);
+  }
+  panel.appendChild(actionsEl);
 
-    backdrop.appendChild(panel);
+  backdrop.appendChild(panel);
 
-    const close = (result: boolean) => {
-      document.removeEventListener("keydown", onKey);
-      backdrop.remove();
-      if (opts.trigger && document.body.contains(opts.trigger)) {
-        opts.trigger.focus();
-      }
-      resolve(result);
-    };
-    const focusableSelector =
-      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener("keydown", onKey);
+    backdrop.remove();
+    if (opts.trigger && document.body.contains(opts.trigger)) {
+      opts.trigger.focus();
+    }
+    opts.onClose?.();
+  };
+
+  const focusableSelector =
+    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      (opts.onEscape ?? ((c) => c()))(close);
+      return;
+    }
+    if (e.key === "Enter") {
+      // Only treat Enter as an activation when it isn't already firing a
+      // focused button — otherwise the button's own click handler runs.
+      if (opts.onEnter && !(document.activeElement instanceof HTMLButtonElement)) {
         e.preventDefault();
-        close(false);
+        opts.onEnter(close);
+      }
+      return;
+    }
+    if (e.key === "Tab") {
+      const focusables = Array.from(panel.querySelectorAll<HTMLElement>(focusableSelector));
+      if (focusables.length === 0) {
+        e.preventDefault();
         return;
       }
-      if (e.key === "Enter") {
-        // Only treat Enter as "apply" when it isn't already activating a
-        // focused button — otherwise the button's own click handler fires.
-        if (!(document.activeElement instanceof HTMLButtonElement)) {
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      if (e.shiftKey) {
+        if (active === first || !panel.contains(active)) {
           e.preventDefault();
-          close(true);
+          last.focus();
         }
-        return;
-      }
-      if (e.key === "Tab") {
-        const focusables = Array.from(panel.querySelectorAll<HTMLElement>(focusableSelector));
-        if (focusables.length === 0) {
+      } else {
+        if (active === last || !panel.contains(active)) {
           e.preventDefault();
-          return;
-        }
-        const first = focusables[0];
-        const last = focusables[focusables.length - 1];
-        const active = document.activeElement as HTMLElement | null;
-        if (e.shiftKey) {
-          if (active === first || !panel.contains(active)) {
-            e.preventDefault();
-            last.focus();
-          }
-        } else {
-          if (active === last || !panel.contains(active)) {
-            e.preventDefault();
-            first.focus();
-          }
+          first.focus();
         }
       }
-    };
-    document.addEventListener("keydown", onKey);
-    backdrop.addEventListener("click", (e) => {
-      if (e.target === backdrop) close(false);
-    });
-    cancel.addEventListener("click", () => close(false));
-    apply.addEventListener("click", () => close(true));
-
-    document.body.appendChild(backdrop);
-    apply.focus();
+    }
+  };
+  document.addEventListener("keydown", onKey);
+  backdrop.addEventListener("click", (e) => {
+    if (e.target === backdrop) {
+      (opts.onBackdropClick ?? ((c) => c()))(close);
+    }
   });
+
+  document.body.appendChild(backdrop);
+  const initial = actionButtons.find((_, i) => opts.actions[i].focus) ?? actionButtons[0];
+  initial?.focus();
 }
 
 function keyDiffSide(side: MoveKeySide, mode: "add" | "remove"): HTMLElement {
@@ -878,84 +983,28 @@ interface SettingsProps {
  * Apply/Cancel dance here, so the dialog only exposes a single "Close"
  * action. Focus is restored to `trigger` when the dialog closes, like the
  * rule-move confirm flow.
+ *
+ * Rides on the shared `openModal` so the keyboard trap and focus machinery
+ * stay identical to the confirm modal (Tab cycling, Escape closes, backdrop
+ * click closes). Enter is deliberately unset — the settings body has
+ * checkboxes and the panel has no default action worth activating on
+ * stray keypresses.
  */
 export function openSettings(props: SettingsProps, trigger?: HTMLElement | null): void {
-  const backdrop = document.createElement("div");
-  backdrop.className = "modal-backdrop";
-
-  const titleId = `modal-title-${++modalIdCounter}`;
-
-  const panel = document.createElement("div");
-  panel.className = "modal modal-settings";
-  panel.setAttribute("role", "dialog");
-  panel.setAttribute("aria-modal", "true");
-  panel.setAttribute("aria-labelledby", titleId);
-
-  const title = document.createElement("h2");
-  title.id = titleId;
-  title.className = "modal-title";
-  title.textContent = "Settings";
-  panel.appendChild(title);
-
-  panel.appendChild(settingsColumnsSection(props));
-
-  const actions = document.createElement("div");
-  actions.className = "modal-actions";
-  const closeBtn = document.createElement("button");
-  closeBtn.textContent = "Close";
-  closeBtn.className = "btn-apply";
-  actions.appendChild(closeBtn);
-  panel.appendChild(actions);
-
-  backdrop.appendChild(panel);
-
-  const focusableSelector =
-    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
-
-  const close = () => {
-    document.removeEventListener("keydown", onKey);
-    backdrop.remove();
-    if (trigger && document.body.contains(trigger)) {
-      trigger.focus();
-    }
-  };
-
-  const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      close();
-      return;
-    }
-    if (e.key === "Tab") {
-      const focusables = Array.from(panel.querySelectorAll<HTMLElement>(focusableSelector));
-      if (focusables.length === 0) {
-        e.preventDefault();
-        return;
-      }
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-      const active = document.activeElement as HTMLElement | null;
-      if (e.shiftKey) {
-        if (active === first || !panel.contains(active)) {
-          e.preventDefault();
-          last.focus();
-        }
-      } else {
-        if (active === last || !panel.contains(active)) {
-          e.preventDefault();
-          first.focus();
-        }
-      }
-    }
-  };
-  document.addEventListener("keydown", onKey);
-  backdrop.addEventListener("click", (e) => {
-    if (e.target === backdrop) close();
+  openModal({
+    titleText: "Settings",
+    body: settingsColumnsSection(props),
+    actions: [
+      {
+        label: "Close",
+        className: "btn-apply",
+        focus: true,
+        activate: (close) => close(),
+      },
+    ],
+    panelClassName: "modal-settings",
+    trigger,
   });
-  closeBtn.addEventListener("click", close);
-
-  document.body.appendChild(backdrop);
-  closeBtn.focus();
 }
 
 function settingsColumnsSection(props: SettingsProps): HTMLElement {
@@ -972,6 +1021,9 @@ function settingsColumnsSection(props: SettingsProps): HTMLElement {
   hint.textContent = "Hide scope columns you don't need. Preferences persist across launches.";
   section.appendChild(hint);
 
+  // Local to this dialog — not the render-wide currentVisibleScopes set,
+  // because settings can change while the dialog is open and we want the
+  // checkbox state to reflect the latest click, not the last render.
   const visible = new Set(props.preferences.visible_scopes);
   const list = document.createElement("div");
   list.className = "settings-checklist";
