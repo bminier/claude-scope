@@ -225,7 +225,12 @@ button:disabled {
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  /* auto-fit + minmax lets the grid adapt to however many scope columns
+     render (currently four, previously three) without hard-coding the
+     count. Columns get a minimum width so they don't compress into
+     unusable slivers on narrow windows; if the viewport can't fit them
+     all at the minimum, the remaining columns wrap to a new row. */
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 12px;
   padding: 12px 16px;
   flex: 1;
