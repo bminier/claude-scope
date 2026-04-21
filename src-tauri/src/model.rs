@@ -151,6 +151,40 @@ impl SettingsDoc {
         before != arr.len()
     }
 
+    /// Read a single top-level key (any type). Used by the key-move flow to
+    /// inspect the raw JSON value before applying a merge.
+    pub fn get_top_level(&self, key: &str) -> Option<&Value> {
+        self.root.get(key)
+    }
+
+    /// Remove a top-level key. Returns true if the key was present.
+    pub fn remove_top_level(&mut self, key: &str) -> bool {
+        self.root
+            .as_object_mut()
+            .and_then(|o| o.remove(key))
+            .is_some()
+    }
+
+    /// Merge `value` into the top-level `key` with type-aware semantics:
+    ///
+    /// - If both the existing and new values are objects, their keys are
+    ///   merged recursively (new values win on conflict for scalars, arrays
+    ///   accumulate with dedup, nested objects recurse).
+    /// - If both are arrays, the new items are appended to the existing
+    ///   array, skipping any that compare equal to an existing element.
+    /// - In any other combination (scalar, or mismatched shapes), the new
+    ///   value replaces whatever was there.
+    ///
+    /// If `key` didn't exist before, the new value is inserted as-is.
+    pub fn merge_top_level(&mut self, key: &str, value: Value) {
+        let obj = ensure_object(&mut self.root);
+        if let Some(existing) = obj.get_mut(key) {
+            merge_value_in_place(existing, value);
+        } else {
+            obj.insert(key.to_string(), value);
+        }
+    }
+
     /// Render to JSON using the detected indentation. We intentionally avoid
     /// serde_json's pretty printer configuration because it doesn't support
     /// tab indents; hand-rolling keeps our options open.
@@ -172,6 +206,34 @@ fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
         *value = Value::Object(Map::new());
     }
     value.as_object_mut().expect("just made it an object")
+}
+
+/// Merge `src` into `dest` in place with the shape-aware rules documented
+/// on `SettingsDoc::merge_top_level`. This is the recursive worker: object
+/// nodes merge key-by-key, arrays accumulate with dedup, everything else
+/// overwrites.
+fn merge_value_in_place(dest: &mut Value, src: Value) {
+    match (dest, src) {
+        (Value::Object(d), Value::Object(s)) => {
+            for (k, v) in s {
+                if let Some(existing) = d.get_mut(&k) {
+                    merge_value_in_place(existing, v);
+                } else {
+                    d.insert(k, v);
+                }
+            }
+        }
+        (Value::Array(d), Value::Array(s)) => {
+            for item in s {
+                if !d.iter().any(|v| v == &item) {
+                    d.push(item);
+                }
+            }
+        }
+        (dest_slot, src) => {
+            *dest_slot = src;
+        }
+    }
 }
 
 struct IndentFormatter {
@@ -355,5 +417,88 @@ mod tests {
     fn remove_rule_on_missing_is_noop() {
         let mut doc = SettingsDoc::empty();
         assert!(!doc.remove_rule(PermissionKind::Allow, "nope"));
+    }
+
+    #[test]
+    fn merge_top_level_object_merges_keys_new_wins() {
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"env": {"PATH": "/old", "HOME": "/home/a"}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level("env", serde_json::json!({"PATH": "/new", "API_KEY": "abc"}));
+        let env = doc.get_top_level("env").unwrap();
+        assert_eq!(env["PATH"], "/new");
+        assert_eq!(env["HOME"], "/home/a");
+        assert_eq!(env["API_KEY"], "abc");
+    }
+
+    #[test]
+    fn merge_top_level_array_appends_and_dedupes() {
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"hooks": ["PreToolUse", "PostToolUse"]}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level(
+            "hooks",
+            serde_json::json!(["PostToolUse", "UserPromptSubmit"]),
+        );
+        let hooks = doc.get_top_level("hooks").unwrap();
+        assert_eq!(
+            *hooks,
+            serde_json::json!(["PreToolUse", "PostToolUse", "UserPromptSubmit"])
+        );
+    }
+
+    #[test]
+    fn merge_top_level_scalar_overwrites() {
+        let mut doc =
+            SettingsDoc::from_value(serde_json::json!({"theme": "dark"}), Indent::Spaces(2));
+        doc.merge_top_level("theme", serde_json::json!("light"));
+        assert_eq!(
+            doc.get_top_level("theme").unwrap(),
+            &serde_json::json!("light")
+        );
+    }
+
+    #[test]
+    fn merge_top_level_inserts_when_missing() {
+        let mut doc = SettingsDoc::empty();
+        doc.merge_top_level("env", serde_json::json!({"A": "1"}));
+        assert_eq!(doc.get_top_level("env").unwrap()["A"], "1");
+    }
+
+    #[test]
+    fn merge_top_level_mismatched_shapes_overwrite() {
+        // Existing is a string, new value is an object — shape mismatch, so
+        // the new value replaces the old one rather than trying to coerce.
+        let mut doc =
+            SettingsDoc::from_value(serde_json::json!({"x": "scalar"}), Indent::Spaces(2));
+        doc.merge_top_level("x", serde_json::json!({"nested": true}));
+        assert_eq!(doc.get_top_level("x").unwrap()["nested"], true);
+    }
+
+    #[test]
+    fn merge_recurses_into_nested_objects() {
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"env": {"group": {"A": "1", "B": "2"}}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level("env", serde_json::json!({"group": {"B": "new", "C": "3"}}));
+        let group = &doc.get_top_level("env").unwrap()["group"];
+        assert_eq!(group["A"], "1");
+        assert_eq!(group["B"], "new");
+        assert_eq!(group["C"], "3");
+    }
+
+    #[test]
+    fn remove_top_level_reports_presence() {
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"env": {"A": "1"}, "theme": "dark"}),
+            Indent::Spaces(2),
+        );
+        assert!(doc.remove_top_level("theme"));
+        assert!(!doc.remove_top_level("theme"));
+        assert!(doc.get_top_level("theme").is_none());
+        assert!(doc.get_top_level("env").is_some());
     }
 }

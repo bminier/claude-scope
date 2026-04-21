@@ -2,6 +2,9 @@ import { lintRule } from "./lint.ts";
 import type {
   JsonValue,
   LoadedScopes,
+  MoveKeyPreview,
+  MoveKeyRequest,
+  MoveKeySide,
   MovePreview,
   MoveRequest,
   MoveSide,
@@ -19,6 +22,7 @@ interface AppProps {
   onPickProject: () => void;
   onReload: () => void;
   onMove: (req: MoveRequest, trigger?: HTMLElement) => void;
+  onMoveKey: (req: MoveKeyRequest, trigger?: HTMLElement) => void;
   onQueryChange: (next: string) => void;
 }
 
@@ -343,11 +347,12 @@ function treeNode(
   path: (string | number)[],
   label: string,
   value: JsonValue,
+  props?: AppProps,
 ): HTMLElement {
   if (value !== null && typeof value === "object") {
-    return treeBranch(scope, path, label, value);
+    return treeBranch(scope, path, label, value, props);
   }
-  return treeLeaf(label, value);
+  return treeLeaf(scope, path, label, value, props);
 }
 
 function treeBranch(
@@ -355,6 +360,7 @@ function treeBranch(
   path: (string | number)[],
   label: string,
   value: JsonValue[] | { [key: string]: JsonValue },
+  props: AppProps | undefined,
 ): HTMLElement {
   const details = document.createElement("details");
   details.className = "tree-node tree-branch";
@@ -370,6 +376,12 @@ function treeBranch(
   peek.className = "tree-peek";
   peek.textContent = Array.isArray(value) ? `[${value.length}]` : `{${Object.keys(value).length}}`;
   summary.appendChild(peek);
+  // Move-target buttons only make sense for whole top-level keys; nested
+  // subtree moves aren't in scope for this PR. props is only provided at
+  // the top level, which keeps the guard implicit and cheap.
+  if (path.length === 1 && props) {
+    summary.appendChild(keyMoveButtons(scope, String(path[0]), props));
+  }
   details.appendChild(summary);
 
   const children = document.createElement("div");
@@ -411,7 +423,13 @@ function treeBranch(
   return details;
 }
 
-function treeLeaf(label: string, value: JsonValue): HTMLElement {
+function treeLeaf(
+  scope: Scope,
+  path: (string | number)[],
+  label: string,
+  value: JsonValue,
+  props?: AppProps,
+): HTMLElement {
   const row = document.createElement("div");
   row.className = "tree-node tree-leaf";
   const name = document.createElement("span");
@@ -422,7 +440,36 @@ function treeLeaf(label: string, value: JsonValue): HTMLElement {
   val.className = `tree-value tree-value-${leafType(value)}`;
   val.textContent = formatLeaf(value);
   row.appendChild(val);
+  if (path.length === 1 && props) {
+    row.appendChild(keyMoveButtons(scope, String(path[0]), props));
+  }
   return row;
+}
+
+function keyMoveButtons(scope: Scope, key: string, props: AppProps): HTMLElement {
+  const moveBtns = document.createElement("div");
+  moveBtns.className = "rule-moves tree-key-moves";
+  for (const target of SCOPES) {
+    if (target === scope) continue;
+    const btn = document.createElement("button");
+    btn.className = "move-btn";
+    btn.type = "button";
+    btn.textContent = `→ ${SCOPE_LABELS[target]}`;
+    btn.setAttribute(
+      "aria-label",
+      `Move settings key ${key} from ${SCOPE_LABELS[scope]} to ${SCOPE_LABELS[target]}`,
+    );
+    btn.disabled = props.busy;
+    btn.addEventListener("click", (e) => {
+      // Clicks on the summary element would otherwise toggle the <details>;
+      // the move action is a distinct intent, so swallow propagation.
+      e.preventDefault();
+      e.stopPropagation();
+      props.onMoveKey({ key, from: scope, to: target }, e.currentTarget as HTMLElement);
+    });
+    moveBtns.appendChild(btn);
+  }
+  return moveBtns;
 }
 
 function leafType(value: JsonValue): string {
@@ -534,7 +581,7 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
     heading.textContent = "Other settings";
     tree.appendChild(heading);
     for (const key of otherKeys) {
-      tree.appendChild(treeNode(view.scope, [key], key, view.other_values[key]));
+      tree.appendChild(treeNode(view.scope, [key], key, view.other_values[key], props));
     }
     col.appendChild(tree);
   }
@@ -589,6 +636,64 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
  * focus is returned to it.
  */
 export function confirmMove(preview: MovePreview, trigger?: HTMLElement | null): Promise<boolean> {
+  const subtitle = document.createDocumentFragment();
+  const ruleCode = document.createElement("code");
+  ruleCode.className = "chip";
+  ruleCode.textContent = preview.rule;
+  subtitle.appendChild(ruleCode);
+  subtitle.appendChild(
+    document.createTextNode(
+      ` from ${SCOPE_LABELS[preview.from.scope]} to ${SCOPE_LABELS[preview.to.scope]}`,
+    ),
+  );
+
+  const diff = document.createElement("div");
+  diff.className = "modal-diff";
+  diff.appendChild(diffSide(preview.from, "remove", preview.rule));
+  diff.appendChild(diffSide(preview.to, "add", preview.rule));
+
+  return openConfirmModal({
+    titleText: `Move ${KIND_LABELS[preview.kind]} rule`,
+    subtitle,
+    body: diff,
+    trigger,
+  });
+}
+
+export function confirmMoveKey(
+  preview: MoveKeyPreview,
+  trigger?: HTMLElement | null,
+): Promise<boolean> {
+  const subtitle = document.createDocumentFragment();
+  const keyCode = document.createElement("code");
+  keyCode.className = "chip";
+  keyCode.textContent = preview.key;
+  subtitle.appendChild(keyCode);
+  subtitle.appendChild(
+    document.createTextNode(
+      ` from ${SCOPE_LABELS[preview.from.scope]} to ${SCOPE_LABELS[preview.to.scope]}`,
+    ),
+  );
+
+  const diff = document.createElement("div");
+  diff.className = "modal-diff";
+  diff.appendChild(keyDiffSide(preview.from, "remove"));
+  diff.appendChild(keyDiffSide(preview.to, "add"));
+
+  return openConfirmModal({
+    titleText: "Move settings key",
+    subtitle,
+    body: diff,
+    trigger,
+  });
+}
+
+function openConfirmModal(opts: {
+  titleText: string;
+  subtitle: Node;
+  body: HTMLElement;
+  trigger?: HTMLElement | null;
+}): Promise<boolean> {
   return new Promise((resolve) => {
     const backdrop = document.createElement("div");
     backdrop.className = "modal-backdrop";
@@ -604,27 +709,15 @@ export function confirmMove(preview: MovePreview, trigger?: HTMLElement | null):
     const title = document.createElement("h2");
     title.id = titleId;
     title.className = "modal-title";
-    title.textContent = `Move ${KIND_LABELS[preview.kind]} rule`;
+    title.textContent = opts.titleText;
     panel.appendChild(title);
 
     const subtitle = document.createElement("div");
     subtitle.className = "modal-subtitle";
-    const ruleCode = document.createElement("code");
-    ruleCode.className = "chip";
-    ruleCode.textContent = preview.rule;
-    subtitle.appendChild(ruleCode);
-    subtitle.appendChild(
-      document.createTextNode(
-        ` from ${SCOPE_LABELS[preview.from.scope]} to ${SCOPE_LABELS[preview.to.scope]}`,
-      ),
-    );
+    subtitle.appendChild(opts.subtitle);
     panel.appendChild(subtitle);
 
-    const diff = document.createElement("div");
-    diff.className = "modal-diff";
-    diff.appendChild(diffSide(preview.from, "remove", preview.rule));
-    diff.appendChild(diffSide(preview.to, "add", preview.rule));
-    panel.appendChild(diff);
+    panel.appendChild(opts.body);
 
     const actions = document.createElement("div");
     actions.className = "modal-actions";
@@ -642,8 +735,8 @@ export function confirmMove(preview: MovePreview, trigger?: HTMLElement | null):
     const close = (result: boolean) => {
       document.removeEventListener("keydown", onKey);
       backdrop.remove();
-      if (trigger && document.body.contains(trigger)) {
-        trigger.focus();
+      if (opts.trigger && document.body.contains(opts.trigger)) {
+        opts.trigger.focus();
       }
       resolve(result);
     };
@@ -696,6 +789,59 @@ export function confirmMove(preview: MovePreview, trigger?: HTMLElement | null):
     document.body.appendChild(backdrop);
     apply.focus();
   });
+}
+
+function keyDiffSide(side: MoveKeySide, mode: "add" | "remove"): HTMLElement {
+  const col = document.createElement("div");
+  col.className = `modal-side modal-side-${mode}`;
+
+  const head = document.createElement("div");
+  head.className = "modal-side-head";
+  const label = document.createElement("h3");
+  label.textContent = SCOPE_LABELS[side.scope];
+  head.appendChild(label);
+
+  const path = document.createElement("div");
+  path.className = "modal-side-path";
+  path.textContent = side.path;
+  head.appendChild(path);
+
+  const verdict = document.createElement("div");
+  verdict.className = "modal-side-verdict";
+  if (!side.will_write) {
+    verdict.textContent = "(no change)";
+    verdict.classList.add("muted");
+  } else if (mode === "remove") {
+    verdict.textContent = "key removed";
+    verdict.classList.add("removed");
+  } else {
+    verdict.textContent = side.value_before === null ? "key added" : "key merged";
+    verdict.classList.add("added");
+  }
+  head.appendChild(verdict);
+  col.appendChild(head);
+
+  if (side.note) {
+    const note = document.createElement("div");
+    note.className = "modal-side-note";
+    note.textContent = side.note;
+    col.appendChild(note);
+  }
+
+  const body = document.createElement("div");
+  body.className = "modal-side-value";
+  const pre = document.createElement("pre");
+  pre.className = "modal-side-json";
+  pre.textContent = formatValue(mode === "remove" ? side.value_before : side.value_after);
+  body.appendChild(pre);
+  col.appendChild(body);
+
+  return col;
+}
+
+function formatValue(v: JsonValue | null): string {
+  if (v === null) return "(absent)";
+  return JSON.stringify(v, null, 2);
 }
 
 function diffSide(side: MoveSide, mode: "add" | "remove", movingRule: string): HTMLElement {

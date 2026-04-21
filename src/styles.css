@@ -424,6 +424,17 @@ button:disabled {
   font-style: italic;
 }
 
+/* Move-target buttons for top-level tree keys. Live on the summary row
+   (branches) or the leaf row (scalars). Push to the right so the
+   key/peek/value stays readable and button clicks are intentional. */
+.tree-key-moves {
+  margin-left: auto;
+  gap: 4px;
+}
+.tree-leaf {
+  align-items: center;
+}
+
 /* ------- Diff confirm modal ------- */
 
 .modal-backdrop {
@@ -528,6 +539,28 @@ button:disabled {
   font-size: 12px;
   color: var(--ask);
   margin-bottom: 6px;
+}
+
+.modal-side-value {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.modal-side-json {
+  flex: 1;
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow: auto;
 }
 
 .modal-diff-list {

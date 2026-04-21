@@ -2,9 +2,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
-import type { LoadedScopes, MovePreview, MoveRequest } from "./types.ts";
+import type {
+  LoadedScopes,
+  MoveKeyPreview,
+  MoveKeyRequest,
+  MovePreview,
+  MoveRequest,
+} from "./types.ts";
 import { SEARCH_INPUT_ID } from "./types.ts";
-import { confirmMove, renderApp } from "./ui.ts";
+import { confirmMove, confirmMoveKey, renderApp } from "./ui.ts";
 
 const state: {
   scopes: LoadedScopes | null;
@@ -116,6 +122,41 @@ async function moveRule(req: MoveRequest, trigger?: HTMLElement): Promise<void> 
   }
 }
 
+async function moveKey(req: MoveKeyRequest, trigger?: HTMLElement): Promise<void> {
+  if (moveInFlight) return;
+  moveInFlight = true;
+  try {
+    const projectDir = state.projectDir;
+    let preview: MoveKeyPreview;
+    try {
+      preview = await invoke<MoveKeyPreview>("diff_move_key", { req, project_dir: projectDir });
+    } catch (err) {
+      alert(`Move failed: ${err}`);
+      return;
+    }
+
+    const apply = await confirmMoveKey(preview, trigger);
+    if (!apply) return;
+
+    state.busy = true;
+    render();
+    try {
+      await invoke("apply_move_key", { req, project_dir: projectDir });
+      await load(projectDir);
+    } catch (err) {
+      alert(`Move failed: ${err}`);
+      state.busy = false;
+      render();
+    }
+  } finally {
+    moveInFlight = false;
+    if (externalReloadPending && !state.busy) {
+      externalReloadPending = false;
+      void load(state.projectDir);
+    }
+  }
+}
+
 function setQuery(next: string): void {
   if (state.query === next) return;
   state.query = next;
@@ -133,6 +174,7 @@ function render(): void {
     onPickProject: pickProject,
     onReload: reload,
     onMove: moveRule,
+    onMoveKey: moveKey,
     onQueryChange: setQuery,
   });
 }

@@ -13,6 +13,8 @@ pub fn run() {
             commands::load_scopes,
             commands::diff_move,
             commands::apply_move,
+            commands::diff_move_key,
+            commands::apply_move_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -69,6 +69,28 @@ export interface MovePreview {
   to: MoveSide;
 }
 
+export interface MoveKeyRequest {
+  key: string;
+  from: Scope;
+  to: Scope;
+}
+
+export interface MoveKeySide {
+  scope: Scope;
+  path: string;
+  path_exists: boolean;
+  value_before: JsonValue | null;
+  value_after: JsonValue | null;
+  will_write: boolean;
+  note: string | null;
+}
+
+export interface MoveKeyPreview {
+  key: string;
+  from: MoveKeySide;
+  to: MoveKeySide;
+}
+
 /**
  * DOM id of the global rule-filter input. Exported as a single source of
  * truth because both the render path (ui.ts sets it) and the keyboard

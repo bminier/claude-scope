@@ -73,6 +73,40 @@ pub struct MoveSide {
     pub note: Option<String>,
 }
 
+/// Moves a top-level non-permission key (`env`, `hooks`, `theme`, …) between
+/// scopes. Companion to `MoveRequest`, which handles individual permission
+/// rules; the key-move flow uses its own type because the payload is a raw
+/// JSON value rather than a rule string, and the merge semantics differ by
+/// value shape (see `SettingsDoc::merge_top_level`).
+#[derive(Debug, Deserialize)]
+pub struct MoveKeyRequest {
+    pub key: String,
+    pub from: Scope,
+    pub to: Scope,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MoveKeyPreview {
+    pub key: String,
+    pub from: MoveKeySide,
+    pub to: MoveKeySide,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MoveKeySide {
+    pub scope: Scope,
+    pub path: String,
+    pub path_exists: bool,
+    /// The raw JSON value stored at this key before the move. `None` when the
+    /// key isn't present (common on the destination when the key is new).
+    pub value_before: Option<serde_json::Value>,
+    /// The JSON value this side will have after the move is applied. `None`
+    /// on the source (the key is removed).
+    pub value_after: Option<serde_json::Value>,
+    pub will_write: bool,
+    pub note: Option<String>,
+}
+
 #[tauri::command]
 pub fn load_scopes(
     project_dir: Option<String>,
@@ -111,6 +145,27 @@ pub fn apply_move(
     let start = project_dir.as_ref().map(Path::new);
     let paths = scope::resolve(start).map_err(|e| e.to_string())?;
     apply_move_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn diff_move_key(
+    req: MoveKeyRequest,
+    project_dir: Option<String>,
+) -> Result<MoveKeyPreview, String> {
+    let start = project_dir.as_ref().map(Path::new);
+    let paths = scope::resolve(start).map_err(|e| e.to_string())?;
+    diff_move_key_impl(&paths, &req).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn apply_move_key(
+    req: MoveKeyRequest,
+    project_dir: Option<String>,
+    watch: State<'_, WatchState>,
+) -> Result<(), String> {
+    let start = project_dir.as_ref().map(Path::new);
+    let paths = scope::resolve(start).map_err(|e| e.to_string())?;
+    apply_move_key_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
 }
 
 fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::Error>> {
@@ -326,6 +381,151 @@ fn apply_move_impl(
         );
     }
     watch.note_self_write();
+    Ok(())
+}
+
+fn diff_move_key_impl(
+    paths: &ScopePaths,
+    req: &MoveKeyRequest,
+) -> Result<MoveKeyPreview, Box<dyn std::error::Error>> {
+    validate_move_key(req)?;
+    let from_path = require_path(paths, req.from)?;
+    let to_path = require_path(paths, req.to)?;
+
+    let from_doc = match io_atomic::load(from_path)? {
+        Some(d) => d,
+        None => {
+            return Err(format!("source file {} does not exist", from_path.display()).into());
+        }
+    };
+    let src_value = from_doc.get_top_level(&req.key).cloned().ok_or_else(
+        || -> Box<dyn std::error::Error> {
+            format!(
+                "key `{}` not found in {} {}",
+                req.key,
+                req.from.label(),
+                from_path.display()
+            )
+            .into()
+        },
+    )?;
+
+    let to_path_exists = to_path.exists();
+    let mut to_doc = io_atomic::load(to_path)?.unwrap_or_else(SettingsDoc::empty);
+    let to_before = to_doc.get_top_level(&req.key).cloned();
+    to_doc.merge_top_level(&req.key, src_value.clone());
+    let to_after = to_doc.get_top_level(&req.key).cloned();
+
+    let dest_unchanged = to_before == to_after;
+    let to_note = if dest_unchanged {
+        Some(
+            "Destination already contains this value; source copy will simply be removed."
+                .to_string(),
+        )
+    } else if !to_path_exists {
+        Some("Destination file will be created.".to_string())
+    } else if to_before.is_some() {
+        Some("Destination already has this key; values will be merged.".to_string())
+    } else {
+        None
+    };
+
+    Ok(MoveKeyPreview {
+        key: req.key.clone(),
+        from: MoveKeySide {
+            scope: req.from,
+            path: from_path.display().to_string(),
+            path_exists: from_path.exists(),
+            value_before: Some(src_value),
+            value_after: None,
+            will_write: true,
+            note: None,
+        },
+        to: MoveKeySide {
+            scope: req.to,
+            path: to_path.display().to_string(),
+            path_exists: to_path_exists,
+            value_before: to_before,
+            value_after: to_after,
+            will_write: !dest_unchanged,
+            note: to_note,
+        },
+    })
+}
+
+fn apply_move_key_impl(
+    paths: &ScopePaths,
+    req: &MoveKeyRequest,
+    backups: &BackupTracker,
+    watch: &WatchState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_move_key(req)?;
+    let from_path = require_path(paths, req.from)?.to_path_buf();
+    let to_path = require_path(paths, req.to)?.to_path_buf();
+
+    let mut from_doc = match io_atomic::load(&from_path)? {
+        Some(d) => d,
+        None => return Err(format!("source file {} does not exist", from_path.display()).into()),
+    };
+    let src_value = from_doc.get_top_level(&req.key).cloned().ok_or_else(
+        || -> Box<dyn std::error::Error> {
+            format!(
+                "key `{}` not found in {} {}",
+                req.key,
+                req.from.label(),
+                from_path.display()
+            )
+            .into()
+        },
+    )?;
+
+    let to_doc_before = io_atomic::load(&to_path)?.unwrap_or_else(SettingsDoc::empty);
+    let to_before = to_doc_before.get_top_level(&req.key).cloned();
+    let mut to_doc = to_doc_before.clone();
+    to_doc.merge_top_level(&req.key, src_value.clone());
+    let to_after = to_doc.get_top_level(&req.key).cloned();
+    let dest_mutated = to_before != to_after;
+
+    from_doc.remove_top_level(&req.key);
+
+    // Destination first, then source — same ordering + rollback shape as
+    // apply_move_impl. Skipping the destination save when nothing changed
+    // avoids writing a .bak for a file we aren't actually touching.
+    if dest_mutated {
+        io_atomic::save(&to_path, &to_doc, backups)?;
+        watch.note_self_write();
+    }
+    if let Err(source_err) = io_atomic::save(&from_path, &from_doc, backups) {
+        if dest_mutated {
+            // Roll back the destination to its pre-merge state. Re-save the
+            // snapshot we took before mutating to_doc.
+            if let Err(rollback_err) = io_atomic::save(&to_path, &to_doc_before, backups) {
+                return Err(format!(
+                    "source save failed: {source_err}; destination rollback also failed: {rollback_err}"
+                )
+                .into());
+            }
+            watch.note_self_write();
+        }
+        return Err(
+            format!("source save failed and destination was rolled back: {source_err}").into(),
+        );
+    }
+    watch.note_self_write();
+    Ok(())
+}
+
+fn validate_move_key(req: &MoveKeyRequest) -> Result<(), Box<dyn std::error::Error>> {
+    if req.from == req.to {
+        return Err("source and destination scopes must differ".into());
+    }
+    if req.key == "permissions" {
+        return Err(
+            "use the permission move action for individual permission rules; \
+             the permissions key is not movable as a whole"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -761,5 +961,184 @@ mod tests {
         assert_eq!(eff.allow, vec!["Bash(git status)", "Read(**)"]);
         assert_eq!(eff.deny, vec!["WebFetch(domain:evil.example)"]);
         assert!(eff.ask.is_empty());
+    }
+
+    #[test]
+    fn move_key_merges_env_object_into_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"env": {"PATH": "/src", "HOME": "/home/a"}}"#,
+        );
+        write(
+            paths.user.as_ref().unwrap(),
+            r#"{"env": {"PATH": "/dst", "SHELL": "/bin/zsh"}}"#,
+        );
+
+        let req = MoveKeyRequest {
+            key: "env".to_string(),
+            from: Scope::Project,
+            to: Scope::User,
+        };
+        apply_move_key_impl(&paths, &req, &BackupTracker::new(), &WatchState::default()).unwrap();
+
+        let project_doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            project_doc.get_top_level("env").is_none(),
+            "source env removed"
+        );
+
+        let user_doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        let env = user_doc.get_top_level("env").unwrap();
+        // New keys from source win on conflict; destination-only keys kept.
+        assert_eq!(env["PATH"], "/src");
+        assert_eq!(env["HOME"], "/home/a");
+        assert_eq!(env["SHELL"], "/bin/zsh");
+    }
+
+    #[test]
+    fn move_key_creates_destination_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(paths.project.as_ref().unwrap(), r#"{"theme": "dark"}"#);
+        assert!(!paths.user.as_ref().unwrap().exists());
+
+        let req = MoveKeyRequest {
+            key: "theme".to_string(),
+            from: Scope::Project,
+            to: Scope::User,
+        };
+        apply_move_key_impl(&paths, &req, &BackupTracker::new(), &WatchState::default()).unwrap();
+
+        let project_doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(project_doc.get_top_level("theme").is_none());
+        let user_doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            user_doc.get_top_level("theme").unwrap(),
+            &serde_json::json!("dark")
+        );
+    }
+
+    #[test]
+    fn diff_move_key_flags_merge_note_when_destination_has_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(paths.project.as_ref().unwrap(), r#"{"env": {"A": "1"}}"#);
+        write(paths.user.as_ref().unwrap(), r#"{"env": {"B": "2"}}"#);
+
+        let preview = diff_move_key_impl(
+            &paths,
+            &MoveKeyRequest {
+                key: "env".to_string(),
+                from: Scope::Project,
+                to: Scope::User,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(preview.key, "env");
+        assert!(preview.from.will_write);
+        assert!(preview.to.will_write);
+        assert!(preview
+            .to
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("merged")));
+        assert_eq!(
+            preview.to.value_after.as_ref().unwrap(),
+            &serde_json::json!({"B": "2", "A": "1"})
+        );
+    }
+
+    #[test]
+    fn move_key_refuses_permissions_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let err = diff_move_key_impl(
+            &paths,
+            &MoveKeyRequest {
+                key: "permissions".to_string(),
+                from: Scope::Project,
+                to: Scope::User,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("permissions key is not movable"));
+    }
+
+    #[test]
+    fn move_key_same_scope_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let err = apply_move_key_impl(
+            &paths,
+            &MoveKeyRequest {
+                key: "env".to_string(),
+                from: Scope::Project,
+                to: Scope::Project,
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must differ"));
+    }
+
+    #[test]
+    fn move_key_errors_when_source_lacks_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(paths.project.as_ref().unwrap(), r#"{}"#);
+        let err = diff_move_key_impl(
+            &paths,
+            &MoveKeyRequest {
+                key: "theme".to_string(),
+                from: Scope::Project,
+                to: Scope::User,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn move_key_dedupes_hook_arrays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"hooks": ["PreToolUse", "PostToolUse"]}"#,
+        );
+        write(
+            paths.user.as_ref().unwrap(),
+            r#"{"hooks": ["PostToolUse", "UserPromptSubmit"]}"#,
+        );
+        apply_move_key_impl(
+            &paths,
+            &MoveKeyRequest {
+                key: "hooks".to_string(),
+                from: Scope::Project,
+                to: Scope::User,
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+        let user_doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            user_doc.get_top_level("hooks").unwrap(),
+            &serde_json::json!(["PostToolUse", "UserPromptSubmit", "PreToolUse"])
+        );
     }
 }
