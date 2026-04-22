@@ -112,11 +112,11 @@ jobs:
       # Pull the exact ref the `setup` job resolved — for tag pushes this is
       # the tag, for dispatch-with-input this is the named tag, and for
       # dispatch-without-input this is the dispatched branch HEAD.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ needs.setup.outputs.checkout_ref }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "20"
           cache: npm
@@ -128,13 +128,13 @@ jobs:
       # Bump this pin deliberately when we want to ship with a newer
       # compiler; Dependabot is configured to ignore
       # `dtolnay/rust-toolchain` so bulk bumps can't do it silently.
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           # universal-apple-darwin needs both Mac targets installed so cargo
           # can cross-compile to the other arch from whichever the runner is.
           targets: ${{ matrix.platform.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.platform.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: src-tauri
           # Key the cache per-target so cross-compiled universal-apple-darwin
@@ -160,7 +160,7 @@ jobs:
       # as part of the same step. Pinned to a specific version rather than
       # `@v0` so rebuilds of an older tag don't silently pick up
       # behavior/bundler changes from a newer action release.
-      - uses: tauri-apps/tauri-action@v0.6.2
+      - uses: tauri-apps/tauri-action@1ddc7b49b13c3038297360482fcb3e058764d7c9 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
