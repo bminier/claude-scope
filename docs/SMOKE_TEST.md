@@ -13,8 +13,7 @@ reviewer.
    ```
 2. Point at a throwaway `.claude/` to avoid mutating your real config.
    Pick any temp directory you don't mind deleting; the examples use
-   `$TMP/cs-smoke` (`/tmp/cs-smoke` on macOS / Linux, `$env:TEMP\cs-smoke`
-   on Windows).
+   `/tmp/cs-smoke` on macOS / Linux and `$env:TEMP\cs-smoke` on Windows.
 
    **macOS / Linux (bash):**
    ```sh
@@ -27,12 +26,15 @@ reviewer.
 
    **Windows (PowerShell):**
    ```powershell
+   # -Encoding utf8 is critical: PowerShell 5.1 (Windows 11 default)
+   # writes UTF-16 LE w/ BOM otherwise, which Rust's serde_json
+   # (via fs::read_to_string) cannot parse.
    $proj = Join-Path $env:TEMP 'cs-smoke'
    New-Item -ItemType Directory -Force "$proj\.claude" | Out-Null
    '{"permissions":{"allow":["Bash(ls *)","Bash(git status)"]}}' `
-     | Set-Content "$proj\.claude\settings.json"
+     | Set-Content -Encoding utf8 "$proj\.claude\settings.json"
    '{"permissions":{"allow":["WebFetch(domain:example.com)"]}}' `
-     | Set-Content "$proj\.claude\settings.local.json"
+     | Set-Content -Encoding utf8 "$proj\.claude\settings.local.json"
    ```
 3. Launch the dev build:
    ```sh
