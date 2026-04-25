@@ -12,7 +12,11 @@ reviewer.
    npm install
    ```
 2. Point at a throwaway `.claude/` to avoid mutating your real config.
-   The simplest setup:
+   Pick any temp directory you don't mind deleting; the examples use
+   `$TMP/cs-smoke` (`/tmp/cs-smoke` on macOS / Linux, `$env:TEMP\cs-smoke`
+   on Windows).
+
+   **macOS / Linux (bash):**
    ```sh
    mkdir -p /tmp/cs-smoke/.claude
    echo '{"permissions":{"allow":["Bash(ls *)","Bash(git status)"]}}' \
@@ -20,16 +24,35 @@ reviewer.
    echo '{"permissions":{"allow":["WebFetch(domain:example.com)"]}}' \
      > /tmp/cs-smoke/.claude/settings.local.json
    ```
+
+   **Windows (PowerShell):**
+   ```powershell
+   $proj = Join-Path $env:TEMP 'cs-smoke'
+   New-Item -ItemType Directory -Force "$proj\.claude" | Out-Null
+   '{"permissions":{"allow":["Bash(ls *)","Bash(git status)"]}}' `
+     | Set-Content "$proj\.claude\settings.json"
+   '{"permissions":{"allow":["WebFetch(domain:example.com)"]}}' `
+     | Set-Content "$proj\.claude\settings.local.json"
+   ```
 3. Launch the dev build:
    ```sh
    npm run tauri dev
    ```
-4. Click **Open project…** → pick `/tmp/cs-smoke` (or your equivalent
-   throwaway).
+4. Click **Open project…** → pick the throwaway dir from step 2.
 
-> Reminder: a real `~/.claude/settings.json` will be read too. If you want
-> the User column visibly populated, drop a couple of throwaway entries
-> there; otherwise expect User / User-Local to show `(file not present)`.
+> ⚠ **User-scope safety.** Moves targeting the **User** or
+> **User-Local** columns write to your real `~/.claude/` — the throwaway
+> project only isolates the Project / Local scopes. Either back those
+> files up first (e.g. `cp ~/.claude/settings.json{,.smoke.bak}`), or
+> after launch open **Settings** and hide the User + User-Local columns
+> so you can only move between Project ↔ Local. The app's own one-shot
+> `.bak` covers the *first* mutation per file per session, but not
+> subsequent ones in the same run.
+
+> Reminder: a real `~/.claude/settings.json` will be read regardless. If
+> you want the User column visibly populated, drop a couple of throwaway
+> entries there; otherwise expect User / User-Local to show
+> `(file not present)`.
 
 ## Golden path
 
@@ -99,10 +122,18 @@ After exercising the moves above, in the throwaway `.claude/` dir:
 
 ## When you're done
 
-Tear down the throwaway dir:
+Tear down the throwaway dir, and (if you backed up `~/.claude/`)
+restore it:
 
 ```sh
+# macOS / Linux
 rm -rf /tmp/cs-smoke
+mv ~/.claude/settings.json.smoke.bak ~/.claude/settings.json   # if backed up
+```
+
+```powershell
+# Windows
+Remove-Item -Recurse -Force (Join-Path $env:TEMP 'cs-smoke')
 ```
 
 If anything in this list misbehaved, link the broken step in the PR
