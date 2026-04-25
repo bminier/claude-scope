@@ -189,18 +189,33 @@ button:disabled {
   color: var(--muted);
 }
 
+/* Three side-by-side group columns. Mirrors `.grid` below so the
+   breakpoint behavior stays in lockstep — both collapse to a single
+   column at the same viewport width. */
+.eff-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
 .eff-group {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 6px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  /* Intentionally no `max-height` / `overflow` here: lint-warn popovers on
+     chips are absolutely positioned and would be clipped by any scrolling
+     ancestor (moving the scroll to an inner wrapper doesn't help — the
+     popovers live inside the chips). The page itself scrolls if a long
+     allow list pushes the scope grid below the fold, which is acceptable. */
 }
 
 .eff-label {
-  font-size: 12px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
   color: var(--muted);
-  min-width: 80px;
+  padding-bottom: 2px;
 }
 
 .eff-allow .eff-label {
@@ -248,6 +263,29 @@ button:disabled {
      are absolutely positioned and need to escape the column bounds,
      especially near the bottom edge. Children that truncate (`.col-path`,
      `.rule-text`) set their own overflow. */
+}
+
+/* Drag-and-drop drop-target highlight. Applied via JS while a draggable
+   chip or top-level key is hovered over a valid target column. Uses the
+   same accent color as the keyboard focus ring so the affordance reads
+   consistently across mouse and keyboard input. */
+.col-drop-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(122, 162, 247, 0.25);
+  background: rgba(122, 162, 247, 0.05);
+}
+
+/* Grab cursors on the actual drag handles. Only applied when JS marks the
+   element draggable (i.e. for whole top-level keys and rule chips when
+   the app isn't busy), so non-draggable tree keys keep their default
+   cursor. */
+.rule-text[draggable="true"],
+.tree-key[draggable="true"] {
+  cursor: grab;
+}
+.rule-text[draggable="true"]:active,
+.tree-key[draggable="true"]:active {
+  cursor: grabbing;
 }
 
 .col-head h3 {
