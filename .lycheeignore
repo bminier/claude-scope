@@ -1,0 +1,6 @@
+# Per-URL ignore list for lychee (one regex per line; `#` starts a comment).
+#
+# Use this for URLs that don't fit the broader categories handled in
+# `.lycheerc`'s `exclude = [...]` — typically a single known-flaky
+# endpoint or a known-private resource that the wider patterns shouldn't
+# need to know about. Empty for now; add patterns as we discover them.

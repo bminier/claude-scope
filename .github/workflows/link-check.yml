@@ -1,0 +1,213 @@
+# Catches external link rot across the markdown surface (README, CLAUDE.md,
+# SECURITY.md, eventually docs/). Runs:
+#
+#   - Weekly on Monday 14:00 UTC (09:00 EDT / 06:00 PDT — automated, so
+#     the early-Pacific hour is fine; the issue gets read whenever).
+#   - On manual workflow_dispatch — for re-running after a fix lands or
+#     to verify a one-off concern.
+#   - On PRs that touch any markdown / link-check config — gives authors
+#     same-PR feedback without spamming check runs on unrelated PRs.
+#
+# Doesn't fail on broken links — those get reported, not enforced. (An
+# action-level failure like the lychee binary failing to download or a
+# `.lycheerc` parse error WILL still fail the job, which is the right
+# signal: the link check stopped working.) External link rot is
+# surfaced via:
+#   - PRs: a comment on the PR (non-blocking; broken third-party links
+#     should not block a refactor PR).
+#   - Scheduled / manual: a single deduped tracking issue tagged with
+#     `link-rot`. When a subsequent run is clean, the open tracking
+#     issue auto-closes.
+
+name: Link check
+
+on:
+  schedule:
+    - cron: "0 14 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "**/*.md"
+      - ".lycheerc"
+      - ".lycheeignore"
+      - ".github/workflows/link-check.yml"
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: link-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  link-check:
+    name: link check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # Persist `.lycheecache` across runs so the weekly schedule doesn't
+      # rehit every endpoint each Monday. The cache key is bucketed by
+      # UTC year-week so all runs within the same week (including PR
+      # pushes) reuse one cache entry — without bucketing, a per-run key
+      # would create a fresh cache on every push and burn through the
+      # repo's 10GB cache quota fast. `restore-keys` falls back to the
+      # most recent prior week so the first run of a new week starts
+      # from last week's state. Combined with `max_cache_age = "7d"` in
+      # .lycheerc, that's roughly: known-good URLs from the last week
+      # don't get re-fetched; everything older or unseen does.
+      - name: Compute lychee cache bucket
+        id: lychee-cache-bucket
+        run: echo "year_week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .lycheecache
+          key: lychee-${{ runner.os }}-${{ steps.lychee-cache-bucket.outputs.year_week }}
+          restore-keys: |
+            lychee-${{ runner.os }}-
+
+      # `fail: false` keeps lychee non-fatal — we surface broken links via
+      # comments / issues instead of failing the run. The action exposes
+      # the underlying lychee exit code as `outputs.exit_code`, which the
+      # branching steps below key off.
+      #
+      # `args` deliberately omits `--output` and `--format`: lychee-action's
+      # entrypoint adds `--output <tempfile>` itself (then `cat`s the temp
+      # to whatever path the `output:` input names) and `--format markdown`
+      # is its default. Passing either inside `args` produces a duplicate
+      # flag that lychee errors on.
+      - name: Run lychee
+        id: lychee
+        uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2.8.0
+        with:
+          args: --config .lycheerc --no-progress .
+          output: lychee-report.md
+          fail: false
+
+      # PR branch: post a single comment with the broken-link summary.
+      # No dedupe yet — repeated pushes will leave a trail of comments.
+      # If that gets noisy, swap to a sticky-comment helper or update via
+      # the issues-comments API.
+      #
+      # Skipped on forked-PR events: `GITHUB_TOKEN` is read-only on those
+      # by GitHub design, and `gh pr comment` would 403 ("Resource not
+      # accessible by integration") which would mark this step (and the
+      # job) failed — defeating the "never fails" guarantee. The
+      # scheduled / manual job still surfaces fork-introduced rot via
+      # the tracking issue once the PR merges.
+      #
+      # `continue-on-error: true` is a belt-and-suspenders: even if some
+      # unrelated gh-cli failure slips through, the job stays green.
+      - name: Comment on PR
+        if: >-
+          github.event_name == 'pull_request'
+          && steps.lychee.outputs.exit_code != '0'
+          && github.event.pull_request.head.repo.fork == false
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo '<!-- link-check-bot -->'
+            echo '### Link check'
+            echo
+            echo "Lychee scanned the whole repo's markdown surface and found broken links. Reported here for visibility — **does not block merge**."
+            echo
+            cat lychee-report.md
+            echo
+            echo "_Run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) on \`${{ github.sha }}\`._"
+          } | gh pr comment "${{ github.event.pull_request.number }}" --body-file -
+
+      # Scheduled / manual runs with broken links: open or update a single
+      # tracking issue. Dedupe on the `link-rot` label so weekly runs don't
+      # pile up duplicates.
+      #
+      # Gated to the repository default branch: `workflow_dispatch` can be
+      # triggered from any branch, and we don't want a feature-branch
+      # manual run to overwrite the shared default-branch signal with
+      # findings from a half-baked branch. `schedule` always runs from the
+      # default branch already.
+      #
+      # `continue-on-error: true` keeps the "never fails" guarantee intact
+      # against transient `gh` failures (rate limits, API blips, label
+      # creation racing another run).
+      - name: Open or update link-rot tracking issue
+        if: >-
+          github.event_name != 'pull_request'
+          && github.ref_name == github.event.repository.default_branch
+          && steps.lychee.outputs.exit_code != '0'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Self-bootstrap the labels so a fresh fork or a label that was
+          # manually deleted doesn't break the run. `--force` is idempotent
+          # (creates if missing, updates colour/description if present).
+          # `bug` is bootstrapped too even though the upstream repo defines
+          # it — without this, a fork or a manual cleanup could fail issue
+          # creation silently under `continue-on-error: true`. The colour
+          # and description match GitHub's defaults so existing issues
+          # don't visibly change.
+          gh label create bug --force \
+            --color "d73a4a" \
+            --description "Something isn't working"
+          gh label create link-rot --force \
+            --color "fbca04" \
+            --description "External link rot detected by the weekly link-check workflow"
+          gh label create "area:docs" --force \
+            --color "0075ca" \
+            --description "Documentation"
+          # Pick the oldest open `link-rot` issue as canonical (lowest
+          # number = longest history). If the dedupe contract was ever
+          # broken — manual creation, a previous bug — close the extras
+          # as duplicates pointing at the canonical so we converge back
+          # to a single open issue rather than silently leaving stragglers.
+          mapfile -t open_issues < <(gh issue list --label link-rot --state open --json number --jq '.[].number' | sort -n)
+          existing="${open_issues[0]:-}"
+          extras=("${open_issues[@]:1}")
+          {
+            cat lychee-report.md
+            echo
+            echo "_Run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) on \`${{ github.sha }}\`._"
+          } > issue-body.md
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body-file issue-body.md
+            gh issue comment "$existing" \
+              --body "Refreshed by run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) on \`${{ github.sha }}\`."
+            for extra in "${extras[@]}"; do
+              gh issue close "$extra" \
+                --comment "Closed as duplicate of #${existing} — consolidating \`link-rot\` tracking into a single open issue per the workflow contract."
+            done
+          else
+            gh issue create \
+              --title "Weekly link check: broken links detected" \
+              --body-file issue-body.md \
+              --label "bug,area:docs,link-rot"
+          fi
+
+      # Scheduled / manual runs that come back clean: close any open
+      # link-rot tracking issue with a comment that points back to the
+      # run that proved it clean. Same default-branch gate and
+      # `continue-on-error` rationale as the open/update step.
+      - name: Close link-rot tracking issue when clean
+        if: >-
+          github.event_name != 'pull_request'
+          && github.ref_name == github.event.repository.default_branch
+          && steps.lychee.outputs.exit_code == '0'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Close every open `link-rot` issue, not just one — see the
+          # consolidation logic in the open/update step. A clean run is
+          # also our chance to mop up any duplicates.
+          mapfile -t open_issues < <(gh issue list --label link-rot --state open --json number --jq '.[].number' | sort -n)
+          for n in "${open_issues[@]}"; do
+            gh issue close "$n" \
+              --comment "Auto-closed: lychee found no broken links in run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) on \`${{ github.sha }}\`."
+          done

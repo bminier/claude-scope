@@ -32,3 +32,8 @@ src-tauri/WixTools/
 
 # TypeScript
 *.tsbuildinfo
+
+# Lychee link checker — per-runner HTTP cache populated when contributors
+# run lychee locally (e.g. for the smoke test or to reproduce a CI run).
+# Never commit; CI runs use a fresh cache each invocation.
+.lycheecache
