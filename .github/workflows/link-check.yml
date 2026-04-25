@@ -66,8 +66,22 @@ jobs:
       # No dedupe yet — repeated pushes will leave a trail of comments.
       # If that gets noisy, swap to a sticky-comment helper or update via
       # the issues-comments API.
+      #
+      # Skipped on forked-PR events: `GITHUB_TOKEN` is read-only on those
+      # by GitHub design, and `gh pr comment` would 403 ("Resource not
+      # accessible by integration") which would mark this step (and the
+      # job) failed — defeating the "never fails" guarantee. The
+      # scheduled / manual job still surfaces fork-introduced rot via
+      # the tracking issue once the PR merges.
+      #
+      # `continue-on-error: true` is a belt-and-suspenders: even if some
+      # unrelated gh-cli failure slips through, the job stays green.
       - name: Comment on PR
-        if: github.event_name == 'pull_request' && steps.lychee.outputs.exit_code != '0'
+        if: >-
+          github.event_name == 'pull_request'
+          && steps.lychee.outputs.exit_code != '0'
+          && github.event.pull_request.head.repo.fork == false
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -75,7 +89,7 @@ jobs:
             echo '<!-- link-check-bot -->'
             echo '### Link check'
             echo
-            echo "Lychee found broken links in the markdown this PR touches. Reported here for visibility — **does not block merge**."
+            echo "Lychee scanned the whole repo's markdown surface and found broken links. Reported here for visibility — **does not block merge**."
             echo
             cat lychee-report.md
             echo
