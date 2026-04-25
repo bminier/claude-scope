@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bezel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#cdd5e2"></stop>
+      <stop offset="1" stop-color="#5c6677"></stop>
+    </linearGradient>
+  </defs>
+  <g transform="translate(512 512)">
+    
+    <circle r="380" fill="none" stroke="url(#bezel)" stroke-width="32"></circle>
+    <circle r="396" fill="none" stroke="#000" stroke-opacity="0.5" stroke-width="3"></circle>
+    <circle r="364" fill="none" stroke="#000" stroke-opacity="0.5" stroke-width="3"></circle>
+
+    
+    <g stroke="#cdd5e2" stroke-width="20" stroke-linecap="round">
+      <line x1="0" y1="-360" x2="0" y2="-280"></line>
+      <line x1="0" y1="280" x2="0" y2="360"></line>
+      <line x1="-360" y1="0" x2="-280" y2="0"></line>
+      <line x1="280" y1="0" x2="360" y2="0"></line>
+    </g>
+
+    
+    <g transform="scale(1.85)" stroke="#7aa2f7" stroke-linecap="round" fill="none">
+      <circle r="22" stroke="none" fill="#7aa2f7"></circle>
+      <path d="M -55 0 A 55 55 0 0 1 55 0" stroke-width="14"></path>
+      <path d="M -90 18 A 92 92 0 0 1 90 18" stroke-width="14" opacity="0.78"></path>
+      <path d="M -125 36 A 130 130 0 0 1 125 36" stroke-width="14" opacity="0.55"></path>
+    </g>
+  </g>
+</svg>
