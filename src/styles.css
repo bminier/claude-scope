@@ -708,6 +708,23 @@ button:disabled {
     visibility 120ms ease;
 }
 
+/* Reason on top, then a muted heuristic disclaimer separated by a hairline.
+   The yellow ⚠ reads as authoritative on its own, so the popover spells out
+   that it's a best-effort shape check rather than a verdict from Claude
+   Code itself. */
+.lint-warn-popover-reason {
+  display: block;
+}
+.lint-warn-popover-note {
+  display: block;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+}
+
 /* Small caret pointing at the badge so the popover's anchor is obvious. */
 .lint-warn-popover::before {
   content: "";

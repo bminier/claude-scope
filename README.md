@@ -18,7 +18,7 @@ Claude Code reads settings from JSON files at several scopes. Moving a permissio
 - **Diff preview modal** — shows before/after for both sides of a move with a proper diff, Esc/Enter/Tab-trap keyboard handling, focus restored to the triggering button on close
 - **Rule search / filter** — press `/` anywhere to focus, case-insensitive substring, `m/n` match counts per group
 - **Auto-reload** — `notify`-based file watcher picks up external edits (hand-edited JSON, another editor, etc.) and refreshes the UI without losing state
-- **Shape-level lint** — subtle ⚠ badge on rules that don't match a recognized shape (`Bash(...)`, `WebFetch(domain:...)`, `mcp__server__tool`, etc.), with tooltips explaining why
+- **Heuristic shape lint** — subtle ⚠ badge on rules that don't match the shapes this UI knows (`Bash(...)`, `WebFetch(domain:...)`, `mcp__server__tool`, etc.). Best-effort only: Claude Code's full rule grammar isn't publicly documented, so flagged rules may still work — the popover names the specific heuristic that tripped and disclaims its scope.
 
 ### Safety model
 
