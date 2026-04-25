@@ -88,13 +88,29 @@ reviewer.
 
 ## Edge cases
 
-- [ ] **Empty scope.** Delete `/tmp/cs-smoke/.claude/settings.local.json`
-      and click **Reload**. The Local column header shows
-      `(file not present)`.
-- [ ] **Parse-error scope.** `echo '{ invalid json' > .../settings.json`,
-      Reload. The affected column header shows
-      `Parse error: <message>` instead of rule rows. Other columns stay
+- [ ] **Empty scope.** Delete the Local file, then click **Reload**.
+      The Local column header shows `(file not present)`.
+      ```sh
+      # macOS / Linux
+      rm /tmp/cs-smoke/.claude/settings.local.json
+      ```
+      ```powershell
+      # Windows
+      Remove-Item "$env:TEMP\cs-smoke\.claude\settings.local.json"
+      ```
+- [ ] **Parse-error scope.** Overwrite the Project file with invalid
+      JSON, then click **Reload**. The affected column header shows
+      `Parse error: <message>` instead of rule rows; other columns stay
       functional.
+      ```sh
+      # macOS / Linux
+      printf '{ invalid json' > /tmp/cs-smoke/.claude/settings.json
+      ```
+      ```powershell
+      # Windows — -Encoding utf8 keeps the parse failure about JSON, not BOM.
+      Set-Content -Encoding utf8 -Value '{ invalid json' `
+        "$env:TEMP\cs-smoke\.claude\settings.json"
+      ```
 - [ ] **Busy-state idempotency.** Trigger a move and rapidly click a
       second `→` button before the modal opens. Only one diff modal
       appears; the second click is a no-op.
