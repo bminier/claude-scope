@@ -99,6 +99,8 @@ npm run tauri dev
 npx tsc --noEmit
 ```
 
+For UI changes, also run the manual smoke pass in [`docs/SMOKE_TEST.md`](./docs/SMOKE_TEST.md) — it's a ~5-minute checklist covering the move flow, watcher reload, scope visibility, and side-effect verification.
+
 ### Lint / format
 
 ```sh
