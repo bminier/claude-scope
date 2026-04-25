@@ -42,12 +42,11 @@ accept = [200, 204, 206, 403, 429, 999]
 # limits should be able to tell who's hitting them.
 user_agent = "claude-scope-linkcheck/1.0 (+https://github.com/bminier/claude-scope)"
 
-# Enable lychee's HTTP cache. The benefit here is purely *within* a
-# single run — the same URL appearing in multiple markdown files (e.g.
-# the project's GitHub URL in README, SECURITY, CONTRIBUTING) only gets
-# fetched once. There is no cross-run persistence today: CI doesn't
-# restore/save `.lycheecache` between runs, and `.lycheecache` is
-# .gitignored. If we want week-over-week reuse later, add an
-# `actions/cache` step to the workflow and set `max_cache_age` to
-# something >= the schedule cadence.
+# Enable lychee's HTTP cache. The workflow restores/saves `.lycheecache`
+# across runs via `actions/cache`, so a known-good URL from a previous
+# weekly run gets reused (within `max_cache_age`) instead of re-fetched.
+# 7d matches the schedule cadence — long enough that Mondays-to-Mondays
+# benefit, short enough that an outage during the gap surfaces on the
+# next run rather than being masked indefinitely.
 cache = true
+max_cache_age = "7d"

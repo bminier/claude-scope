@@ -48,6 +48,19 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      # Persist `.lycheecache` across runs so the weekly schedule doesn't
+      # rehit every endpoint each Monday. Cache key is unique per run
+      # (always saves), restore-keys does prefix-match against the most
+      # recent prior cache. Combined with `max_cache_age = "7d"` in
+      # .lycheerc, that's roughly: known-good URLs from the last week
+      # don't get re-fetched; everything older or unseen does.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .lycheecache
+          key: lychee-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            lychee-${{ runner.os }}-
+
       # `fail: false` keeps lychee non-fatal — we surface broken links via
       # comments / issues instead of failing the run. The action exposes
       # the underlying lychee exit code as `outputs.exit_code`, which the
