@@ -1,0 +1,49 @@
+# Lychee configuration for the weekly link-check workflow
+# (.github/workflows/link-check.yml). Tuned to scan the markdown surface
+# of this repo without crying wolf about intentional or transient cases.
+
+# Skip URLs that lychee would fail to resolve through no fault of the
+# documentation. Keep this list short — broad excludes hide real rot.
+exclude = [
+  # Local-dev URLs referenced in setup docs.
+  "^http://localhost",
+  "^http://127\\.0\\.0\\.1",
+  # Anthropic session URLs from git-generated commit trailers — they are
+  # session-scoped by design and 404 from any other session.
+  "^https://claude\\.ai/code/session_",
+  # Pure anchor fragments (#section); lychee resolves these flakily and
+  # they're already validated by the markdown renderer at view time.
+  "^#",
+]
+
+# File-system paths to skip entirely. node_modules ships markdown READMEs
+# for every transitive dependency — scanning those would dwarf the run
+# and hammer third-party sites with traffic about links we don't own.
+exclude_path = [
+  "node_modules",
+  "target",
+  "dist",
+]
+
+# Retry transient failures before declaring a link broken. The defaults
+# err on the side of fast-failing; widening here is the difference
+# between "real rot" and "GitHub had a bad afternoon."
+max_retries = 3
+retry_wait_time = 10
+timeout = 20
+
+# Status codes that count as "working enough." Some sites legitimately
+# 403 bots (Cloudflare, GH abuse heuristics) or 429 under load while
+# the URL is fine for a human reader; 999 is LinkedIn's "we don't talk
+# to bots" signal.
+accept = [200, 204, 206, 403, 429, 999]
+
+# Identifiable but not browser-spoofing — server admins seeing rate
+# limits should be able to tell who's hitting them.
+user_agent = "claude-scope-linkcheck/1.0 (+https://github.com/bminier/claude-scope)"
+
+# Persist an HTTP cache between runs. Weekly runs shouldn't rehit every
+# endpoint when the markdown hasn't changed; 2d is short enough that
+# a real outage stops being silently hidden.
+cache = true
+max_cache_age = "2d"
