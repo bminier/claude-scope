@@ -126,6 +126,14 @@ jobs:
           # Self-bootstrap the labels so a fresh fork or a label that was
           # manually deleted doesn't break the run. `--force` is idempotent
           # (creates if missing, updates colour/description if present).
+          # `bug` is bootstrapped too even though the upstream repo defines
+          # it — without this, a fork or a manual cleanup could fail issue
+          # creation silently under `continue-on-error: true`. The colour
+          # and description match GitHub's defaults so existing issues
+          # don't visibly change.
+          gh label create bug --force \
+            --color "d73a4a" \
+            --description "Something isn't working"
           gh label create link-rot --force \
             --color "fbca04" \
             --description "External link rot detected by the weekly link-check workflow"
