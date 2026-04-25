@@ -49,15 +49,23 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       # Persist `.lycheecache` across runs so the weekly schedule doesn't
-      # rehit every endpoint each Monday. Cache key is unique per run
-      # (always saves), restore-keys does prefix-match against the most
-      # recent prior cache. Combined with `max_cache_age = "7d"` in
+      # rehit every endpoint each Monday. The cache key is bucketed by
+      # UTC year-week so all runs within the same week (including PR
+      # pushes) reuse one cache entry — without bucketing, a per-run key
+      # would create a fresh cache on every push and burn through the
+      # repo's 10GB cache quota fast. `restore-keys` falls back to the
+      # most recent prior week so the first run of a new week starts
+      # from last week's state. Combined with `max_cache_age = "7d"` in
       # .lycheerc, that's roughly: known-good URLs from the last week
       # don't get re-fetched; everything older or unseen does.
+      - name: Compute lychee cache bucket
+        id: lychee-cache-bucket
+        run: echo "year_week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: .lycheecache
-          key: lychee-${{ runner.os }}-${{ github.run_id }}
+          key: lychee-${{ runner.os }}-${{ steps.lychee-cache-bucket.outputs.year_week }}
           restore-keys: |
             lychee-${{ runner.os }}-
 
