@@ -278,7 +278,7 @@ function lintBadge(rule: string): HTMLElement | null {
   btn.type = "button";
   btn.className = "lint-warn";
   btn.textContent = "⚠";
-  btn.setAttribute("aria-label", "Rule warning");
+  btn.setAttribute("aria-label", "Rule shape check");
   // `aria-describedby` is the canonical tooltip relationship. Keep the
   // detailed reason here only — `aria-label` is intentionally short so
   // screen readers don't announce the full message twice (once as the
@@ -292,7 +292,18 @@ function lintBadge(rule: string): HTMLElement | null {
   pop.id = popoverId;
   pop.className = "lint-warn-popover";
   pop.setAttribute("role", "tooltip");
-  pop.textContent = reason;
+  // Two-part body: reason on top, then a muted disclaimer that this is a
+  // best-effort shape check rather than a verdict from Claude Code itself.
+  // The popover is a known authority cue (yellow ⚠), so without the
+  // disclaimer users can read it as canonical validation.
+  const reasonLine = document.createElement("span");
+  reasonLine.className = "lint-warn-popover-reason";
+  reasonLine.textContent = reason;
+  const note = document.createElement("span");
+  note.className = "lint-warn-popover-note";
+  note.textContent = "Best-effort shape check — Claude Code may still accept this rule.";
+  pop.appendChild(reasonLine);
+  pop.appendChild(note);
 
   btn.addEventListener("click", (e) => {
     e.stopPropagation();

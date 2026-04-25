@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { homeDir } from "@tauri-apps/api/path";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 import type {
@@ -72,7 +73,14 @@ let moveInFlight = false;
 
 async function pickProject(): Promise<void> {
   if (moveInFlight) return;
-  const picked = await openDialog({ directory: true, multiple: false });
+  // Default to ~ so the picker doesn't open in whatever deep subdir the OS
+  // last remembered (often Documents/ on Windows). homeDir() is a Tauri
+  // path API that resolves to the platform-correct home dir.
+  const picked = await openDialog({
+    directory: true,
+    multiple: false,
+    defaultPath: await homeDir(),
+  });
   if (typeof picked === "string") {
     // Reset the filter when the user explicitly picks a different project —
     // a query that matched rules in the old project would silently hide the
