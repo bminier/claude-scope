@@ -128,7 +128,14 @@ jobs:
           gh label create "area:docs" --force \
             --color "0075ca" \
             --description "Documentation"
-          existing=$(gh issue list --label link-rot --state open --json number --jq '.[0].number // empty')
+          # Pick the oldest open `link-rot` issue as canonical (lowest
+          # number = longest history). If the dedupe contract was ever
+          # broken — manual creation, a previous bug — close the extras
+          # as duplicates pointing at the canonical so we converge back
+          # to a single open issue rather than silently leaving stragglers.
+          mapfile -t open_issues < <(gh issue list --label link-rot --state open --json number --jq '.[].number' | sort -n)
+          existing="${open_issues[0]:-}"
+          extras=("${open_issues[@]:1}")
           {
             cat lychee-report.md
             echo
@@ -138,6 +145,10 @@ jobs:
             gh issue edit "$existing" --body-file issue-body.md
             gh issue comment "$existing" \
               --body "Refreshed by run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) on \`${{ github.sha }}\`."
+            for extra in "${extras[@]}"; do
+              gh issue close "$extra" \
+                --comment "Closed as duplicate of #${existing} — consolidating \`link-rot\` tracking into a single open issue per the workflow contract."
+            done
           else
             gh issue create \
               --title "Weekly link check: broken links detected" \
@@ -159,8 +170,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          existing=$(gh issue list --label link-rot --state open --json number --jq '.[0].number // empty')
-          if [ -n "$existing" ]; then
-            gh issue close "$existing" \
+          # Close every open `link-rot` issue, not just one — see the
+          # consolidation logic in the open/update step. A clean run is
+          # also our chance to mop up any duplicates.
+          mapfile -t open_issues < <(gh issue list --label link-rot --state open --json number --jq '.[].number' | sort -n)
+          for n in "${open_issues[@]}"; do
+            gh issue close "$n" \
               --comment "Auto-closed: lychee found no broken links in run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) on \`${{ github.sha }}\`."
-          fi
+          done
