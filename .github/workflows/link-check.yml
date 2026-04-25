@@ -99,8 +99,22 @@ jobs:
       # Scheduled / manual runs with broken links: open or update a single
       # tracking issue. Dedupe on the `link-rot` label so weekly runs don't
       # pile up duplicates.
+      #
+      # Gated to the repository default branch: `workflow_dispatch` can be
+      # triggered from any branch, and we don't want a feature-branch
+      # manual run to overwrite the shared default-branch signal with
+      # findings from a half-baked branch. `schedule` always runs from the
+      # default branch already.
+      #
+      # `continue-on-error: true` keeps the "never fails" guarantee intact
+      # against transient `gh` failures (rate limits, API blips, label
+      # creation racing another run).
       - name: Open or update link-rot tracking issue
-        if: github.event_name != 'pull_request' && steps.lychee.outputs.exit_code != '0'
+        if: >-
+          github.event_name != 'pull_request'
+          && github.ref_name == github.event.repository.default_branch
+          && steps.lychee.outputs.exit_code != '0'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -133,9 +147,14 @@ jobs:
 
       # Scheduled / manual runs that come back clean: close any open
       # link-rot tracking issue with a comment that points back to the
-      # run that proved it clean.
+      # run that proved it clean. Same default-branch gate and
+      # `continue-on-error` rationale as the open/update step.
       - name: Close link-rot tracking issue when clean
-        if: github.event_name != 'pull_request' && steps.lychee.outputs.exit_code == '0'
+        if: >-
+          github.event_name != 'pull_request'
+          && github.ref_name == github.event.repository.default_branch
+          && steps.lychee.outputs.exit_code == '0'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
