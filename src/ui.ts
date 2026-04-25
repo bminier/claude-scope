@@ -393,8 +393,8 @@ let lastRenderedProjectDir: string | null = null;
 // closure over the source element, and the lifecycle is one short user
 // gesture — same shape as `openTreeNodes` / `lastRenderedProjectDir`.
 type DragSource =
-  | { kind: "rule"; rule: string; ruleKind: PermissionKind; from: Scope }
-  | { kind: "key"; key: string; from: Scope };
+  | { kind: "rule"; rule: string; ruleKind: PermissionKind; from: Scope; el: HTMLElement }
+  | { kind: "key"; key: string; from: Scope; el: HTMLElement };
 let dragSource: DragSource | null = null;
 
 function clearDragState(): void {
@@ -415,11 +415,11 @@ function setupRuleDragSource(
 ): void {
   el.draggable = true;
   el.addEventListener("dragstart", (e) => {
-    dragSource = { kind: "rule", rule, ruleKind: kind, from: scope };
+    dragSource = { kind: "rule", rule, ruleKind: kind, from: scope, el };
     if (e.dataTransfer) {
-      // Custom MIME type so we don't accidentally accept arbitrary text
-      // drags from other apps. The actual payload lives in `dragSource`;
-      // this is just a marker for `dragover`-time type sniffing.
+      // Custom MIME type used in dragover to reject foreign drags from other
+      // apps or browser tabs before checking dragSource. The payload lives in
+      // dragSource; the MIME value is just a discriminator.
       e.dataTransfer.setData("application/x-claude-scope-move", "rule");
       e.dataTransfer.effectAllowed = "move";
     }
@@ -430,7 +430,7 @@ function setupRuleDragSource(
 function setupKeyDragSource(el: HTMLElement, scope: Scope, key: string): void {
   el.draggable = true;
   el.addEventListener("dragstart", (e) => {
-    dragSource = { kind: "key", key, from: scope };
+    dragSource = { kind: "key", key, from: scope, el };
     if (e.dataTransfer) {
       e.dataTransfer.setData("application/x-claude-scope-move", "key");
       e.dataTransfer.effectAllowed = "move";
@@ -627,10 +627,11 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
   // column at all (scopeGrid filters them), so no extra `isScopeVisible`
   // check is needed here.
   col.addEventListener("dragover", (e) => {
+    if (!e.dataTransfer?.types.includes("application/x-claude-scope-move")) return;
     if (!dragSource || dragSource.from === view.scope || props.busy) return;
     // Calling preventDefault is what makes a target "droppable" in HTML5 DnD.
     e.preventDefault();
-    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    e.dataTransfer.dropEffect = "move";
     col.classList.add("col-drop-active");
   });
   col.addEventListener("dragleave", (e) => {
@@ -651,10 +652,11 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
     // modal synchronously, and we don't want a stale `dragSource` lingering
     // through the user's confirm interaction.
     dragSource = null;
+    const trigger = src.el.isConnected ? src.el : undefined;
     if (src.kind === "rule") {
-      props.onMove({ rule: src.rule, kind: src.ruleKind, from: src.from, to: view.scope });
+      props.onMove({ rule: src.rule, kind: src.ruleKind, from: src.from, to: view.scope }, trigger);
     } else {
-      props.onMoveKey({ key: src.key, from: src.from, to: view.scope });
+      props.onMoveKey({ key: src.key, from: src.from, to: view.scope }, trigger);
     }
   });
 
