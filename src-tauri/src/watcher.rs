@@ -21,13 +21,16 @@
 //!    one-hop-at-a-time keeps the watch set tight (at most ~3 dirs).
 //!
 //! 3. **We must not echo our own writes.** `apply_move` calls
-//!    `note_self_write` right after each successful save, and the watcher
-//!    ignores any debounced batch that arrives within `SELF_WRITE_GRACE_MS`
-//!    of the most recent self-write. Without this, every move would trigger
-//!    a phantom external-change reload.
+//!    `note_self_write(path)` right after each successful save. Suppression
+//!    is *path-scoped* and *consumed on first match*: the watcher ignores
+//!    the next interesting batch whose matched paths are all self-writes
+//!    we recorded recently, and removes those map entries as it does so.
+//!    This means a self-write to one scope file cannot suppress a
+//!    legitimate external edit to a different scope file, and a stale
+//!    entry can't suppress more than one batch.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,40 +59,46 @@ const FILENAME_ALLOWLIST: &[&str] = &["settings.json", "settings.local.json", ".
 pub struct WatchState {
     /// Holds the active debouncer; dropping it stops the watch threads.
     debouncer: Mutex<Option<Debouncer<notify_debouncer_mini::notify::RecommendedWatcher>>>,
-    /// Shared with the watcher callback so it can suppress echoes of our own
-    /// writes. Stored separately from `debouncer` so the callback doesn't
-    /// have to reach into the debouncer's mutex while it's being replaced.
-    last_self_write: Arc<Mutex<Instant>>,
+    /// Per-path record of recent self-writes. Shared with the watcher
+    /// callback so it can suppress echoes of our own writes — but only for
+    /// the specific paths we wrote to, not globally. Each entry is consumed
+    /// the first time a matching event batch arrives, so a stale entry
+    /// (e.g. the OS coalesced our event with someone else's) can suppress
+    /// at most one batch.
+    self_writes: Arc<Mutex<HashMap<PathBuf, Instant>>>,
 }
 
 impl Default for WatchState {
     fn default() -> Self {
         Self {
             debouncer: Mutex::new(None),
-            // Push it far enough back that the very first watcher event after
-            // install is never mistaken for a self-write echo.
-            last_self_write: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
+            self_writes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
 impl WatchState {
-    /// Record that we just wrote to disk ourselves. Call this *after* each
+    /// Record that we just wrote to `path` ourselves. Call this *after* each
     /// successful `io_atomic::save` from a write command (e.g. `apply_move`).
     /// Calling it after (not before) means a save that fails doesn't silence
     /// a real subsequent external edit — and the 200ms debouncer gives us
     /// plenty of slack between the actual file write and the notify callback.
     ///
+    /// Keys are normalized via `canonicalize_with_fallback` so each file has
+    /// a single entry regardless of which spelling the caller passed or
+    /// which spelling notify later reports — important for the
+    /// consume-on-match guarantee in the callback.
+    ///
     /// A poisoned mutex is recovered with `into_inner`: self-write
     /// suppression is important enough that silently skipping the update
     /// would defeat the whole point — poisoning just means a previous lock
     /// holder panicked, and overwriting the timestamp is safe either way.
-    pub fn note_self_write(&self) {
-        let mut t = self
-            .last_self_write
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *t = Instant::now();
+    pub fn note_self_write(&self, path: &Path) {
+        let key = self_write_key(path);
+        let mut map = self.self_writes.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        prune_expired(&mut map, now);
+        map.insert(key, now);
     }
 
     /// Tear down any existing watcher and install a fresh one. Idempotent:
@@ -131,7 +140,7 @@ impl WatchState {
             })
             .collect();
 
-        let last_self_write = Arc::clone(&self.last_self_write);
+        let self_writes = Arc::clone(&self.self_writes);
         let app_for_cb = app.clone();
         // Cooldown guard against flooding the frontend with `watcher-error`
         // notifications if notify enters a persistent error state. The
@@ -147,12 +156,14 @@ impl WatchState {
                         return;
                     }
                 };
-                // Exact-path filter. match_paths is precomputed from the
+                // Collect the deduped set of interesting paths in this
+                // batch. match_paths_for_cb is precomputed from the
                 // resolved scope paths (plus any expected-but-missing
-                // `.claude/` dirs), with both raw and canonical forms
-                // inserted, so unrelated `settings.json` files elsewhere
-                // in the tree can't fire a spurious reload.
-                let interesting = events.iter().any(|ev| {
+                // `.claude/` dirs) in both raw and canonical forms, so
+                // unrelated `settings.json` files elsewhere in the tree
+                // can't fire a spurious reload.
+                let mut matched: HashSet<PathBuf> = HashSet::new();
+                for ev in &events {
                     // Cheap filename pre-filter — rejects the overwhelming
                     // majority of events (editor swaps, build outputs,
                     // etc.) without touching the filesystem.
@@ -162,10 +173,11 @@ impl WatchState {
                         .and_then(|n| n.to_str())
                         .is_some_and(|n| FILENAME_ALLOWLIST.contains(&n));
                     if !name_ok {
-                        return false;
+                        continue;
                     }
                     if match_paths_for_cb.contains(&ev.path) {
-                        return true;
+                        matched.insert(ev.path.clone());
+                        continue;
                     }
                     // Last-resort: canonicalize the incoming event path
                     // and check again. Handles the inverse of the
@@ -174,14 +186,16 @@ impl WatchState {
                     // symlink cases. The filename pre-filter above
                     // guarantees we only pay the syscall for plausibly-
                     // relevant paths.
-                    std::fs::canonicalize(&ev.path)
-                        .map(|c| match_paths_for_cb.contains(&c))
-                        .unwrap_or(false)
-                });
-                if !interesting {
+                    if let Ok(canon) = std::fs::canonicalize(&ev.path) {
+                        if match_paths_for_cb.contains(&canon) {
+                            matched.insert(canon);
+                        }
+                    }
+                }
+                if matched.is_empty() {
                     return;
                 }
-                if recent_self_write(&last_self_write) {
+                if !classify_external_change(&matched, &self_writes) {
                     return;
                 }
                 let _ = app_for_cb.emit("scopes-changed", ());
@@ -301,14 +315,70 @@ fn canonicalize_with_fallback(p: &std::path::Path) -> Option<PathBuf> {
     Some(canon)
 }
 
-fn recent_self_write(slot: &Arc<Mutex<Instant>>) -> bool {
-    // If the mutex is poisoned, the inner value is still the last timestamp
-    // we successfully wrote — recovering via into_inner() keeps suppression
-    // working. Returning false on poison would disable echo suppression
-    // after any panic in a watcher callback, which reintroduces phantom
-    // reloads on self-writes. `note_self_write` recovers the same way.
-    let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-    Instant::now().duration_since(*guard) < Duration::from_millis(SELF_WRITE_GRACE_MS)
+/// Decide whether a debounced batch should fire `scopes-changed`.
+///
+/// Each path in `matched` is checked against the per-path self-write log:
+/// - If the entry is fresh (within `SELF_WRITE_GRACE_MS`), we treat that
+///   path as a self-echo and *consume* the entry, so the next batch for
+///   the same path won't be suppressed.
+/// - If the entry is missing or expired, the path counts as an external
+///   change and the function returns `true`.
+///
+/// Returns `true` iff at least one matched path is not a current self-write.
+///
+/// `now` is captured *after* the mutex is locked so it can never precede a
+/// timestamp another thread inserted concurrently — which would otherwise
+/// make `duration_since` panic on some platforms (the std docs reserve the
+/// right to reintroduce the panic, even though it currently saturates).
+/// Belt-and-braces, we also use `saturating_duration_since` for any
+/// non-monotonic clock weirdness.
+///
+/// Lookup keys are normalized through `self_write_key`, matching how
+/// `note_self_write` stores them, so each file is represented by a single
+/// canonical entry — no sibling spelling left behind to suppress a later
+/// batch.
+///
+/// Poisoned mutex is recovered with `into_inner` — see `note_self_write`
+/// for the rationale; the same logic applies here.
+fn classify_external_change(
+    matched: &HashSet<PathBuf>,
+    self_writes: &Arc<Mutex<HashMap<PathBuf, Instant>>>,
+) -> bool {
+    let mut map = self_writes.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    prune_expired(&mut map, now);
+    let grace = Duration::from_millis(SELF_WRITE_GRACE_MS);
+    let mut external = false;
+    for path in matched {
+        let key = self_write_key(path);
+        match map.get(&key) {
+            Some(&ts) if now.saturating_duration_since(ts) < grace => {
+                map.remove(&key);
+            }
+            _ => external = true,
+        }
+    }
+    external
+}
+
+/// Normalize a path for use as a self-write map key. Falls back to the raw
+/// path if `canonicalize_with_fallback` can't resolve any existing
+/// ancestor — note_self_write and classify_external_change both run this,
+/// so as long as it's deterministic (same input → same output) the same
+/// file always maps to the same key.
+fn self_write_key(path: &Path) -> PathBuf {
+    canonicalize_with_fallback(path).unwrap_or_else(|| path.to_path_buf())
+}
+
+/// Drop self-write entries older than the grace window. Called on every
+/// insert and lookup so the map can't grow unbounded if note_self_write is
+/// invoked in a tight loop (e.g. many rule moves) or if events never
+/// arrive for some recorded write. Uses `saturating_duration_since` so a
+/// future-dated `ts` (theoretically possible on a non-monotonic clock)
+/// can't panic.
+fn prune_expired(map: &mut HashMap<PathBuf, Instant>, now: Instant) {
+    let grace = Duration::from_millis(SELF_WRITE_GRACE_MS);
+    map.retain(|_, ts| now.saturating_duration_since(*ts) < grace);
 }
 
 #[cfg(test)]
@@ -474,18 +544,199 @@ mod tests {
         assert_eq!(canonical, expected);
     }
 
-    #[test]
-    fn recent_self_write_true_within_grace_window() {
-        let slot = Arc::new(Mutex::new(Instant::now()));
-        assert!(recent_self_write(&slot));
+    fn make_self_writes() -> Arc<Mutex<HashMap<PathBuf, Instant>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// Build a real-on-disk path so `self_write_key` is deterministic for
+    /// the test (its result depends on which ancestor exists, so paths
+    /// rooted in a tempdir behave the same in production and tests).
+    fn fake_scope(claude_dir: &Path, name: &str) -> PathBuf {
+        claude_dir.join(name)
     }
 
     #[test]
-    fn recent_self_write_false_past_grace_window() {
-        let slot = Arc::new(Mutex::new(
+    fn classify_treats_unrecorded_path_as_external() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        let writes = make_self_writes();
+        let mut matched = HashSet::new();
+        matched.insert(fake_scope(&claude_dir, "settings.json"));
+        assert!(classify_external_change(&matched, &writes));
+    }
+
+    #[test]
+    fn classify_suppresses_a_self_write_to_the_same_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let path = fake_scope(&claude_dir, "settings.json");
+
+        let writes = make_self_writes();
+        writes
+            .lock()
+            .unwrap()
+            .insert(self_write_key(&path), Instant::now());
+
+        let mut matched = HashSet::new();
+        matched.insert(path.clone());
+        assert!(!classify_external_change(&matched, &writes));
+        // Entry consumed — a second matching batch isn't suppressed.
+        assert!(!writes.lock().unwrap().contains_key(&self_write_key(&path)));
+    }
+
+    #[test]
+    fn classify_does_not_suppress_external_change_to_different_path() {
+        // Regression for #31: a self-write to one scope file must not
+        // silence a legitimate external edit to a different scope file
+        // arriving in the same batch (or any later batch).
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let local = fake_scope(&claude_dir, "settings.local.json");
+        let project = fake_scope(&claude_dir, "settings.json");
+
+        let writes = make_self_writes();
+        writes
+            .lock()
+            .unwrap()
+            .insert(self_write_key(&local), Instant::now());
+
+        let mut matched = HashSet::new();
+        matched.insert(project);
+        assert!(
+            classify_external_change(&matched, &writes),
+            "external edit to project must fire even with a fresh self-write to local"
+        );
+        assert!(
+            writes.lock().unwrap().contains_key(&self_write_key(&local)),
+            "the unrelated self-write entry should be left intact"
+        );
+    }
+
+    #[test]
+    fn classify_emits_when_batch_mixes_self_write_and_external_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let local = fake_scope(&claude_dir, "settings.local.json");
+        let project = fake_scope(&claude_dir, "settings.json");
+
+        let writes = make_self_writes();
+        writes
+            .lock()
+            .unwrap()
+            .insert(self_write_key(&local), Instant::now());
+
+        let mut matched = HashSet::new();
+        matched.insert(local.clone());
+        matched.insert(project);
+        assert!(classify_external_change(&matched, &writes));
+        // The matching self-write entry is consumed.
+        assert!(!writes.lock().unwrap().contains_key(&self_write_key(&local)));
+    }
+
+    #[test]
+    fn classify_does_not_suppress_after_grace_window_elapses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let path = fake_scope(&claude_dir, "settings.json");
+
+        let writes = make_self_writes();
+        writes.lock().unwrap().insert(
+            self_write_key(&path),
             Instant::now() - Duration::from_millis(SELF_WRITE_GRACE_MS + 50),
-        ));
-        assert!(!recent_self_write(&slot));
+        );
+
+        let mut matched = HashSet::new();
+        matched.insert(path);
+        assert!(classify_external_change(&matched, &writes));
+    }
+
+    #[test]
+    fn classify_consumes_self_write_so_followup_batch_is_not_suppressed() {
+        // Self-write → first batch suppressed, entry consumed.
+        // A follow-up batch for the same path → NOT suppressed, even though
+        // it lands inside the legacy global grace window.
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let path = fake_scope(&claude_dir, "settings.json");
+
+        let writes = make_self_writes();
+        writes
+            .lock()
+            .unwrap()
+            .insert(self_write_key(&path), Instant::now());
+
+        let mut matched = HashSet::new();
+        matched.insert(path);
+        assert!(!classify_external_change(&matched, &writes));
+        assert!(classify_external_change(&matched, &writes));
+    }
+
+    #[test]
+    fn classify_consumes_via_alternate_spelling() {
+        // Self-write recorded under one spelling, event arrives under the
+        // other (canonical vs. raw): consumption must still match, since
+        // both spellings normalize to the same `self_write_key`.
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let raw = fake_scope(&claude_dir, "settings.json");
+        let canon_dir = match std::fs::canonicalize(&claude_dir) {
+            Ok(c) if c != claude_dir => c,
+            _ => {
+                // Tempdir is already canonical on this platform — the
+                // alternate-spelling case is not reachable, so skip.
+                return;
+            }
+        };
+        let canon = canon_dir.join("settings.json");
+        assert_ne!(raw, canon, "test only meaningful when spellings differ");
+
+        let writes = make_self_writes();
+        writes
+            .lock()
+            .unwrap()
+            .insert(self_write_key(&raw), Instant::now());
+
+        let mut matched = HashSet::new();
+        matched.insert(canon);
+        assert!(
+            !classify_external_change(&matched, &writes),
+            "canonical spelling must hit the raw-spelled self-write entry"
+        );
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "the single normalized entry must be fully consumed"
+        );
+    }
+
+    #[test]
+    fn note_self_write_records_under_normalized_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings = claude_dir.join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+
+        let state = WatchState::default();
+        state.note_self_write(&settings);
+
+        let map = state.self_writes.lock().unwrap();
+        assert_eq!(
+            map.len(),
+            1,
+            "exactly one entry per file regardless of spelling"
+        );
+        assert!(
+            map.contains_key(&self_write_key(&settings)),
+            "entry should live under the normalized key"
+        );
     }
 
     #[test]
@@ -493,26 +744,62 @@ mod tests {
         // Poison the inner mutex by panicking inside a lock guard on another
         // thread, then confirm note_self_write still writes a fresh value.
         let state = WatchState::default();
-        let arc = Arc::clone(&state.last_self_write);
+        let arc = Arc::clone(&state.self_writes);
         let _ = std::thread::spawn(move || {
             let _guard = arc.lock().unwrap();
             panic!("intentional poisoning for test");
         })
         .join();
-        assert!(state.last_self_write.is_poisoned());
+        assert!(state.self_writes.is_poisoned());
 
-        // Bracket the call with wall-clock reads and assert the stored
-        // timestamp sits inside [before, after]. Avoids a tight freshness
-        // threshold that can flake when CI deschedules this thread.
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let path = claude_dir.join("settings.json");
+
         let before = Instant::now();
-        state.note_self_write();
+        state.note_self_write(&path);
         let after = Instant::now();
 
-        let ts = state
-            .last_self_write
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let map = state.self_writes.lock().unwrap_or_else(|e| e.into_inner());
+        let ts = map.get(&self_write_key(&path)).expect("path was recorded");
         assert!(*ts >= before);
         assert!(*ts <= after);
+    }
+
+    #[test]
+    fn prune_expired_drops_old_entries_only() {
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        let fresh = PathBuf::from("/x/.claude/settings.json");
+        let stale = PathBuf::from("/x/.claude/settings.local.json");
+        map.insert(fresh.clone(), now);
+        map.insert(
+            stale.clone(),
+            now - Duration::from_millis(SELF_WRITE_GRACE_MS + 100),
+        );
+
+        prune_expired(&mut map, now);
+
+        assert!(map.contains_key(&fresh));
+        assert!(!map.contains_key(&stale));
+    }
+
+    #[test]
+    fn prune_expired_handles_future_dated_timestamp_without_panic() {
+        // Defensive: if a timestamp ever lands in the future relative to
+        // `now` (clock jitter / non-monotonic edge cases), saturating
+        // arithmetic must keep the entry rather than panicking.
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        let path = PathBuf::from("/x/.claude/settings.json");
+        map.insert(path.clone(), now + Duration::from_millis(50));
+
+        prune_expired(&mut map, now);
+
+        assert!(
+            map.contains_key(&path),
+            "future-dated entry must be retained, not panic"
+        );
     }
 }

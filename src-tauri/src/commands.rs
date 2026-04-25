@@ -379,11 +379,11 @@ fn apply_move_impl(
     // `note_self_write` is called *after* each successful save, not before:
     // a failed save means no filesystem event will arrive, so suppressing a
     // would-be-legitimate external change would leave the UI stale for no
-    // reason. The 200ms debouncer gives us a comfortable window to record
-    // the write before the notify callback fires.
+    // reason. Suppression is path-scoped, so we pass the exact path each
+    // save touched.
     if dest_mutated {
         io_atomic::save(&to_path, &to_doc, backups)?;
-        watch.note_self_write();
+        watch.note_self_write(&to_path);
     }
     // If the source write fails after the destination was updated, roll back
     // the destination so the rule doesn't end up duplicated in both scopes.
@@ -396,13 +396,13 @@ fn apply_move_impl(
                 )
                 .into());
             }
-            watch.note_self_write();
+            watch.note_self_write(&to_path);
         }
         return Err(
             format!("source save failed and destination was rolled back: {source_err}").into(),
         );
     }
-    watch.note_self_write();
+    watch.note_self_write(&from_path);
     Ok(())
 }
 
@@ -519,7 +519,7 @@ fn apply_move_key_impl(
     // avoids writing a .bak for a file we aren't actually touching.
     if dest_mutated {
         io_atomic::save(&to_path, &to_doc, backups)?;
-        watch.note_self_write();
+        watch.note_self_write(&to_path);
     }
     if let Err(source_err) = io_atomic::save(&from_path, &from_doc, backups) {
         if dest_mutated {
@@ -538,13 +538,13 @@ fn apply_move_key_impl(
                 )
                 .into());
             }
-            watch.note_self_write();
+            watch.note_self_write(&to_path);
         }
         return Err(
             format!("source save failed and destination was rolled back: {source_err}").into(),
         );
     }
-    watch.note_self_write();
+    watch.note_self_write(&from_path);
     Ok(())
 }
 
