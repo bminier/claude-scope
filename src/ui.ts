@@ -75,6 +75,11 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   // tracking state so a stale `openLintWrap` doesn't survive re-render and
   // confuse the next outside-click / Escape.
   closeLintPopover();
+  // Same reasoning for an in-flight drag: if a re-render lands mid-drag
+  // (e.g. an external file change reloads scopes), the source chip is
+  // detached and `dragend` may not fire — drop the singleton so the next
+  // gesture starts clean.
+  clearDragState();
   // Compute the visible-scope set once here — every helper below reads
   // `isScopeVisible` instead of rebuilding this Set per scope/rule/tree
   // node, which mattered for payloads with many rules.
@@ -381,6 +386,59 @@ const openTreeNodes = new Set<string>();
 // in a different project that happens to share scope+path strings.
 let lastRenderedProjectDir: string | null = null;
 
+// HTML5 drag-and-drop source state. Set by `dragstart` on a chip or
+// top-level tree key, cleared by `dragend` (or by renderApp on a re-render
+// that tears down the source mid-drag). Lives at module scope because
+// `dragover` on drop targets needs to read the source scope without a
+// closure over the source element, and the lifecycle is one short user
+// gesture — same shape as `openTreeNodes` / `lastRenderedProjectDir`.
+type DragSource =
+  | { kind: "rule"; rule: string; ruleKind: PermissionKind; from: Scope }
+  | { kind: "key"; key: string; from: Scope };
+let dragSource: DragSource | null = null;
+
+function clearDragState(): void {
+  dragSource = null;
+  // Belt-and-suspenders: a drop on a non-target column doesn't fire its
+  // own dragleave, so a stale `.col-drop-active` could survive into the
+  // next render. Sweep them all here on any drag-state reset.
+  for (const el of document.querySelectorAll<HTMLElement>(".col-drop-active")) {
+    el.classList.remove("col-drop-active");
+  }
+}
+
+function setupRuleDragSource(
+  el: HTMLElement,
+  rule: string,
+  kind: PermissionKind,
+  scope: Scope,
+): void {
+  el.draggable = true;
+  el.addEventListener("dragstart", (e) => {
+    dragSource = { kind: "rule", rule, ruleKind: kind, from: scope };
+    if (e.dataTransfer) {
+      // Custom MIME type so we don't accidentally accept arbitrary text
+      // drags from other apps. The actual payload lives in `dragSource`;
+      // this is just a marker for `dragover`-time type sniffing.
+      e.dataTransfer.setData("application/x-claude-scope-move", "rule");
+      e.dataTransfer.effectAllowed = "move";
+    }
+  });
+  el.addEventListener("dragend", clearDragState);
+}
+
+function setupKeyDragSource(el: HTMLElement, scope: Scope, key: string): void {
+  el.draggable = true;
+  el.addEventListener("dragstart", (e) => {
+    dragSource = { kind: "key", key, from: scope };
+    if (e.dataTransfer) {
+      e.dataTransfer.setData("application/x-claude-scope-move", "key");
+      e.dataTransfer.effectAllowed = "move";
+    }
+  });
+  el.addEventListener("dragend", clearDragState);
+}
+
 function treeKey(scope: Scope, path: (string | number)[]): string {
   return `${scope}:${JSON.stringify(path)}`;
 }
@@ -414,6 +472,14 @@ function treeBranch(
   const name = document.createElement("span");
   name.className = "tree-key";
   name.textContent = label;
+  // Make the key span (not the whole <summary>) the drag source for whole
+  // top-level keys: starting a drag on the inner span lets the browser
+  // suppress the `<details>` toggle that would otherwise fire on click,
+  // and isolates the affordance from nested key labels which never become
+  // drag sources.
+  if (path.length === 1 && props && !props.busy) {
+    setupKeyDragSource(name, scope, String(path[0]));
+  }
   summary.appendChild(name);
   const peek = document.createElement("span");
   peek.className = "tree-peek";
@@ -478,6 +544,9 @@ function treeLeaf(
   const name = document.createElement("span");
   name.className = "tree-key";
   name.textContent = label;
+  if (path.length === 1 && props && !props.busy) {
+    setupKeyDragSource(name, scope, String(path[0]));
+  }
   row.appendChild(name);
   const val = document.createElement("span");
   val.className = `tree-value tree-value-${leafType(value)}`;
@@ -551,6 +620,43 @@ function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
 function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTMLElement {
   const col = document.createElement("div");
   col.className = "col";
+
+  // Drop target wiring. Only highlight + accept when the active drag came
+  // from a different scope — same-scope drops are intra-scope reorders,
+  // explicitly out of scope here (#43). Hidden scopes don't render this
+  // column at all (scopeGrid filters them), so no extra `isScopeVisible`
+  // check is needed here.
+  col.addEventListener("dragover", (e) => {
+    if (!dragSource || dragSource.from === view.scope || props.busy) return;
+    // Calling preventDefault is what makes a target "droppable" in HTML5 DnD.
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    col.classList.add("col-drop-active");
+  });
+  col.addEventListener("dragleave", (e) => {
+    // dragleave fires on every transition into a child element, so checking
+    // relatedTarget is the only way to distinguish "actually left the
+    // column" from "moved between two children of the column". Without
+    // this guard the highlight flickers on every chip the cursor crosses.
+    const next = e.relatedTarget as Node | null;
+    if (next && col.contains(next)) return;
+    col.classList.remove("col-drop-active");
+  });
+  col.addEventListener("drop", (e) => {
+    e.preventDefault();
+    col.classList.remove("col-drop-active");
+    if (!dragSource || dragSource.from === view.scope || props.busy) return;
+    const src = dragSource;
+    // Clear the singleton before dispatching the move — onMove can open a
+    // modal synchronously, and we don't want a stale `dragSource` lingering
+    // through the user's confirm interaction.
+    dragSource = null;
+    if (src.kind === "rule") {
+      props.onMove({ rule: src.rule, kind: src.ruleKind, from: src.from, to: view.scope });
+    } else {
+      props.onMoveKey({ key: src.key, from: src.from, to: view.scope });
+    }
+  });
 
   const head = document.createElement("div");
   head.className = "col-head";
@@ -643,6 +749,13 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
   const code = document.createElement("code");
   code.className = "rule-text";
   code.textContent = rule;
+  // Drag affordance lives on the chip itself, not the row, so the move
+  // buttons stay clickable and the row keeps its hover semantics intact.
+  // Disabled while a write is in flight, mirroring how `move-btn` is
+  // gated on `props.busy` further down.
+  if (!props.busy) {
+    setupRuleDragSource(code, rule, kind, scope);
+  }
   row.appendChild(code);
 
   const badge = lintBadge(rule);

@@ -272,6 +272,29 @@ button:disabled {
      `.rule-text`) set their own overflow. */
 }
 
+/* Drag-and-drop drop-target highlight. Applied via JS while a draggable
+   chip or top-level key is hovered over a valid target column. Uses the
+   same accent color as the keyboard focus ring so the affordance reads
+   consistently across mouse and keyboard input. */
+.col-drop-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(122, 162, 247, 0.25);
+  background: rgba(122, 162, 247, 0.05);
+}
+
+/* Grab cursors on the actual drag handles. Only applied when JS marks the
+   element draggable (i.e. for whole top-level keys and rule chips when
+   the app isn't busy), so non-draggable tree keys keep their default
+   cursor. */
+.rule-text[draggable="true"],
+.tree-key[draggable="true"] {
+  cursor: grab;
+}
+.rule-text[draggable="true"]:active,
+.tree-key[draggable="true"]:active {
+  cursor: grabbing;
+}
+
 .col-head h3 {
   margin: 0;
   font-size: 15px;
