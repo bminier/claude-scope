@@ -215,6 +215,13 @@ function effectivePanel(loaded: LoadedScopes, query: string, lowerQuery: string)
   title.textContent = "Effective permissions";
   panel.appendChild(title);
 
+  // Three side-by-side group columns instead of stacked rows. The grid
+  // mirrors the scope-grid breakpoint below (auto-fit + minmax) so the
+  // panel collapses to a single column on narrow viewports in lockstep
+  // with the rest of the layout.
+  const groupsWrap = document.createElement("div");
+  groupsWrap.className = "eff-groups";
+
   const kinds: PermissionKind[] = ["allow", "deny", "ask"];
   for (const kind of kinds) {
     const all = loaded.effective_permissions[kind];
@@ -233,10 +240,11 @@ function effectivePanel(loaded: LoadedScopes, query: string, lowerQuery: string)
         : `${KIND_LABELS[kind]} (${matched.length}/${all.length})`;
     group.appendChild(label);
     for (const rule of matched) {
-      // Chip + optional badge wrap as a single flex item. Without the
-      // wrapper, the badge can break onto a new line without its chip
-      // because `.eff-group` uses `flex-wrap: wrap`, and it would then
-      // be ambiguous which rule the warning belongs to.
+      // Chip + optional badge wrap as a single flex item. Originally added
+      // because `.eff-group` used `flex-wrap: wrap` (badges could orphan to
+      // a new line without their chip); the group is now a vertical stack,
+      // but the wrap still keeps badge + chip baseline-aligned and lets the
+      // hover popover anchor relative to the pair.
       const chipWrap = document.createElement("span");
       chipWrap.className = "chip-wrap";
       const chip = document.createElement("code");
@@ -247,8 +255,9 @@ function effectivePanel(loaded: LoadedScopes, query: string, lowerQuery: string)
       if (badge) chipWrap.appendChild(badge);
       group.appendChild(chipWrap);
     }
-    panel.appendChild(group);
+    groupsWrap.appendChild(group);
   }
+  panel.appendChild(groupsWrap);
   return panel;
 }
 
