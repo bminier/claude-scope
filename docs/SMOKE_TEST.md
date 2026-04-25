@@ -24,7 +24,7 @@ reviewer.
    ```sh
    npm run tauri dev
    ```
-4. Click the project path → pick `/tmp/cs-smoke` (or your equivalent
+4. Click **Open project…** → pick `/tmp/cs-smoke` (or your equivalent
    throwaway).
 
 > Reminder: a real `~/.claude/settings.json` will be read too. If you want
@@ -48,13 +48,14 @@ reviewer.
       an `env` / `hooks` / `theme` entry, use the per-key `→ <Scope>`
       button. Same diff/apply flow; the key moves and JSON round-trips
       cleanly.
-- [ ] **Toggle scope visibility.** Open the gear → Settings dialog →
-      uncheck a scope. Column disappears immediately. Re-check it; column
-      returns. Close and re-open the dialog; checkbox state is preserved.
+- [ ] **Toggle scope visibility.** Click **Settings** to open the dialog
+      → uncheck a scope. Column disappears immediately. Re-check it;
+      column returns. Close and re-open the dialog; checkbox state is
+      preserved.
 - [ ] **Search filter.** Press `/` anywhere → search input takes focus.
-      Type a substring → group headers switch to `Allow (m/n)` format and
-      only matching rules render. Press **Esc** in the input → filter
-      clears.
+      Type a substring → group headers switch to `allow (m/n)` /
+      `deny (m/n)` / `ask (m/n)` and only matching rules render. Press
+      **Esc** in the input → filter clears.
 - [ ] **Lint-warning chip.** Find (or temporarily add) a malformed rule
       like `Bash` (no parens). The ⚠ chip appears. Tab to it — focus ring
       visible. Activate it (Enter or click) → popover opens with the
