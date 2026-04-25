@@ -1,6 +1,6 @@
 [package]
 name = "claude-scope"
-version = "0.1.0"
+version = "0.2.0"
 description = "Desktop GUI for promoting Claude Code settings between scopes"
 authors = ["Brian Minier"]
 license = "MIT"
