@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-  
+
   <defs>
     <linearGradient id="bezel" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#cdd5e2"></stop>
@@ -17,7 +17,7 @@
     <rect width="1024" height="1024" fill="url(#tile)"></rect>
     <rect x="2" y="2" width="1020" height="1020" fill="none" stroke="#ffffff" stroke-opacity="0.06" rx="222" ry="222"></rect>
   </g>
-  
+
   <g transform="translate(512 512) scale(1)">
     <g stroke="#cdd5e2" stroke-width="24" stroke-linecap="round">
       <line x1="0" y1="-425" x2="0" y2="-330"></line>
@@ -28,7 +28,7 @@
     <circle r="448" fill="none" stroke="url(#bezel)" stroke-width="38"></circle>
     <circle r="467" fill="none" stroke="#000" stroke-opacity="0.5" stroke-width="3"></circle>
     <circle r="429" fill="none" stroke="#000" stroke-opacity="0.5" stroke-width="3"></circle>
-    
+
   <g transform="scale(2.18)" stroke="#7aa2f7" stroke-linecap="round" fill="none">
     <circle r="22" stroke="none" fill="#7aa2f7"></circle>
     <path d="M -55 0 A 55 55 0 0 1 55 0" stroke-width="14"></path>
