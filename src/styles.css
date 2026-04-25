@@ -203,12 +203,11 @@ button:disabled {
   flex-direction: column;
   align-items: stretch;
   gap: 4px;
-  /* Cap the height of a single group so a long allow list can't push the
-     scope grid below the fold. Each group scrolls independently, which is
-     fine because they're parallel (not nested) and the kind labels stay
-     pinned at the top of the panel. */
-  max-height: 240px;
-  overflow-y: auto;
+  /* Intentionally no `max-height` / `overflow` here: lint-warn popovers on
+     chips are absolutely positioned and would be clipped by any scrolling
+     ancestor (moving the scroll to an inner wrapper doesn't help — the
+     popovers live inside the chips). The page itself scrolls if a long
+     allow list pushes the scope grid below the fold, which is acceptable. */
 }
 
 .eff-label {
@@ -216,13 +215,7 @@ button:disabled {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--muted);
-  /* Keep the label at the top edge even if the group has more chips than
-     fit; if the user scrolls a long list, the kind label stays visible. */
-  position: sticky;
-  top: 0;
-  background: var(--panel);
   padding-bottom: 2px;
-  z-index: 1;
 }
 
 .eff-allow .eff-label {

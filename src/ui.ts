@@ -627,11 +627,17 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
   // column at all (scopeGrid filters them), so no extra `isScopeVisible`
   // check is needed here.
   col.addEventListener("dragover", (e) => {
-    if (!e.dataTransfer?.types.includes("application/x-claude-scope-move")) return;
+    // Normalize `DataTransfer.types` before sniffing the marker. The current
+    // spec says it's a frozen `Array<string>` (so `.includes` works), but
+    // older WebKit exposed it as a `DOMStringList` with `.contains` instead.
+    // Tauri 2 supports macOS 10.15+ where that older shape can still surface,
+    // so be defensive: `Array.from` accepts either and gives us `.includes`.
+    const types = e.dataTransfer ? Array.from(e.dataTransfer.types) : [];
+    if (!types.includes("application/x-claude-scope-move")) return;
     if (!dragSource || dragSource.from === view.scope || props.busy) return;
     // Calling preventDefault is what makes a target "droppable" in HTML5 DnD.
     e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
     col.classList.add("col-drop-active");
   });
   col.addEventListener("dragleave", (e) => {
