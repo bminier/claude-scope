@@ -82,7 +82,8 @@ reviewer.
       `deny (m/n)` / `ask (m/n)` and only matching rules render. Press
       **Esc** in the input → filter clears.
 - [ ] **Lint-warning chip.** Find (or temporarily add) a malformed rule
-      like `Bash` (no parens). The ⚠ chip appears. Tab to it — focus ring
+      like `Bash()` (empty args) or `WebFetch(example.com)` (missing
+      `domain:` prefix). The ⚠ chip appears. Tab to it — focus ring
       visible. Activate it (Enter or click) → popover opens with the
       reason. Press **Esc** → popover closes, focus returns to the chip.
 
