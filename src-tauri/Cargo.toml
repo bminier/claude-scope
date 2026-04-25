@@ -20,7 +20,7 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
-dirs = "5"
+dirs = "6"
 tempfile = "3"
 notify-debouncer-mini = "0.7"
 
