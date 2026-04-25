@@ -12,6 +12,18 @@ Desktop GUI for promoting Claude Code settings between scopes
 
 Work on feature branches. Open PRs targeting `dev`. Follow conventional commits.
 
+## Versioning
+
+A version bump must update four files in lockstep: `package.json`,
+`package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`.
+`src-tauri/Cargo.lock` regenerates on the next `cargo` run.
+
+Do **not** regenerate `package-lock.json` with `npm install --package-lock-only`
+on Windows — npm drops Linux-only optional deps (e.g. `@emnapi/*`,
+`@napi-rs/*`) and `npm ci` then fails on the Linux CI runner. For a pure
+version bump, edit only the two top-level `"version"` fields in the lockfile;
+leave the dependency tree alone.
+
 ## Bootstrap
 
 ## Origin
