@@ -8,7 +8,11 @@
 #   - On PRs that touch any markdown / link-check config — gives authors
 #     same-PR feedback without spamming check runs on unrelated PRs.
 #
-# Never fails the workflow. External link rot is reported via:
+# Doesn't fail on broken links — those get reported, not enforced. (An
+# action-level failure like the lychee binary failing to download or a
+# `.lycheerc` parse error WILL still fail the job, which is the right
+# signal: the link check stopped working.) External link rot is
+# surfaced via:
 #   - PRs: a comment on the PR (non-blocking; broken third-party links
 #     should not block a refactor PR).
 #   - Scheduled / manual: a single deduped tracking issue tagged with
