@@ -60,14 +60,16 @@ pub fn load() -> Preferences {
     serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
-/// Save preferences atomically. Creates the parent directory if needed and
-/// writes via `tempfile::NamedTempFile` + `persist()` — the same pattern
-/// `io_atomic::save` uses — for two reasons:
-///   - `NamedTempFile` gives each in-flight save a unique filename, so a
-///     call that races with another can't scribble over its tempfile.
-///   - `persist()` uses platform-appropriate atomic replace semantics;
-///     `std::fs::rename` alone refuses to overwrite an existing destination
-///     on Windows, which would break every save after the first.
+/// Save preferences atomically. Routes through `io_atomic::atomic_write_json`
+/// so the pre-write JSON revalidation invariant is enforced at the same
+/// chokepoint the settings writer uses — even though `serde_json::to_vec_pretty`
+/// against a typed `Preferences` is safe-by-construction today, a future
+/// manual render or schema-evolution shortcut can't quietly skip validation
+/// without bypassing the helper on purpose.
+///
+/// `backups: None` is intentional: the preferences file lives in the OS
+/// config directory and is cheap to regenerate; a stray `.bak` next to it
+/// would be more surprise than safety.
 pub fn save(prefs: &Preferences) -> std::io::Result<()> {
     let path = config_path().ok_or_else(|| {
         std::io::Error::new(
@@ -75,22 +77,10 @@ pub fn save(prefs: &Preferences) -> std::io::Result<()> {
             "no OS config directory available",
         )
     })?;
-    let Some(parent) = path.parent() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "config path has no parent directory",
-        ));
-    };
-    std::fs::create_dir_all(parent)?;
-
     let body = serde_json::to_vec_pretty(prefs)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    std::io::Write::write_all(&mut tmp, &body)?;
-    tmp.as_file_mut().sync_all()?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    Ok(())
+    crate::io_atomic::atomic_write_json(&path, &body, None)
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 #[cfg(test)]
