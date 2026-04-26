@@ -158,6 +158,16 @@ pub fn save(path: &Path, doc: &SettingsDoc, backups: &BackupTracker) -> Result<(
 /// a small raw-winapi wrapper. NTFS journals rename metadata as part of
 /// `MoveFileEx`, so the additional sync would mostly duplicate work the
 /// filesystem already commits to.
+///
+/// If the parent-dir sync itself fails, the function returns
+/// `IoError::Io { path: <parent> }` *after* the rename has already taken
+/// effect. Treat such an error as a durability warning, not as "the write
+/// did not happen": the destination has been replaced, but its directory
+/// entry isn't yet guaranteed to survive a crash. This is the honest
+/// failure mode — silently swallowing the fsync error would leave the docs
+/// claiming durability the code can't actually deliver, and `eprintln!` is
+/// invisible in Windows release builds where `windows_subsystem = "windows"`
+/// discards stderr.
 pub fn atomic_write_json(
     path: &Path,
     bytes: &[u8],
@@ -189,18 +199,13 @@ pub fn atomic_write_json(
         .map_err(|e| IoError::io(tmp.path(), e))?;
     tmp.persist(path).map_err(|e| IoError::io(path, e.error))?;
 
-    // After `persist`, the destination path has already been replaced.
-    // A parent-directory sync failure here means the write is committed but
-    // may be less crash-durable than desired; do not report it as if no
-    // change happened.
-    if let Err(err) = sync_parent_dir(parent) {
-        eprintln!(
-            "warning: committed write to {} but failed to sync parent directory {}: {}",
-            path.display(),
-            parent.display(),
-            err
-        );
-    }
+    // After `persist`, the destination path has already been replaced. A
+    // parent-directory sync failure here means the write is committed but
+    // not yet crash-durable; propagate it as `IoError::Io` against the
+    // parent path so the caller sees an honest failure rather than a silent
+    // swallow. See the doc-comment on `atomic_write_json` for the contract
+    // callers must follow when this happens.
+    sync_parent_dir(parent)?;
 
     Ok(())
 }
