@@ -15,8 +15,12 @@
 //!   3. On the first write of this process that targets a given path, copy
 //!      the existing file (if any) to `<file>.bak` — opt-in per call site
 //!      via the `backups` argument.
-//!   4. Write the new contents to a tempfile in the same directory.
+//!   4. Write the new contents to a tempfile in the same directory and
+//!      `sync_all()` the file's data + metadata.
 //!   5. Rename the tempfile over the target (atomic on the same filesystem).
+//!   6. On Unix, `sync_all()` the parent directory so the rename itself is
+//!      durable across a crash. Windows skips this step — see the
+//!      `atomic_write_json` doc-comment for the rationale.
 
 use std::collections::HashSet;
 use std::fs;
@@ -143,6 +147,27 @@ pub fn save(path: &Path, doc: &SettingsDoc, backups: &BackupTracker) -> Result<(
 /// settings.json`), and `None` for ClaudeScope-owned files that are cheap to
 /// regenerate and would clutter their directory with `.bak`s (e.g. the
 /// preferences file under the OS config dir).
+///
+/// **Durability:** after the rename, on Unix this also opens the parent
+/// directory and `sync_all()`s it — without that, a crash between the
+/// `rename` syscall and the kernel flushing the directory entry can leave
+/// the *file data* on disk while the *directory entry pointing at it* is
+/// lost. Windows skips the parent-dir step: opening a directory handle for
+/// flushing requires `FILE_FLAG_BACKUP_SEMANTICS`, which `std::fs::File`
+/// does not expose for directory opens, so doing the equivalent would need
+/// a small raw-winapi wrapper. NTFS journals rename metadata as part of
+/// `MoveFileEx`, so the additional sync would mostly duplicate work the
+/// filesystem already commits to.
+///
+/// If the parent-dir sync itself fails, the function returns
+/// `IoError::Io { path: <parent> }` *after* the rename has already taken
+/// effect. Treat such an error as a durability warning, not as "the write
+/// did not happen": the destination has been replaced, but its directory
+/// entry isn't yet guaranteed to survive a crash. This is the honest
+/// failure mode — silently swallowing the fsync error would leave the docs
+/// claiming durability the code can't actually deliver, and `eprintln!` is
+/// invisible in Windows release builds where `windows_subsystem = "windows"`
+/// discards stderr.
 pub fn atomic_write_json(
     path: &Path,
     bytes: &[u8],
@@ -174,6 +199,28 @@ pub fn atomic_write_json(
         .map_err(|e| IoError::io(tmp.path(), e))?;
     tmp.persist(path).map_err(|e| IoError::io(path, e.error))?;
 
+    // After `persist`, the destination path has already been replaced. A
+    // parent-directory sync failure here means the write is committed but
+    // not yet crash-durable; propagate it as `IoError::Io` against the
+    // parent path so the caller sees an honest failure rather than a silent
+    // swallow. See the doc-comment on `atomic_write_json` for the contract
+    // callers must follow when this happens.
+    sync_parent_dir(parent)?;
+
+    Ok(())
+}
+
+/// Flush the parent directory so the rename in `atomic_write_json` is
+/// crash-durable, not just crash-atomic. Unix-only; see the
+/// `atomic_write_json` doc-comment for why Windows is a no-op here.
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) -> Result<(), IoError> {
+    let dir = fs::File::open(parent).map_err(|e| IoError::io(parent, e))?;
+    dir.sync_all().map_err(|e| IoError::io(parent, e))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_parent: &Path) -> Result<(), IoError> {
     Ok(())
 }
 
