@@ -153,10 +153,11 @@ pub fn save(path: &Path, doc: &SettingsDoc, backups: &BackupTracker) -> Result<(
 /// `rename` syscall and the kernel flushing the directory entry can leave
 /// the *file data* on disk while the *directory entry pointing at it* is
 /// lost. Windows skips the parent-dir step: opening a directory handle for
-/// flushing requires `FILE_FLAG_BACKUP_SEMANTICS` via raw winapi (or admin
-/// privileges through `std::fs::File::open`), and NTFS journals rename
-/// metadata as part of `MoveFileEx`, so the additional sync would mostly
-/// duplicate work the filesystem already commits to.
+/// flushing requires `FILE_FLAG_BACKUP_SEMANTICS`, which `std::fs::File`
+/// does not expose for directory opens, so doing the equivalent would need
+/// a small raw-winapi wrapper. NTFS journals rename metadata as part of
+/// `MoveFileEx`, so the additional sync would mostly duplicate work the
+/// filesystem already commits to.
 pub fn atomic_write_json(
     path: &Path,
     bytes: &[u8],
@@ -188,7 +189,18 @@ pub fn atomic_write_json(
         .map_err(|e| IoError::io(tmp.path(), e))?;
     tmp.persist(path).map_err(|e| IoError::io(path, e.error))?;
 
-    sync_parent_dir(parent)?;
+    // After `persist`, the destination path has already been replaced.
+    // A parent-directory sync failure here means the write is committed but
+    // may be less crash-durable than desired; do not report it as if no
+    // change happened.
+    if let Err(err) = sync_parent_dir(parent) {
+        eprintln!(
+            "warning: committed write to {} but failed to sync parent directory {}: {}",
+            path.display(),
+            parent.display(),
+            err
+        );
+    }
 
     Ok(())
 }
