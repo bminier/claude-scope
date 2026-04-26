@@ -15,8 +15,12 @@
 //!   3. On the first write of this process that targets a given path, copy
 //!      the existing file (if any) to `<file>.bak` — opt-in per call site
 //!      via the `backups` argument.
-//!   4. Write the new contents to a tempfile in the same directory.
+//!   4. Write the new contents to a tempfile in the same directory and
+//!      `sync_all()` the file's data + metadata.
 //!   5. Rename the tempfile over the target (atomic on the same filesystem).
+//!   6. On Unix, `sync_all()` the parent directory so the rename itself is
+//!      durable across a crash. Windows skips this step — see the
+//!      `atomic_write_json` doc-comment for the rationale.
 
 use std::collections::HashSet;
 use std::fs;
@@ -143,6 +147,16 @@ pub fn save(path: &Path, doc: &SettingsDoc, backups: &BackupTracker) -> Result<(
 /// settings.json`), and `None` for ClaudeScope-owned files that are cheap to
 /// regenerate and would clutter their directory with `.bak`s (e.g. the
 /// preferences file under the OS config dir).
+///
+/// **Durability:** after the rename, on Unix this also opens the parent
+/// directory and `sync_all()`s it — without that, a crash between the
+/// `rename` syscall and the kernel flushing the directory entry can leave
+/// the *file data* on disk while the *directory entry pointing at it* is
+/// lost. Windows skips the parent-dir step: opening a directory handle for
+/// flushing requires `FILE_FLAG_BACKUP_SEMANTICS` via raw winapi (or admin
+/// privileges through `std::fs::File::open`), and NTFS journals rename
+/// metadata as part of `MoveFileEx`, so the additional sync would mostly
+/// duplicate work the filesystem already commits to.
 pub fn atomic_write_json(
     path: &Path,
     bytes: &[u8],
@@ -174,6 +188,22 @@ pub fn atomic_write_json(
         .map_err(|e| IoError::io(tmp.path(), e))?;
     tmp.persist(path).map_err(|e| IoError::io(path, e.error))?;
 
+    sync_parent_dir(parent)?;
+
+    Ok(())
+}
+
+/// Flush the parent directory so the rename in `atomic_write_json` is
+/// crash-durable, not just crash-atomic. Unix-only; see the
+/// `atomic_write_json` doc-comment for why Windows is a no-op here.
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) -> Result<(), IoError> {
+    let dir = fs::File::open(parent).map_err(|e| IoError::io(parent, e))?;
+    dir.sync_all().map_err(|e| IoError::io(parent, e))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_parent: &Path) -> Result<(), IoError> {
     Ok(())
 }
 
