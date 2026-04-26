@@ -354,10 +354,12 @@ fn apply_move_impl(
     let from_path = require_path(paths, req.from)?.to_path_buf();
     let to_path = require_path(paths, req.to)?.to_path_buf();
 
-    let mut to_doc = io_atomic::load(&to_path)?.unwrap_or_else(SettingsDoc::empty);
+    let (to_doc_loaded, to_stamp) = io_atomic::load_with_stamp(&to_path)?;
+    let mut to_doc = to_doc_loaded.unwrap_or_else(SettingsDoc::empty);
     let dest_mutated = to_doc.add_rule(req.kind, &req.rule);
 
-    let mut from_doc = match io_atomic::load(&from_path)? {
+    let (from_doc_loaded, from_stamp) = io_atomic::load_with_stamp(&from_path)?;
+    let mut from_doc = match from_doc_loaded {
         Some(d) => d,
         None => return Err(format!("source file {} does not exist", from_path.display()).into()),
     };
@@ -381,16 +383,23 @@ fn apply_move_impl(
     // would-be-legitimate external change would leave the UI stale for no
     // reason. Suppression is path-scoped, so we pass the exact path each
     // save touched.
+    //
+    // Each save passes the stamp captured at load time. A third party that
+    // edited the file between our load and our save aborts with
+    // `ConcurrentModification` rather than getting silently overwritten.
     if dest_mutated {
-        io_atomic::save(&to_path, &to_doc, backups)?;
+        io_atomic::save(&to_path, &to_doc, backups, Some(&to_stamp))?;
         watch.note_self_write(&to_path);
     }
     // If the source write fails after the destination was updated, roll back
     // the destination so the rule doesn't end up duplicated in both scopes.
-    if let Err(source_err) = io_atomic::save(&from_path, &from_doc, backups) {
+    if let Err(source_err) = io_atomic::save(&from_path, &from_doc, backups, Some(&from_stamp)) {
         if dest_mutated {
             to_doc.remove_rule(req.kind, &req.rule);
-            if let Err(rollback_err) = io_atomic::save(&to_path, &to_doc, backups) {
+            // Rollback skips the stamp check: we are the canonical writer of
+            // the destination at this point, and the stamp we'd want is the
+            // one our own successful write just produced.
+            if let Err(rollback_err) = io_atomic::save(&to_path, &to_doc, backups, None) {
                 return Err(format!(
                     "source save failed: {source_err}; destination rollback also failed: {rollback_err}"
                 )
@@ -485,7 +494,8 @@ fn apply_move_key_impl(
     let from_path = require_path(paths, req.from)?.to_path_buf();
     let to_path = require_path(paths, req.to)?.to_path_buf();
 
-    let mut from_doc = match io_atomic::load(&from_path)? {
+    let (from_doc_loaded, from_stamp) = io_atomic::load_with_stamp(&from_path)?;
+    let mut from_doc = match from_doc_loaded {
         Some(d) => d,
         None => return Err(format!("source file {} does not exist", from_path.display()).into()),
     };
@@ -505,7 +515,8 @@ fn apply_move_key_impl(
     // touched it, so a later rollback can tell "restore the old contents"
     // apart from "we created this file, so removing it is the rollback."
     let to_existed_before = to_path.exists();
-    let to_doc_before = io_atomic::load(&to_path)?.unwrap_or_else(SettingsDoc::empty);
+    let (to_doc_loaded, to_stamp) = io_atomic::load_with_stamp(&to_path)?;
+    let to_doc_before = to_doc_loaded.unwrap_or_else(SettingsDoc::empty);
     let to_before = to_doc_before.get_top_level(&req.key).cloned();
     let mut to_doc = to_doc_before.clone();
     to_doc.merge_top_level(&req.key, src_value.clone());
@@ -517,18 +528,22 @@ fn apply_move_key_impl(
     // Destination first, then source — same ordering + rollback shape as
     // apply_move_impl. Skipping the destination save when nothing changed
     // avoids writing a .bak for a file we aren't actually touching.
+    //
+    // Stamp checks: each save passes the stamp captured at load. Rollback
+    // saves pass `None` because we are the canonical writer at that point
+    // (see apply_move_impl for the same reasoning).
     if dest_mutated {
-        io_atomic::save(&to_path, &to_doc, backups)?;
+        io_atomic::save(&to_path, &to_doc, backups, Some(&to_stamp))?;
         watch.note_self_write(&to_path);
     }
-    if let Err(source_err) = io_atomic::save(&from_path, &from_doc, backups) {
+    if let Err(source_err) = io_atomic::save(&from_path, &from_doc, backups, Some(&from_stamp)) {
         if dest_mutated {
             // Roll back the destination. If the file already existed before
             // we wrote to it, restore the pre-merge snapshot. If the save
             // newly created the file, delete it outright — re-saving the
             // empty snapshot would leave a stray `{}` file behind.
             let rollback_result: Result<(), Box<dyn std::error::Error>> = if to_existed_before {
-                io_atomic::save(&to_path, &to_doc_before, backups).map_err(Into::into)
+                io_atomic::save(&to_path, &to_doc_before, backups, None).map_err(Into::into)
             } else {
                 std::fs::remove_file(&to_path).map_err(Into::into)
             };
