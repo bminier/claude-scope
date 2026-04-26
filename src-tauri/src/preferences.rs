@@ -79,8 +79,14 @@ pub fn save(prefs: &Preferences) -> std::io::Result<()> {
     })?;
     let body = serde_json::to_vec_pretty(prefs)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    crate::io_atomic::atomic_write_json(&path, &body, None)
-        .map_err(|e| std::io::Error::other(e.to_string()))
+    crate::io_atomic::atomic_write_json(&path, &body, None).map_err(|e| {
+        let kind = match &e {
+            crate::io_atomic::IoError::Io { source, .. } => source.kind(),
+            crate::io_atomic::IoError::Revalidate { .. } => std::io::ErrorKind::InvalidData,
+            _ => std::io::ErrorKind::Other,
+        };
+        std::io::Error::new(kind, e)
+    })
 }
 
 #[cfg(test)]
