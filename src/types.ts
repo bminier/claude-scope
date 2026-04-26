@@ -3,7 +3,7 @@ export type Scope = "local" | "project" | "user_local" | "user";
 // UI-side scope order: broadest scope on the left, narrowest on the right.
 // That's the opposite of precedence order, so this list intentionally
 // diverges from Rust's `Scope::ALL` (which still iterates highest-precedence
-// first to drive the effective-permissions union). The only keep-in-sync
+// first to drive the combined-permissions union). The only keep-in-sync
 // invariant is membership: every scope variant must appear here so column
 // rendering and move-target buttons cover the full set.
 export const SCOPES: readonly Scope[] = ["user", "user_local", "project", "local"] as const;
@@ -42,7 +42,7 @@ export type PermissionKind = "allow" | "deny" | "ask";
 export interface LoadedScopes {
   project_dir: string;
   scopes: ScopeView[];
-  effective_permissions: PermissionRules;
+  combined_permissions: PermissionRules;
 }
 
 export interface MoveRequest {

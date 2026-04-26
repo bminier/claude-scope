@@ -37,7 +37,7 @@ pub struct ScopeView {
 pub struct LoadedScopes {
     pub project_dir: String,
     pub scopes: Vec<ScopeView>,
-    pub effective_permissions: PermissionRules,
+    pub combined_permissions: PermissionRules,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,12 +197,12 @@ fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::
         views.push(load_scope_view(scope, paths.path_for(scope)));
     }
 
-    let effective = effective_permissions(&views);
+    let combined = combined_permissions(&views);
 
     Ok(LoadedScopes {
         project_dir: paths.project_dir.display().to_string(),
         scopes: views,
-        effective_permissions: effective,
+        combined_permissions: combined,
     })
 }
 
@@ -233,13 +233,18 @@ fn load_scope_view(scope: Scope, path: Option<&Path>) -> ScopeView {
     view
 }
 
-/// Build the effective permission view. For v1 we union `allow` / `deny` /
-/// `ask` across the recognized scopes and deduplicate while preserving the
-/// order Local → Project → UserLocal → User (highest precedence first).
-/// That's a faithful first approximation of "what Claude Code sees" for
-/// list-valued rule sets; precedence-sensitive semantics like conflict
-/// resolution are a future concern.
-fn effective_permissions(views: &[ScopeView]) -> PermissionRules {
+/// Build the combined permission view: union `allow` / `deny` / `ask`
+/// across the recognized scopes and deduplicate while preserving the order
+/// Local → Project → UserLocal → User (highest precedence first).
+///
+/// This is intentionally *not* a precedence-aware effective evaluation.
+/// When a rule appears in both an `allow` and a `deny` list across scopes,
+/// both copies appear in their respective lists and no resolution happens.
+/// Naming it "combined" rather than "effective" keeps the UI honest about
+/// what the panel shows; modelling Claude Code's full conflict semantics is
+/// out of scope for v1 and would require grammar Claude Code does not
+/// publicly document.
+fn combined_permissions(views: &[ScopeView]) -> PermissionRules {
     let mut out = PermissionRules::default();
     for view in views {
         for rule in &view.permissions.allow {
@@ -978,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_unions_across_scopes() {
+    fn combined_unions_across_scopes() {
         let views = vec![
             ScopeView {
                 scope: Scope::Local,
@@ -1013,10 +1018,50 @@ mod tests {
                 parse_error: None,
             },
         ];
-        let eff = effective_permissions(&views);
-        assert_eq!(eff.allow, vec!["Bash(git status)", "Read(**)"]);
-        assert_eq!(eff.deny, vec!["WebFetch(domain:evil.example)"]);
-        assert!(eff.ask.is_empty());
+        let combined = combined_permissions(&views);
+        assert_eq!(combined.allow, vec!["Bash(git status)", "Read(**)"]);
+        assert_eq!(combined.deny, vec!["WebFetch(domain:evil.example)"]);
+        assert!(combined.ask.is_empty());
+    }
+
+    /// When the same rule appears in `allow` at one scope and `deny` at
+    /// another, the combined view surfaces both copies in their respective
+    /// lists rather than resolving the conflict. This is the documented
+    /// behavior of `combined_permissions`: it is a union, not a
+    /// precedence-aware evaluation. Locking it down so a future "let's
+    /// silently make this smarter" change has to delete this test.
+    #[test]
+    fn combined_surfaces_allow_deny_overlap_without_resolving() {
+        let views = vec![
+            ScopeView {
+                scope: Scope::Local,
+                path: None,
+                exists: true,
+                permissions: PermissionRules {
+                    allow: vec!["Bash(git push)".into()],
+                    deny: vec![],
+                    ask: vec![],
+                },
+                other_values: serde_json::Map::new(),
+                parse_error: None,
+            },
+            ScopeView {
+                scope: Scope::Project,
+                path: None,
+                exists: true,
+                permissions: PermissionRules {
+                    allow: vec![],
+                    deny: vec!["Bash(git push)".into()],
+                    ask: vec![],
+                },
+                other_values: serde_json::Map::new(),
+                parse_error: None,
+            },
+        ];
+        let combined = combined_permissions(&views);
+        assert_eq!(combined.allow, vec!["Bash(git push)"]);
+        assert_eq!(combined.deny, vec!["Bash(git push)"]);
+        assert!(combined.ask.is_empty());
     }
 
     #[test]

@@ -59,8 +59,9 @@ reviewer.
 ## Golden path
 
 - [ ] **All four scope columns render.** User / User-Local / Project / Local
-      appear left-to-right; the "Effective" panel shows the merged union on
-      top.
+      appear left-to-right; the "Combined permissions" panel shows the union
+      across scopes on top, with the precedence-aware-evaluation caveat in
+      its subtitle.
 - [ ] **Click-to-move a permission rule.** From any populated scope, click a
       `→ <Scope>` button on a rule → diff modal opens with before/after for
       both sides → click **Apply** → modal closes, rule disappears from
