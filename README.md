@@ -13,17 +13,19 @@ Claude Code reads settings from JSON files at several scopes. Moving a permissio
 
 ### Features
 
-- **Four-column scope view** — User / User-Local / Project / Local, laid out broadest-on-the-left, with the "effective" merged view on top
-- **Atomic, safe writes** — serialize → JSON-revalidate → tempfile + rename, with one-shot `.bak` backup per file per session
+- **Four-column scope view** — User / User-Local / Project / Local, laid out broadest-on-the-left, with a panel above them currently labelled "Effective permissions" in the UI. That panel is a union across scopes; it is not a full precedence-aware evaluation of what Claude Code resolves at runtime. The label is being walked back as part of [#30](https://github.com/bminier/claude-scope/issues/30).
+- **Atomic writes with revalidation** — serialize → re-parse the produced JSON → tempfile + rename, with one-shot `.bak` backup per file per session. See [Write strategy](#write-strategy) for the fine print.
 - **Diff preview modal** — shows before/after for both sides of a move with a proper diff, Esc/Enter/Tab-trap keyboard handling, focus restored to the triggering button on close
 - **Rule search / filter** — press `/` anywhere to focus, case-insensitive substring, `m/n` match counts per group
 - **Auto-reload** — `notify`-based file watcher picks up external edits (hand-edited JSON, another editor, etc.) and refreshes the UI without losing state
 - **Heuristic shape lint** — subtle ⚠ badge on rules that don't match the shapes this UI knows (`Bash(...)`, `WebFetch(domain:...)`, `mcp__server__tool`, etc.). Best-effort only: Claude Code's full rule grammar isn't publicly documented, so flagged rules may still work — the popover names the specific heuristic that tripped and disclaims its scope.
 
-### Safety model
+### Write strategy
 
-- Writes are atomic: serialize → revalidate JSON → tempfile in the same directory → `rename` over target.
-- On the first write of a given file per session, the original is copied to `<file>.bak`. Existing `.bak` files from previous runs are preserved, not clobbered.
+- Writes funnel through a single `atomic_write_json` chokepoint: serialize → re-parse the produced bytes → tempfile in the same directory → `rename` over target. Bad bytes never reach disk.
+- The rename is filesystem-atomic. On Unix the parent directory is also `fsync`'d so the rename is crash-durable; on Windows the parent-dir flush is skipped (see the doc-comment on `atomic_write_json` for the rationale — `std::fs` cannot open a directory handle for flushing without a small raw-winapi wrapper, and NTFS journals rename metadata in `MoveFileEx`).
+- A `FileStamp` (mtime + length) captured at load time is rechecked just before the rename. If the file changed on disk between load and save, the write is refused with a "reload and retry" error rather than overwriting the external edit. The check has a microsecond-scale TOCTOU window between the recheck and `persist`; a writer that lands inside that window will still be overwritten.
+- On the first write of a given file per session, the original is copied to `<file>.bak`. Existing `.bak` files from previous runs are preserved, not clobbered. This is a one-shot backup attempt, not a best-effort write-through: if backup creation is required and the copy fails, the error is surfaced and the write is not attempted.
 - A move writes the destination first, then removes from the source. If the source write fails, the destination write is rolled back so the rule ends up in exactly one scope rather than being lost *or* duplicated. If the rollback itself fails the user sees an explicit error.
 
 ## Stack
