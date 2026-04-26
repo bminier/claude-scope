@@ -456,7 +456,10 @@ fn diff_move_key_impl(
     } else if !to_path_exists {
         Some("Destination file will be created.".to_string())
     } else if to_before.is_some() {
-        Some("Destination already has this key; values will be merged.".to_string())
+        Some(
+            "Destination already has this key; values will be merged with a generic shape-based policy. Review the diff before applying."
+                .to_string(),
+        )
     } else {
         None
     };

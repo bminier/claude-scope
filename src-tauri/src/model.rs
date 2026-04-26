@@ -176,6 +176,13 @@ impl SettingsDoc {
     ///   value replaces whatever was there.
     ///
     /// If `key` didn't exist before, the new value is inserted as-is.
+    ///
+    /// This is a generic, *shape-based* policy: it does not know what each
+    /// key actually means to Claude Code. Some keys may be replacement-only,
+    /// some order-sensitive, some additive in ways that don't match
+    /// "append + dedup". For keys where shape-based merge does not match the
+    /// real semantics, this can silently change meaning. Tracked by
+    /// <https://github.com/bminier/claude-scope/issues/33>.
     pub fn merge_top_level(&mut self, key: &str, value: Value) {
         let obj = ensure_object(&mut self.root);
         if let Some(existing) = obj.get_mut(key) {
