@@ -514,8 +514,13 @@ fn apply_move_key_impl(
     // Snapshot whether the destination file existed on disk before we
     // touched it, so a later rollback can tell "restore the old contents"
     // apart from "we created this file, so removing it is the rollback."
-    let to_existed_before = to_path.exists();
+    // Derive the existence flag from the load result rather than a separate
+    // `exists()` call: a third party that creates the file between our
+    // `exists()` and our `load_with_stamp` would otherwise leave us with
+    // `to_existed_before = false` plus a present stamp, and on rollback
+    // we'd `remove_file` a file we never created.
     let (to_doc_loaded, to_stamp) = io_atomic::load_with_stamp(&to_path)?;
+    let to_existed_before = to_doc_loaded.is_some();
     let to_doc_before = to_doc_loaded.unwrap_or_else(SettingsDoc::empty);
     let to_before = to_doc_before.get_top_level(&req.key).cloned();
     let mut to_doc = to_doc_before.clone();
