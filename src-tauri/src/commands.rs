@@ -605,7 +605,13 @@ fn policy_preview_note(
                 "Array-union key, but the destination or source value is not a JSON array — the destination's value will be replaced instead. The original is saved to a .bak alongside the file.".to_string()
             }
         }
-        KeyPolicy::ReplaceComplex => "Complex per-subkey merge semantics not yet implemented; the destination's value will be replaced wholesale. The original is saved to a .bak alongside the file. Review the diff carefully.".to_string(),
+        KeyPolicy::Sandbox => {
+            if to_before.is_object() && src_value.is_object() {
+                "Sandbox structured merge: array fields under filesystem.*, network.*, and excludedCommands are concatenated and deduplicated; every other field is overwritten by the source.".to_string()
+            } else {
+                "Sandbox structured merge, but the destination or source value is not a JSON object — the destination's value will be replaced instead. The original is saved to a .bak alongside the file.".to_string()
+            }
+        }
         KeyPolicy::ReplaceUnknown => "Unknown key — ClaudeScope has no documented merge policy for it. The destination's value will be replaced. The original is saved to a .bak alongside the file. Review the diff carefully.".to_string(),
     }
 }
@@ -1353,14 +1359,32 @@ mod tests {
     }
 
     #[test]
-    fn preview_note_for_sandbox_calls_out_complex_semantics() {
+    fn preview_note_for_sandbox_describes_structured_merge() {
         let note = policy_preview_note(
             "sandbox",
             &serde_json::json!({"enabled": false}),
             &serde_json::json!({"enabled": true}),
         );
-        assert!(note.contains("Complex"));
-        assert!(note.contains("replaced"));
+        assert!(
+            note.contains("Sandbox structured merge"),
+            "expected structured-merge language, got: {note}"
+        );
+        assert!(note.contains("concatenated and deduplicated"));
+        assert!(note.contains("overwritten"));
+    }
+
+    #[test]
+    fn preview_note_for_sandbox_warns_on_shape_mismatch() {
+        let note = policy_preview_note(
+            "sandbox",
+            &serde_json::json!("not-an-object"),
+            &serde_json::json!({"enabled": true}),
+        );
+        assert!(
+            note.contains("not a JSON object"),
+            "expected shape-mismatch warning, got: {note}"
+        );
+        assert!(note.contains("replaced instead"));
     }
 
     #[test]
@@ -1407,6 +1431,61 @@ mod tests {
         assert_eq!(
             user_doc.get_top_level("hooks").unwrap(),
             &serde_json::json!({"PreToolUse": [{"command": "from-project"}]})
+        );
+    }
+
+    #[test]
+    fn move_key_applies_structured_sandbox_merge() {
+        // End-to-end check that the structured sandbox merge survives
+        // serialization through apply_move_key_impl: array leaves under
+        // filesystem.* and network.* union, scalar leaves replace,
+        // dest-only leaves survive.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{
+  "sandbox": {
+    "enabled": true,
+    "filesystem": {"allowWrite": ["/proj"]},
+    "network": {"allowedDomains": ["*.npmjs.org"]}
+  }
+}"#,
+        );
+        write(
+            paths.user.as_ref().unwrap(),
+            r#"{
+  "sandbox": {
+    "enabled": false,
+    "filesystem": {"allowWrite": ["/user"]},
+    "network": {"allowedDomains": ["github.com"], "httpProxyPort": 8080}
+  }
+}"#,
+        );
+        apply_move_key_impl(
+            &paths,
+            &MoveKeyRequest {
+                key: "sandbox".to_string(),
+                from: Scope::Project,
+                to: Scope::User,
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+        let user_doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            user_doc.get_top_level("sandbox").unwrap(),
+            &serde_json::json!({
+                "enabled": true,
+                "filesystem": {"allowWrite": ["/user", "/proj"]},
+                "network": {
+                    "allowedDomains": ["github.com", "*.npmjs.org"],
+                    "httpProxyPort": 8080
+                }
+            })
         );
     }
 }
