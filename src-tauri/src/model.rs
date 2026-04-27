@@ -228,7 +228,7 @@ fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
 /// ClaudeScope produces an effective config consistent with the documented
 /// semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyPolicy {
+pub(crate) enum KeyPolicy {
     /// Override-only key — Claude Code uses the highest-precedence scope's
     /// value verbatim. Moving overwrites the destination's existing value.
     Replace,
@@ -251,12 +251,15 @@ pub enum KeyPolicy {
 
 /// Documented merge semantics for a top-level Claude Code settings key.
 ///
-/// Sourced from the official Claude Code settings reference. The lists of
-/// override-only keys are exhaustive as of the current docs so that real
-/// keys land on `Replace` rather than the `ReplaceUnknown` warning fallback.
-/// Caller note: `permissions` is handled by the per-rule move flow, not the
-/// key-move flow, and is rejected upstream by `validate_move_key`.
-pub fn key_policy(key: &str) -> KeyPolicy {
+/// `OVERRIDE_ONLY_KEYS` covers the override-only keys from the official
+/// Claude Code settings reference plus a few legacy/project-supported keys
+/// (e.g. `theme`) that this crate's contract advertises in
+/// `CLAUDE.md`. Anything missing falls through to `ReplaceUnknown`, which
+/// shows a "no documented policy" warning rather than silently picking
+/// behavior. Caller note: `permissions` is handled by the per-rule move
+/// flow, not the key-move flow, and is rejected upstream by
+/// `validate_move_key`.
+pub(crate) fn key_policy(key: &str) -> KeyPolicy {
     match key {
         "env" => KeyPolicy::DeepMerge,
         "allowedHttpHookUrls" | "httpHookAllowedEnvVars" => KeyPolicy::ArrayUnion,
@@ -302,6 +305,8 @@ const OVERRIDE_ONLY_KEYS: &[&str] = &[
     "effortLevel",
     "enableAllProjectMcpServers",
     "enabledMcpjsonServers",
+    "enabledPlugins",
+    "extraKnownMarketplaces",
     "fastModePerSessionOptIn",
     "feedbackSurveyRate",
     "fileSuggestion",
@@ -334,6 +339,11 @@ const OVERRIDE_ONLY_KEYS: &[&str] = &[
     "strictKnownMarketplaces",
     "teammateMode",
     "terminalProgressBarEnabled",
+    // `theme` isn't in the current Claude Code settings reference, but this
+    // project's CLAUDE.md and tests advertise it as a supported top-level
+    // key, so users who still carry it in settings.json see Replace rather
+    // than the unknown-key warning.
+    "theme",
     "tui",
     "useAutoModeDuringPlan",
     "viewMode",
@@ -642,6 +652,14 @@ mod tests {
             *doc.get_top_level("hooks").unwrap(),
             serde_json::json!({"PostToolUse": [{"command": "new"}]})
         );
+    }
+
+    #[test]
+    fn project_supported_legacy_keys_resolve_to_replace_not_unknown() {
+        // theme isn't in the current Claude Code settings reference, but
+        // CLAUDE.md and the project tests advertise it as supported, so it
+        // must land on Replace rather than the ReplaceUnknown warning.
+        assert_eq!(key_policy("theme"), KeyPolicy::Replace);
     }
 
     #[test]
