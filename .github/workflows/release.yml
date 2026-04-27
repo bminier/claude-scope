@@ -160,7 +160,7 @@ jobs:
       # as part of the same step. Pinned to a specific version rather than
       # `@v0` so rebuilds of an older tag don't silently pick up
       # behavior/bundler changes from a newer action release.
-      - uses: tauri-apps/tauri-action@1ddc7b49b13c3038297360482fcb3e058764d7c9 # v0.6.2
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
