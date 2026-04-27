@@ -165,30 +165,37 @@ impl SettingsDoc {
             .is_some()
     }
 
-    /// Merge `value` into the top-level `key` with type-aware semantics:
+    /// Merge `value` into the top-level `key` using the documented Claude
+    /// Code semantics for that key (see [`key_policy`]).
     ///
-    /// - If both the existing and new values are objects, their keys are
-    ///   merged recursively (new values win on conflict for scalars, arrays
-    ///   accumulate with dedup, nested objects recurse).
-    /// - If both are arrays, the new items are appended to the existing
-    ///   array, skipping any that compare equal to an existing element.
-    /// - In any other combination (scalar, or mismatched shapes), the new
-    ///   value replaces whatever was there.
+    /// If the key isn't present yet, the value is inserted unchanged. If the
+    /// key already exists, the policy decides what happens:
     ///
-    /// If `key` didn't exist before, the new value is inserted as-is.
-    ///
-    /// This is a generic, *shape-based* policy: it does not know what each
-    /// key actually means to Claude Code. Some keys may be replacement-only,
-    /// some order-sensitive, some additive in ways that don't match
-    /// "append + dedup". For keys where shape-based merge does not match the
-    /// real semantics, this can silently change meaning. Tracked by
-    /// <https://github.com/bminier/claude-scope/issues/33>.
+    /// - [`KeyPolicy::Replace`] / [`KeyPolicy::ReplaceComplex`] /
+    ///   [`KeyPolicy::ReplaceUnknown`]: the destination is overwritten.
+    /// - [`KeyPolicy::DeepMerge`]: object trees are merged recursively, with
+    ///   source values winning on scalar/non-object conflicts.
+    /// - [`KeyPolicy::ArrayUnion`]: arrays are concatenated with duplicates
+    ///   removed; mismatched shapes fall back to overwrite.
     pub fn merge_top_level(&mut self, key: &str, value: Value) {
+        let policy = key_policy(key);
         let obj = ensure_object(&mut self.root);
-        if let Some(existing) = obj.get_mut(key) {
-            merge_value_in_place(existing, value);
-        } else {
-            obj.insert(key.to_string(), value);
+        match policy {
+            KeyPolicy::Replace | KeyPolicy::ReplaceComplex | KeyPolicy::ReplaceUnknown => {
+                obj.insert(key.to_string(), value);
+            }
+            KeyPolicy::DeepMerge => match obj.get_mut(key) {
+                Some(existing) => deep_merge_in_place(existing, value),
+                None => {
+                    obj.insert(key.to_string(), value);
+                }
+            },
+            KeyPolicy::ArrayUnion => match obj.get_mut(key) {
+                Some(existing) => array_union_in_place(existing, value),
+                None => {
+                    obj.insert(key.to_string(), value);
+                }
+            },
         }
     }
 
@@ -215,21 +222,153 @@ fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
     value.as_object_mut().expect("just made it an object")
 }
 
-/// Merge `src` into `dest` in place with the shape-aware rules documented
-/// on `SettingsDoc::merge_top_level`. This is the recursive worker: object
-/// nodes merge key-by-key, arrays accumulate with dedup, everything else
-/// overwrites.
-fn merge_value_in_place(dest: &mut Value, src: Value) {
+/// How a top-level settings key should be combined when its value is moved
+/// from one scope into another that already has the same key. Modelled on
+/// how Claude Code itself reads each key across scopes, so that a move in
+/// ClaudeScope produces an effective config consistent with the documented
+/// semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPolicy {
+    /// Override-only key — Claude Code uses the highest-precedence scope's
+    /// value verbatim. Moving overwrites the destination's existing value.
+    Replace,
+    /// `env` — nested object, deep-merged across scopes by Claude Code, with
+    /// the higher-precedence scope winning on conflicts. Source wins here
+    /// because the move's intent is "make the destination carry this value".
+    DeepMerge,
+    /// Array-valued key whose entries are concatenated and deduplicated
+    /// across scopes (e.g. `allowedHttpHookUrls`).
+    ArrayUnion,
+    /// Known key with complex per-subkey merge semantics that ClaudeScope
+    /// doesn't model yet (currently `sandbox`). Replace-with-warning so the
+    /// user sees the diff and can decide; structured merge is a follow-up.
+    ReplaceComplex,
+    /// Key not in our known-keys table. Conservative replace-with-warning so
+    /// new Claude Code keys still work but the user is told we don't have a
+    /// documented policy for them.
+    ReplaceUnknown,
+}
+
+/// Documented merge semantics for a top-level Claude Code settings key.
+///
+/// Sourced from the official Claude Code settings reference. The lists of
+/// override-only keys are exhaustive as of the current docs so that real
+/// keys land on `Replace` rather than the `ReplaceUnknown` warning fallback.
+/// Caller note: `permissions` is handled by the per-rule move flow, not the
+/// key-move flow, and is rejected upstream by `validate_move_key`.
+pub fn key_policy(key: &str) -> KeyPolicy {
+    match key {
+        "env" => KeyPolicy::DeepMerge,
+        "allowedHttpHookUrls" | "httpHookAllowedEnvVars" => KeyPolicy::ArrayUnion,
+        "sandbox" => KeyPolicy::ReplaceComplex,
+        k if OVERRIDE_ONLY_KEYS.contains(&k) => KeyPolicy::Replace,
+        _ => KeyPolicy::ReplaceUnknown,
+    }
+}
+
+/// Top-level keys documented as override-only (highest-precedence scope
+/// wins; values are not merged across scopes). Kept as a sorted slice so
+/// future additions stay easy to scan and `contains` is fine at this size.
+const OVERRIDE_ONLY_KEYS: &[&str] = &[
+    "agent",
+    "allowManagedHooksOnly",
+    "allowManagedMcpServersOnly",
+    "allowManagedPermissionRulesOnly",
+    "allowedChannelPlugins",
+    "allowedMcpServers",
+    "alwaysThinkingEnabled",
+    "apiKeyHelper",
+    "attribution",
+    "autoMemoryDirectory",
+    "autoMode",
+    "autoScrollEnabled",
+    "autoUpdatesChannel",
+    "availableModels",
+    "awaySummaryEnabled",
+    "awsAuthRefresh",
+    "awsCredentialExport",
+    "blockedMarketplaces",
+    "channelsEnabled",
+    "cleanupPeriodDays",
+    "companyAnnouncements",
+    "defaultShell",
+    "deniedMcpServers",
+    "disableAllHooks",
+    "disableAutoMode",
+    "disableDeepLinkRegistration",
+    "disableSkillShellExecution",
+    "disabledMcpjsonServers",
+    "editorMode",
+    "effortLevel",
+    "enableAllProjectMcpServers",
+    "enabledMcpjsonServers",
+    "fastModePerSessionOptIn",
+    "feedbackSurveyRate",
+    "fileSuggestion",
+    "forceLoginMethod",
+    "forceLoginOrgUUID",
+    "forceRemoteSettingsRefresh",
+    "hooks",
+    "includeCoAuthoredBy",
+    "includeGitInstructions",
+    "language",
+    "minimumVersion",
+    "model",
+    "modelOverrides",
+    "otelHeadersHelper",
+    "outputStyle",
+    "plansDirectory",
+    "pluginTrustMessage",
+    "prefersReducedMotion",
+    "prUrlTemplate",
+    "respectGitignore",
+    "showClearContextOnPlanAccept",
+    "showThinkingSummaries",
+    "showTurnDuration",
+    "skipWebFetchPreflight",
+    "spinnerTipsEnabled",
+    "spinnerTipsOverride",
+    "spinnerVerbs",
+    "sshConfigs",
+    "statusLine",
+    "strictKnownMarketplaces",
+    "teammateMode",
+    "terminalProgressBarEnabled",
+    "tui",
+    "useAutoModeDuringPlan",
+    "viewMode",
+    "voice",
+    "voiceEnabled",
+    "worktree",
+    "wslInheritsWindowsSettings",
+];
+
+/// Recursive object merge: nested objects merge key-by-key, source wins on
+/// any non-object collision. Used for [`KeyPolicy::DeepMerge`] keys.
+fn deep_merge_in_place(dest: &mut Value, src: Value) {
     match (dest, src) {
         (Value::Object(d), Value::Object(s)) => {
             for (k, v) in s {
-                if let Some(existing) = d.get_mut(&k) {
-                    merge_value_in_place(existing, v);
-                } else {
-                    d.insert(k, v);
+                match d.get_mut(&k) {
+                    Some(existing) => deep_merge_in_place(existing, v),
+                    None => {
+                        d.insert(k, v);
+                    }
                 }
             }
         }
+        (dest_slot, src) => {
+            *dest_slot = src;
+        }
+    }
+}
+
+/// Append items from `src` onto `dest`, skipping any that compare equal to
+/// an existing entry. If either side isn't an array, the source replaces
+/// the destination — `merge_top_level`'s preview note tells the user when
+/// this falls back to overwrite behavior. Used for [`KeyPolicy::ArrayUnion`].
+fn array_union_in_place(dest: &mut Value, src: Value) {
+    match (dest, src) {
         (Value::Array(d), Value::Array(s)) => {
             for item in s {
                 if !d.iter().any(|v| v == &item) {
@@ -427,7 +566,8 @@ mod tests {
     }
 
     #[test]
-    fn merge_top_level_object_merges_keys_new_wins() {
+    fn env_uses_deep_merge_with_source_winning() {
+        assert_eq!(key_policy("env"), KeyPolicy::DeepMerge);
         let mut doc = SettingsDoc::from_value(
             serde_json::json!({"env": {"PATH": "/old", "HOME": "/home/a"}}),
             Indent::Spaces(2),
@@ -440,24 +580,67 @@ mod tests {
     }
 
     #[test]
-    fn merge_top_level_array_appends_and_dedupes() {
+    fn env_deep_merge_recurses_into_nested_objects() {
         let mut doc = SettingsDoc::from_value(
-            serde_json::json!({"hooks": ["PreToolUse", "PostToolUse"]}),
+            serde_json::json!({"env": {"group": {"A": "1", "B": "2"}}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level("env", serde_json::json!({"group": {"B": "new", "C": "3"}}));
+        let group = &doc.get_top_level("env").unwrap()["group"];
+        assert_eq!(group["A"], "1");
+        assert_eq!(group["B"], "new");
+        assert_eq!(group["C"], "3");
+    }
+
+    #[test]
+    fn allowed_http_hook_urls_uses_array_union() {
+        assert_eq!(key_policy("allowedHttpHookUrls"), KeyPolicy::ArrayUnion);
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"allowedHttpHookUrls": ["https://a.example", "https://b.example"]}),
             Indent::Spaces(2),
         );
         doc.merge_top_level(
-            "hooks",
-            serde_json::json!(["PostToolUse", "UserPromptSubmit"]),
+            "allowedHttpHookUrls",
+            serde_json::json!(["https://b.example", "https://c.example"]),
         );
-        let hooks = doc.get_top_level("hooks").unwrap();
         assert_eq!(
-            *hooks,
-            serde_json::json!(["PreToolUse", "PostToolUse", "UserPromptSubmit"])
+            *doc.get_top_level("allowedHttpHookUrls").unwrap(),
+            serde_json::json!([
+                "https://a.example",
+                "https://b.example",
+                "https://c.example"
+            ])
         );
     }
 
     #[test]
-    fn merge_top_level_scalar_overwrites() {
+    fn http_hook_allowed_env_vars_uses_array_union() {
+        assert_eq!(key_policy("httpHookAllowedEnvVars"), KeyPolicy::ArrayUnion);
+    }
+
+    #[test]
+    fn hooks_is_override_only_replace_not_deep_merge() {
+        // Regression: pre-#33, the generic shape-based merge would deep-merge
+        // hooks objects across scopes. Claude Code itself reads hooks
+        // override-only, so a move must replace, not merge.
+        assert_eq!(key_policy("hooks"), KeyPolicy::Replace);
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"hooks": {"PreToolUse": [{"command": "old"}]}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level(
+            "hooks",
+            serde_json::json!({"PostToolUse": [{"command": "new"}]}),
+        );
+        assert_eq!(
+            *doc.get_top_level("hooks").unwrap(),
+            serde_json::json!({"PostToolUse": [{"command": "new"}]})
+        );
+    }
+
+    #[test]
+    fn scalar_keys_replace() {
+        assert_eq!(key_policy("model"), KeyPolicy::Replace);
         let mut doc =
             SettingsDoc::from_value(serde_json::json!({"theme": "dark"}), Indent::Spaces(2));
         doc.merge_top_level("theme", serde_json::json!("light"));
@@ -468,33 +651,70 @@ mod tests {
     }
 
     #[test]
-    fn merge_top_level_inserts_when_missing() {
+    fn missing_destination_inserts_value_unchanged() {
         let mut doc = SettingsDoc::empty();
         doc.merge_top_level("env", serde_json::json!({"A": "1"}));
         assert_eq!(doc.get_top_level("env").unwrap()["A"], "1");
+        let mut doc = SettingsDoc::empty();
+        doc.merge_top_level("hooks", serde_json::json!({"PreToolUse": []}));
+        assert_eq!(
+            *doc.get_top_level("hooks").unwrap(),
+            serde_json::json!({"PreToolUse": []})
+        );
     }
 
     #[test]
-    fn merge_top_level_mismatched_shapes_overwrite() {
-        // Existing is a string, new value is an object — shape mismatch, so
-        // the new value replaces the old one rather than trying to coerce.
-        let mut doc =
-            SettingsDoc::from_value(serde_json::json!({"x": "scalar"}), Indent::Spaces(2));
-        doc.merge_top_level("x", serde_json::json!({"nested": true}));
-        assert_eq!(doc.get_top_level("x").unwrap()["nested"], true);
-    }
-
-    #[test]
-    fn merge_recurses_into_nested_objects() {
+    fn sandbox_uses_replace_complex_pending_structured_merge() {
+        // sandbox has per-subkey merge semantics (some arrays union, some
+        // scalars override) that ClaudeScope doesn't model yet. Until then
+        // the destination is replaced wholesale; the user sees this in the
+        // preview note. See the follow-up issue tracked in commands.rs.
+        assert_eq!(key_policy("sandbox"), KeyPolicy::ReplaceComplex);
         let mut doc = SettingsDoc::from_value(
-            serde_json::json!({"env": {"group": {"A": "1", "B": "2"}}}),
+            serde_json::json!({"sandbox": {"enabled": false, "filesystem": {"allowWrite": ["/old"]}}}),
             Indent::Spaces(2),
         );
-        doc.merge_top_level("env", serde_json::json!({"group": {"B": "new", "C": "3"}}));
-        let group = &doc.get_top_level("env").unwrap()["group"];
-        assert_eq!(group["A"], "1");
-        assert_eq!(group["B"], "new");
-        assert_eq!(group["C"], "3");
+        doc.merge_top_level(
+            "sandbox",
+            serde_json::json!({"enabled": true, "filesystem": {"allowWrite": ["/new"]}}),
+        );
+        assert_eq!(
+            *doc.get_top_level("sandbox").unwrap(),
+            serde_json::json!({"enabled": true, "filesystem": {"allowWrite": ["/new"]}})
+        );
+    }
+
+    #[test]
+    fn unknown_keys_replace_with_warning_policy() {
+        assert_eq!(key_policy("notARealKey"), KeyPolicy::ReplaceUnknown);
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"notARealKey": {"existing": true}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level("notARealKey", serde_json::json!({"new": 1}));
+        assert_eq!(
+            *doc.get_top_level("notARealKey").unwrap(),
+            serde_json::json!({"new": 1})
+        );
+    }
+
+    #[test]
+    fn array_union_falls_back_to_replace_on_shape_mismatch() {
+        // If the destination's existing value isn't an array (corrupted or
+        // hand-edited file), array-union has nothing to append to. Source
+        // replaces — the diff preview shows the user what happened.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"allowedHttpHookUrls": "not-an-array"}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level(
+            "allowedHttpHookUrls",
+            serde_json::json!(["https://a.example"]),
+        );
+        assert_eq!(
+            *doc.get_top_level("allowedHttpHookUrls").unwrap(),
+            serde_json::json!(["https://a.example"])
+        );
     }
 
     #[test]
