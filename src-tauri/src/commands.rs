@@ -607,7 +607,7 @@ fn policy_preview_note(
         }
         KeyPolicy::Sandbox => {
             if to_before.is_object() && src_value.is_object() {
-                "Sandbox structured merge: a fixed set of documented array paths (e.g. `filesystem.allowWrite`, `network.allowedDomains`, `excludedCommands`) are concatenated and deduplicated; every other field — including arrays not in that schema — is overwritten by the source.".to_string()
+                "Sandbox structured merge: a fixed set of documented array paths (e.g. `filesystem.allowWrite`, `network.allowedDomains`, `excludedCommands`) are concatenated and deduplicated when both sides are arrays (otherwise that leaf is replaced); every other field — including arrays not in that schema — is overwritten by the source.".to_string()
             } else {
                 "Sandbox structured merge, but the destination or source value is not a JSON object — the destination's value will be replaced instead. The original is saved to a .bak alongside the file.".to_string()
             }

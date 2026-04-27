@@ -919,6 +919,26 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_array_union_leaves_replace_on_leaf_shape_mismatch() {
+        // A documented array-union path (filesystem.allowWrite) where one
+        // side isn't an array — e.g. hand-edited file that left a string
+        // there — falls back to leaf replacement via array_union_in_place's
+        // shape-mismatch path. The preview note now documents this caveat.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"sandbox": {"filesystem": {"allowWrite": "broken-string"}}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level(
+            "sandbox",
+            serde_json::json!({"filesystem": {"allowWrite": ["/src"]}}),
+        );
+        assert_eq!(
+            *doc.get_top_level("sandbox").unwrap(),
+            serde_json::json!({"filesystem": {"allowWrite": ["/src"]}})
+        );
+    }
+
+    #[test]
     fn sandbox_falls_back_to_replace_on_shape_mismatch() {
         // Hand-edited file where sandbox ended up as a string. The
         // structured walker can't recurse into a non-object; source replaces.
