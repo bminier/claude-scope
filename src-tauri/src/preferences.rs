@@ -10,9 +10,10 @@
 //! user-visible surface (the settings modal) should still open on a broken
 //! or first-run config, not error out.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::scope::Scope;
 
@@ -21,10 +22,15 @@ use crate::scope::Scope;
 /// schema can evolve without forcing a migration on every launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preferences {
-    /// Scope columns the user wants visible. Defaults to all four. An empty
-    /// list is tolerated but renders an empty grid — the UI guards against
-    /// that separately by keeping at least one checkbox visually ticked.
-    #[serde(default = "default_visible_scopes")]
+    /// Scope columns the user wants visible. Defaults to all four. The
+    /// deserialize hook normalizes any incoming list (dedup, canonical
+    /// ordering, fall back to the default when empty) so a hand-edited or
+    /// older buggy config file can't push the app into a state the UI
+    /// can't recover from.
+    #[serde(
+        default = "default_visible_scopes",
+        deserialize_with = "deserialize_visible_scopes"
+    )]
     pub visible_scopes: Vec<Scope>,
 }
 
@@ -38,6 +44,32 @@ impl Default for Preferences {
 
 fn default_visible_scopes() -> Vec<Scope> {
     Scope::ALL.to_vec()
+}
+
+/// Normalize a `visible_scopes` list: dedupe, reorder to match `Scope::ALL`,
+/// and fall back to the default when nothing remains. Splitting this out of
+/// the serde hook keeps it usable from in-process code paths too if a
+/// future caller constructs `Preferences` by hand.
+fn normalize_visible_scopes(input: Vec<Scope>) -> Vec<Scope> {
+    let set: HashSet<Scope> = input.into_iter().collect();
+    let ordered: Vec<Scope> = Scope::ALL
+        .iter()
+        .copied()
+        .filter(|s| set.contains(s))
+        .collect();
+    if ordered.is_empty() {
+        default_visible_scopes()
+    } else {
+        ordered
+    }
+}
+
+fn deserialize_visible_scopes<'de, D>(deserializer: D) -> Result<Vec<Scope>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Vec::<Scope>::deserialize(deserializer)?;
+    Ok(normalize_visible_scopes(raw))
 }
 
 /// Resolve the on-disk path for the config file. `None` when the OS couldn't
@@ -114,6 +146,30 @@ mod tests {
         let prefs: Preferences =
             serde_json::from_str(r#"{"visible_scopes":["project","user"]}"#).unwrap();
         assert_eq!(prefs.visible_scopes, vec![Scope::Project, Scope::User]);
+    }
+
+    #[test]
+    fn empty_visible_scopes_falls_back_to_default() {
+        // A hand-edited or stale config that explicitly persists an empty
+        // list shouldn't strand the app in an empty-grid state.
+        let prefs: Preferences = serde_json::from_str(r#"{"visible_scopes":[]}"#).unwrap();
+        assert_eq!(prefs.visible_scopes, default_visible_scopes());
+    }
+
+    #[test]
+    fn duplicate_visible_scopes_are_deduped() {
+        let prefs: Preferences =
+            serde_json::from_str(r#"{"visible_scopes":["project","project","user"]}"#).unwrap();
+        assert_eq!(prefs.visible_scopes, vec![Scope::Project, Scope::User]);
+    }
+
+    #[test]
+    fn visible_scopes_load_in_canonical_order() {
+        // Input order is reversed; the loader should reorder to Scope::ALL.
+        let prefs: Preferences =
+            serde_json::from_str(r#"{"visible_scopes":["user","user_local","project","local"]}"#)
+                .unwrap();
+        assert_eq!(prefs.visible_scopes, Scope::ALL.to_vec());
     }
 
     #[test]
