@@ -344,7 +344,11 @@ const OVERRIDE_ONLY_KEYS: &[&str] = &[
 ];
 
 /// Recursive object merge: nested objects merge key-by-key, source wins on
-/// any non-object collision. Used for [`KeyPolicy::DeepMerge`] keys.
+/// any non-object collision. Used for [`KeyPolicy::DeepMerge`] keys. If
+/// either side isn't an object the source replaces the destination outright;
+/// the move flow's preview note inspects the runtime shapes (see
+/// `policy_preview_note` in `commands.rs`) so the user is warned ahead of
+/// time when this fallback applies.
 fn deep_merge_in_place(dest: &mut Value, src: Value) {
     match (dest, src) {
         (Value::Object(d), Value::Object(s)) => {
@@ -364,9 +368,11 @@ fn deep_merge_in_place(dest: &mut Value, src: Value) {
 }
 
 /// Append items from `src` onto `dest`, skipping any that compare equal to
-/// an existing entry. If either side isn't an array, the source replaces
-/// the destination — `merge_top_level`'s preview note tells the user when
-/// this falls back to overwrite behavior. Used for [`KeyPolicy::ArrayUnion`].
+/// an existing entry. Used for [`KeyPolicy::ArrayUnion`]. If either side
+/// isn't an array the source replaces the destination outright; the move
+/// flow's preview note inspects the runtime shapes (see `policy_preview_note`
+/// in `commands.rs`) so the user is warned ahead of time when this fallback
+/// applies.
 fn array_union_in_place(dest: &mut Value, src: Value) {
     match (dest, src) {
         (Value::Array(d), Value::Array(s)) => {
@@ -695,6 +701,23 @@ mod tests {
         assert_eq!(
             *doc.get_top_level("notARealKey").unwrap(),
             serde_json::json!({"new": 1})
+        );
+    }
+
+    #[test]
+    fn deep_merge_falls_back_to_replace_on_shape_mismatch() {
+        // If the destination's existing value isn't an object (corrupted or
+        // hand-edited file), deep-merge has nothing to recurse into. Source
+        // replaces — the diff preview note flags this so the user isn't
+        // surprised.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"env": "not-an-object"}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level("env", serde_json::json!({"A": "1"}));
+        assert_eq!(
+            *doc.get_top_level("env").unwrap(),
+            serde_json::json!({"A": "1"})
         );
     }
 

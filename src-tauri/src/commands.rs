@@ -460,10 +460,10 @@ fn diff_move_key_impl(
         )
     } else if !to_path_exists {
         Some("Destination file will be created.".to_string())
-    } else if to_before.is_some() {
-        Some(policy_preview_note(&req.key))
     } else {
-        None
+        to_before
+            .as_ref()
+            .map(|before| policy_preview_note(&req.key, before, &src_value))
     };
 
     Ok(MoveKeyPreview {
@@ -577,11 +577,34 @@ fn apply_move_key_impl(
 /// be combined with the incoming source value, given the documented merge
 /// policy for `key`. Shown in the diff preview so the user can confirm
 /// before applying the move.
-fn policy_preview_note(key: &str) -> String {
+///
+/// `to_before` and `src_value` are inspected so that `DeepMerge` /
+/// `ArrayUnion` keys whose runtime shapes don't match the policy (e.g. a
+/// hand-edited file where `allowedHttpHookUrls` ended up as a string) get
+/// an accurate "will be replaced instead" message rather than the nominal
+/// merge description. The model layer's own fallback to overwrite on shape
+/// mismatch then matches what the preview promised.
+fn policy_preview_note(
+    key: &str,
+    to_before: &serde_json::Value,
+    src_value: &serde_json::Value,
+) -> String {
     match key_policy(key) {
         KeyPolicy::Replace => "Override-only key: the destination's previous value will be replaced. The original is saved to a .bak alongside the file.".to_string(),
-        KeyPolicy::DeepMerge => "Deep-merged key: source values override destination values on conflict; other destination keys are preserved.".to_string(),
-        KeyPolicy::ArrayUnion => "Array-union key: source items are appended to the destination and deduplicated.".to_string(),
+        KeyPolicy::DeepMerge => {
+            if to_before.is_object() && src_value.is_object() {
+                "Deep-merged key: source values override destination values on conflict; other destination keys are preserved.".to_string()
+            } else {
+                "Deep-merged key, but the destination or source value is not a JSON object — the destination's value will be replaced instead. The original is saved to a .bak alongside the file.".to_string()
+            }
+        }
+        KeyPolicy::ArrayUnion => {
+            if to_before.is_array() && src_value.is_array() {
+                "Array-union key: source items are appended to the destination and deduplicated.".to_string()
+            } else {
+                "Array-union key, but the destination or source value is not a JSON array — the destination's value will be replaced instead. The original is saved to a .bak alongside the file.".to_string()
+            }
+        }
         KeyPolicy::ReplaceComplex => "Complex per-subkey merge semantics not yet implemented; the destination's value will be replaced wholesale. The original is saved to a .bak alongside the file. Review the diff carefully.".to_string(),
         KeyPolicy::ReplaceUnknown => "Unknown key — ClaudeScope has no documented merge policy for it. The destination's value will be replaced. The original is saved to a .bak alongside the file. Review the diff carefully.".to_string(),
     }
@@ -1260,6 +1283,95 @@ mod tests {
                 "https://a.example"
             ])
         );
+    }
+
+    #[test]
+    fn preview_note_for_replace_keys_calls_out_override_only() {
+        let note = policy_preview_note(
+            "hooks",
+            &serde_json::json!({"PreToolUse": []}),
+            &serde_json::json!({"PostToolUse": []}),
+        );
+        assert!(
+            note.contains("Override-only"),
+            "expected override-only language for hooks, got: {note}"
+        );
+        assert!(note.contains(".bak"));
+    }
+
+    #[test]
+    fn preview_note_for_deep_merge_uses_merge_language_when_shapes_match() {
+        let note = policy_preview_note(
+            "env",
+            &serde_json::json!({"A": "1"}),
+            &serde_json::json!({"B": "2"}),
+        );
+        assert!(note.contains("Deep-merged"));
+        assert!(note.contains("source values override"));
+    }
+
+    #[test]
+    fn preview_note_for_deep_merge_warns_on_shape_mismatch() {
+        // Hand-edited file where env ended up as a string. The nominal
+        // policy is DeepMerge, but the model layer falls back to replace
+        // and the preview must say so.
+        let note = policy_preview_note(
+            "env",
+            &serde_json::json!("oops-not-an-object"),
+            &serde_json::json!({"A": "1"}),
+        );
+        assert!(
+            note.contains("not a JSON object"),
+            "expected shape-mismatch warning, got: {note}"
+        );
+        assert!(note.contains("replaced instead"));
+    }
+
+    #[test]
+    fn preview_note_for_array_union_uses_union_language_when_shapes_match() {
+        let note = policy_preview_note(
+            "allowedHttpHookUrls",
+            &serde_json::json!(["https://a.example"]),
+            &serde_json::json!(["https://b.example"]),
+        );
+        assert!(note.contains("Array-union"));
+        assert!(note.contains("appended"));
+    }
+
+    #[test]
+    fn preview_note_for_array_union_warns_on_shape_mismatch() {
+        let note = policy_preview_note(
+            "allowedHttpHookUrls",
+            &serde_json::json!("not-an-array"),
+            &serde_json::json!(["https://b.example"]),
+        );
+        assert!(
+            note.contains("not a JSON array"),
+            "expected shape-mismatch warning, got: {note}"
+        );
+        assert!(note.contains("replaced instead"));
+    }
+
+    #[test]
+    fn preview_note_for_sandbox_calls_out_complex_semantics() {
+        let note = policy_preview_note(
+            "sandbox",
+            &serde_json::json!({"enabled": false}),
+            &serde_json::json!({"enabled": true}),
+        );
+        assert!(note.contains("Complex"));
+        assert!(note.contains("replaced"));
+    }
+
+    #[test]
+    fn preview_note_for_unknown_key_warns_user() {
+        let note = policy_preview_note(
+            "notARealKey",
+            &serde_json::json!({"a": 1}),
+            &serde_json::json!({"b": 2}),
+        );
+        assert!(note.contains("Unknown key"));
+        assert!(note.contains("replaced"));
     }
 
     #[test]
