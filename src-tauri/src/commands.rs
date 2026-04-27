@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::io_atomic::{self, BackupTracker};
-use crate::model::{PermissionKind, PermissionRules, SettingsDoc};
+use crate::model::{key_policy, KeyPolicy, PermissionKind, PermissionRules, SettingsDoc};
 use crate::preferences::{self, Preferences};
 use crate::scope::{self, Scope, ScopePaths};
 use crate::watcher::WatchState;
@@ -460,13 +460,10 @@ fn diff_move_key_impl(
         )
     } else if !to_path_exists {
         Some("Destination file will be created.".to_string())
-    } else if to_before.is_some() {
-        Some(
-            "Destination already has this key; values will be merged with a generic shape-based policy. Review the diff before applying."
-                .to_string(),
-        )
     } else {
-        None
+        to_before
+            .as_ref()
+            .map(|before| policy_preview_note(&req.key, before, &src_value))
     };
 
     Ok(MoveKeyPreview {
@@ -574,6 +571,43 @@ fn apply_move_key_impl(
     }
     watch.note_self_write(&from_path);
     Ok(())
+}
+
+/// Human-readable note explaining how the destination's existing value will
+/// be combined with the incoming source value, given the documented merge
+/// policy for `key`. Shown in the diff preview so the user can confirm
+/// before applying the move.
+///
+/// `to_before` and `src_value` are inspected so that `DeepMerge` /
+/// `ArrayUnion` keys whose runtime shapes don't match the policy (e.g. a
+/// hand-edited file where `allowedHttpHookUrls` ended up as a string) get
+/// an accurate "will be replaced instead" message rather than the nominal
+/// merge description. The model layer's own fallback to overwrite on shape
+/// mismatch then matches what the preview promised.
+fn policy_preview_note(
+    key: &str,
+    to_before: &serde_json::Value,
+    src_value: &serde_json::Value,
+) -> String {
+    match key_policy(key) {
+        KeyPolicy::Replace => "Override-only key: the destination's previous value will be replaced. The original is saved to a .bak alongside the file.".to_string(),
+        KeyPolicy::DeepMerge => {
+            if to_before.is_object() && src_value.is_object() {
+                "Deep-merged key: source values override destination values on conflict; other destination keys are preserved.".to_string()
+            } else {
+                "Deep-merged key, but the destination or source value is not a JSON object — the destination's value will be replaced instead. The original is saved to a .bak alongside the file.".to_string()
+            }
+        }
+        KeyPolicy::ArrayUnion => {
+            if to_before.is_array() && src_value.is_array() {
+                "Array-union key: source items are appended to the destination and deduplicated.".to_string()
+            } else {
+                "Array-union key, but the destination or source value is not a JSON array — the destination's value will be replaced instead. The original is saved to a .bak alongside the file.".to_string()
+            }
+        }
+        KeyPolicy::ReplaceComplex => "Complex per-subkey merge semantics not yet implemented; the destination's value will be replaced wholesale. The original is saved to a .bak alongside the file. Review the diff carefully.".to_string(),
+        KeyPolicy::ReplaceUnknown => "Unknown key — ClaudeScope has no documented merge policy for it. The destination's value will be replaced. The original is saved to a .bak alongside the file. Review the diff carefully.".to_string(),
+    }
 }
 
 fn validate_move_key(req: &MoveKeyRequest) -> Result<(), Box<dyn std::error::Error>> {
@@ -1212,16 +1246,149 @@ mod tests {
     }
 
     #[test]
-    fn move_key_dedupes_hook_arrays() {
+    fn move_key_dedupes_array_union_keys() {
+        // allowedHttpHookUrls is a documented array-union key: entries from
+        // every scope are concatenated and deduplicated. Moving from project
+        // into user with overlap should yield the destination's entries
+        // followed by the source's, with the duplicate dropped.
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());
         write(
             paths.project.as_ref().unwrap(),
-            r#"{"hooks": ["PreToolUse", "PostToolUse"]}"#,
+            r#"{"allowedHttpHookUrls": ["https://a.example", "https://b.example"]}"#,
         );
         write(
             paths.user.as_ref().unwrap(),
-            r#"{"hooks": ["PostToolUse", "UserPromptSubmit"]}"#,
+            r#"{"allowedHttpHookUrls": ["https://b.example", "https://c.example"]}"#,
+        );
+        apply_move_key_impl(
+            &paths,
+            &MoveKeyRequest {
+                key: "allowedHttpHookUrls".to_string(),
+                from: Scope::Project,
+                to: Scope::User,
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+        let user_doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            user_doc.get_top_level("allowedHttpHookUrls").unwrap(),
+            &serde_json::json!([
+                "https://b.example",
+                "https://c.example",
+                "https://a.example"
+            ])
+        );
+    }
+
+    #[test]
+    fn preview_note_for_replace_keys_calls_out_override_only() {
+        let note = policy_preview_note(
+            "hooks",
+            &serde_json::json!({"PreToolUse": []}),
+            &serde_json::json!({"PostToolUse": []}),
+        );
+        assert!(
+            note.contains("Override-only"),
+            "expected override-only language for hooks, got: {note}"
+        );
+        assert!(note.contains(".bak"));
+    }
+
+    #[test]
+    fn preview_note_for_deep_merge_uses_merge_language_when_shapes_match() {
+        let note = policy_preview_note(
+            "env",
+            &serde_json::json!({"A": "1"}),
+            &serde_json::json!({"B": "2"}),
+        );
+        assert!(note.contains("Deep-merged"));
+        assert!(note.contains("source values override"));
+    }
+
+    #[test]
+    fn preview_note_for_deep_merge_warns_on_shape_mismatch() {
+        // Hand-edited file where env ended up as a string. The nominal
+        // policy is DeepMerge, but the model layer falls back to replace
+        // and the preview must say so.
+        let note = policy_preview_note(
+            "env",
+            &serde_json::json!("oops-not-an-object"),
+            &serde_json::json!({"A": "1"}),
+        );
+        assert!(
+            note.contains("not a JSON object"),
+            "expected shape-mismatch warning, got: {note}"
+        );
+        assert!(note.contains("replaced instead"));
+    }
+
+    #[test]
+    fn preview_note_for_array_union_uses_union_language_when_shapes_match() {
+        let note = policy_preview_note(
+            "allowedHttpHookUrls",
+            &serde_json::json!(["https://a.example"]),
+            &serde_json::json!(["https://b.example"]),
+        );
+        assert!(note.contains("Array-union"));
+        assert!(note.contains("appended"));
+    }
+
+    #[test]
+    fn preview_note_for_array_union_warns_on_shape_mismatch() {
+        let note = policy_preview_note(
+            "allowedHttpHookUrls",
+            &serde_json::json!("not-an-array"),
+            &serde_json::json!(["https://b.example"]),
+        );
+        assert!(
+            note.contains("not a JSON array"),
+            "expected shape-mismatch warning, got: {note}"
+        );
+        assert!(note.contains("replaced instead"));
+    }
+
+    #[test]
+    fn preview_note_for_sandbox_calls_out_complex_semantics() {
+        let note = policy_preview_note(
+            "sandbox",
+            &serde_json::json!({"enabled": false}),
+            &serde_json::json!({"enabled": true}),
+        );
+        assert!(note.contains("Complex"));
+        assert!(note.contains("replaced"));
+    }
+
+    #[test]
+    fn preview_note_for_unknown_key_warns_user() {
+        let note = policy_preview_note(
+            "notARealKey",
+            &serde_json::json!({"a": 1}),
+            &serde_json::json!({"b": 2}),
+        );
+        assert!(note.contains("Unknown key"));
+        assert!(note.contains("replaced"));
+    }
+
+    #[test]
+    fn move_key_replaces_override_only_hooks() {
+        // hooks is override-only per Claude Code's docs: the highest-precedence
+        // scope wins, scopes are not merged. Moving hooks from project into
+        // user must overwrite the destination's existing hooks block, not
+        // merge into it.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"hooks": {"PreToolUse": [{"command": "from-project"}]}}"#,
+        );
+        write(
+            paths.user.as_ref().unwrap(),
+            r#"{"hooks": {"PostToolUse": [{"command": "from-user"}]}}"#,
         );
         apply_move_key_impl(
             &paths,
@@ -1239,7 +1406,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             user_doc.get_top_level("hooks").unwrap(),
-            &serde_json::json!(["PostToolUse", "UserPromptSubmit", "PreToolUse"])
+            &serde_json::json!({"PreToolUse": [{"command": "from-project"}]})
         );
     }
 }
