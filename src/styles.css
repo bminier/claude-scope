@@ -175,30 +175,37 @@ button:disabled {
   color: var(--muted);
 }
 
-.effective {
+.combined {
   padding: 12px 16px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
 }
 
-.effective h2 {
-  margin: 0 0 8px 0;
+.combined h2 {
+  margin: 0;
   font-size: 13px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--muted);
 }
 
+.combined-subtitle {
+  margin: 2px 0 8px 0;
+  font-size: 11px;
+  color: var(--muted);
+  font-style: italic;
+}
+
 /* Three side-by-side group columns. Mirrors `.grid` below so the
    breakpoint behavior stays in lockstep — both collapse to a single
    column at the same viewport width. */
-.eff-groups {
+.combo-groups {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 12px;
 }
 
-.eff-group {
+.combo-group {
   display: flex;
   flex-direction: column;
   align-items: stretch;
@@ -210,7 +217,7 @@ button:disabled {
      allow list pushes the scope grid below the fold, which is acceptable. */
 }
 
-.eff-label {
+.combo-label {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -218,13 +225,13 @@ button:disabled {
   padding-bottom: 2px;
 }
 
-.eff-allow .eff-label {
+.combo-allow .combo-label {
   color: var(--allow);
 }
-.eff-deny .eff-label {
+.combo-deny .combo-label {
   color: var(--deny);
 }
-.eff-ask .eff-label {
+.combo-ask .combo-label {
   color: var(--ask);
 }
 
@@ -662,7 +669,7 @@ button:disabled {
 }
 
 /* Keeps the chip + ⚠ badge together as a single flex item inside
-   `.eff-group`; without this they can wrap to separate lines and orphan
+   `.combo-group`; without this they can wrap to separate lines and orphan
    the warning. */
 .chip-wrap {
   display: inline-flex;

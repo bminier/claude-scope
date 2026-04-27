@@ -103,9 +103,9 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   }
 
   // Lowercase the query once per render instead of per rule; scopeGrid/
-  // effectivePanel push this down into every filter call.
+  // combinedPanel push this down into every filter call.
   const lowerQuery = props.query.toLowerCase();
-  root.appendChild(effectivePanel(props.scopes, props.query, lowerQuery));
+  root.appendChild(combinedPanel(props.scopes, props.query, lowerQuery));
   root.appendChild(scopeGrid(props, lowerQuery));
   restoreSearchFocus(preserveSearchFocus, caret);
 }
@@ -213,29 +213,33 @@ function searchBox(props: AppProps): HTMLElement {
   return wrap;
 }
 
-function effectivePanel(loaded: LoadedScopes, query: string, lowerQuery: string): HTMLElement {
+function combinedPanel(loaded: LoadedScopes, query: string, lowerQuery: string): HTMLElement {
   const panel = document.createElement("section");
-  panel.className = "effective";
+  panel.className = "combined";
   const title = document.createElement("h2");
-  title.textContent = "Effective permissions";
+  title.textContent = "Combined permissions";
   panel.appendChild(title);
+  const subtitle = document.createElement("p");
+  subtitle.className = "combined-subtitle";
+  subtitle.textContent = "Union across scopes — not a precedence-aware evaluation.";
+  panel.appendChild(subtitle);
 
   // Three side-by-side group columns instead of stacked rows. The grid
   // mirrors the scope-grid breakpoint below (auto-fit + minmax) so the
   // panel collapses to a single column on narrow viewports in lockstep
   // with the rest of the layout.
   const groupsWrap = document.createElement("div");
-  groupsWrap.className = "eff-groups";
+  groupsWrap.className = "combo-groups";
 
   const kinds: PermissionKind[] = ["allow", "deny", "ask"];
   for (const kind of kinds) {
-    const all = loaded.effective_permissions[kind];
+    const all = loaded.combined_permissions[kind];
     // Fast path when the filter is empty — no allocation, no iteration.
     const matched = lowerQuery === "" ? all : all.filter((r) => matchesLoweredQuery(r, lowerQuery));
     const group = document.createElement("div");
-    group.className = `eff-group eff-${kind}`;
+    group.className = `combo-group combo-${kind}`;
     const label = document.createElement("span");
-    label.className = "eff-label";
+    label.className = "combo-label";
     // Show matched/total when a filter is active AND the group isn't empty —
     // otherwise "(0/0)" reads as noise. Unfiltered groups and empty groups
     // fall back to the plain "(N)" format.
@@ -246,7 +250,7 @@ function effectivePanel(loaded: LoadedScopes, query: string, lowerQuery: string)
     group.appendChild(label);
     for (const rule of matched) {
       // Chip + optional badge wrap as a single flex item. Originally added
-      // because `.eff-group` used `flex-wrap: wrap` (badges could orphan to
+      // because `.combo-group` used `flex-wrap: wrap` (badges could orphan to
       // a new line without their chip); the group is now a vertical stack,
       // but the wrap still keeps badge + chip baseline-aligned and lets the
       // hover popover anchor relative to the pair.

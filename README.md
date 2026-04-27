@@ -13,7 +13,7 @@ Claude Code reads settings from JSON files at several scopes. Moving a permissio
 
 ### Features
 
-- **Four-column scope view** — User / User-Local / Project / Local, laid out broadest-on-the-left, with a panel above them currently labelled "Effective permissions" in the UI. That panel is a union across scopes; it is not a full precedence-aware evaluation of what Claude Code resolves at runtime. The label is being walked back as part of [#30](https://github.com/bminier/claude-scope/issues/30).
+- **Four-column scope view** — User / User-Local / Project / Local, laid out broadest-on-the-left, with a "Combined permissions" panel above them. That panel is a union across scopes; it is not a full precedence-aware evaluation of what Claude Code resolves at runtime, and the subtitle says so.
 - **Atomic writes with revalidation** — serialize → re-parse the produced JSON → tempfile + rename, with one-shot `.bak` backup per file per session. See [Write strategy](#write-strategy) for the fine print.
 - **Diff preview modal** — shows before/after for both sides of a move with a proper diff, Esc/Enter/Tab-trap keyboard handling, focus restored to the triggering button on close
 - **Rule search / filter** — press `/` anywhere to focus, case-insensitive substring, `m/n` match counts per group

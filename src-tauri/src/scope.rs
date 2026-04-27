@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn scope_all_includes_user_local_between_project_and_user() {
         // Precedence: highest first. UserLocal sits above User so that the
-        // effective-permissions union iterates in the right order.
+        // combined-permissions union iterates in the right order.
         assert_eq!(
             Scope::ALL,
             [Scope::Local, Scope::Project, Scope::UserLocal, Scope::User]
