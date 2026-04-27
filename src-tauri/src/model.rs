@@ -427,15 +427,22 @@ pub(crate) const SANDBOX_SCHEMA: &[&str] = &[
 ];
 
 /// Merge a `sandbox` object using the documented per-subkey semantics in
-/// [`SANDBOX_SCHEMA`]: array fields under the listed paths are unioned;
-/// every other leaf (scalars, objects not listed in the schema, unknown
-/// subkeys) is replaced by the source. Used for [`KeyPolicy::Sandbox`].
+/// [`SANDBOX_SCHEMA`]. Used for [`KeyPolicy::Sandbox`].
 ///
-/// If either side isn't an object — e.g. a hand-edited file where
-/// `sandbox` ended up as a string — the source replaces the destination
-/// outright. The move flow's preview note inspects the runtime shapes (see
-/// `policy_preview_note` in `commands.rs`) so the user is warned ahead of
-/// time when that fallback applies.
+/// At each key, the walker dispatches in this order:
+/// - If both sides are objects, recurse into them. Object subtrees always
+///   recurse regardless of whether their dotted path appears in the schema —
+///   the schema describes leaves, not branches.
+/// - Else if the dotted path matches an entry in [`SANDBOX_SCHEMA`], the
+///   leaf goes through [`array_union_in_place`].
+/// - Else the destination's leaf is replaced by the source's value.
+/// - Subkeys present only on the source are inserted as-is.
+///
+/// If either side at the top level isn't an object — e.g. a hand-edited
+/// file where `sandbox` ended up as a string — the source replaces the
+/// destination outright. The move flow's preview note inspects the runtime
+/// shapes (see `policy_preview_note` in `commands.rs`) so the user is
+/// warned ahead of time when that fallback applies.
 fn sandbox_merge_in_place(dest: &mut Value, src: Value) {
     if !dest.is_object() || !src.is_object() {
         *dest = src;
@@ -871,6 +878,43 @@ mod tests {
                 "enabled": true,
                 "network": {"allowedDomains": ["github.com"]}
             })
+        );
+    }
+
+    #[test]
+    fn sandbox_replaces_arrays_not_in_schema() {
+        // Only the dotted paths listed in SANDBOX_SCHEMA union — an
+        // arbitrary array under filesystem.* (or anywhere else) that isn't
+        // in the schema must replace, not union, so the preview note
+        // doesn't overpromise. Regression test for PR review on #84.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"sandbox": {"filesystem": {"unknownArrayField": ["dest"]}}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level(
+            "sandbox",
+            serde_json::json!({"filesystem": {"unknownArrayField": ["src"]}}),
+        );
+        assert_eq!(
+            *doc.get_top_level("sandbox").unwrap(),
+            serde_json::json!({"filesystem": {"unknownArrayField": ["src"]}})
+        );
+    }
+
+    #[test]
+    fn sandbox_recurses_into_nested_objects_outside_schema() {
+        // Object subtrees always recurse when both sides are objects, even
+        // when the path isn't in SANDBOX_SCHEMA (the schema describes
+        // leaves, not branches). A scalar inside the unknown subtree should
+        // still replace at the leaf, but sibling keys must survive.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"sandbox": {"futureFeature": {"a": 1, "b": 2}}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level("sandbox", serde_json::json!({"futureFeature": {"b": 99}}));
+        assert_eq!(
+            *doc.get_top_level("sandbox").unwrap(),
+            serde_json::json!({"futureFeature": {"a": 1, "b": 99}})
         );
     }
 
