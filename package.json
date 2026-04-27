@@ -18,9 +18,9 @@
     "@tauri-apps/plugin-dialog": "^2.2.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.4.12",
+    "@biomejs/biome": "2.4.13",
     "@tauri-apps/cli": "^2.3.0",
     "typescript": "^6.0.3",
-    "vite": "^8.0.9"
+    "vite": "^8.0.10"
   }
 }
