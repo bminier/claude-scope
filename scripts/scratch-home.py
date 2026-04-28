@@ -28,8 +28,8 @@ preserves anything else under `<dest>` (your hand-edits, .bak trail from
 the last run, etc.). Pass `--force` to wipe `<dest>/.claude` and
 `<dest>/project/.claude` before reseeding.
 
-Why Python: Brian's global preference is portable scripts so the same file
-runs on Windows / macOS / Linux without dragging shell quirks into the repo.
+Why Python: keeps the script portable so the same file runs on
+Windows / macOS / Linux without dragging shell quirks into the repo.
 """
 
 from __future__ import annotations

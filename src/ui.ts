@@ -144,7 +144,11 @@ function sandboxBanner(runtime: RuntimeInfo): HTMLElement | null {
   if (!runtime.home_override && !runtime.project_override) return null;
   const banner = document.createElement("div");
   banner.className = "sandbox-banner";
-  banner.setAttribute("role", "status");
+  // `role="note"` (not "status"): the banner is supplementary context,
+  // not a live status update. renderApp wipes the DOM on every keystroke,
+  // so a polite live region (which "status" implies) would re-announce
+  // the same scratch-mode message to screen readers on every render.
+  banner.setAttribute("role", "note");
 
   const label = document.createElement("strong");
   label.textContent = "Sandbox mode";
