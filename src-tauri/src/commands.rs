@@ -38,6 +38,21 @@ pub struct LoadedScopes {
     pub project_dir: String,
     pub scopes: Vec<ScopeView>,
     pub combined_permissions: PermissionRules,
+    /// Parallel to `combined_permissions`: for each rule in
+    /// `allow`/`deny`/`ask`, the list of scopes that contribute that rule, in
+    /// precedence order (highest first). Drives the front-end's
+    /// scope-origin tooltip on combined rule rows.
+    pub combined_origins: PermissionRuleOrigins,
+}
+
+/// Per-rule provenance for the combined permissions view: for each rule in
+/// the parallel `PermissionRules` array (same kind, same index), the scopes
+/// that contributed it, in precedence order.
+#[derive(Debug, Default, Serialize)]
+pub struct PermissionRuleOrigins {
+    pub allow: Vec<Vec<Scope>>,
+    pub deny: Vec<Vec<Scope>>,
+    pub ask: Vec<Vec<Scope>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,12 +212,13 @@ fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::
         views.push(load_scope_view(scope, paths.path_for(scope)));
     }
 
-    let combined = combined_permissions(&views);
+    let (combined, origins) = combined_permissions(&views);
 
     Ok(LoadedScopes {
         project_dir: paths.project_dir.display().to_string(),
         scopes: views,
         combined_permissions: combined,
+        combined_origins: origins,
     })
 }
 
@@ -244,26 +260,56 @@ fn load_scope_view(scope: Scope, path: Option<&Path>) -> ScopeView {
 /// what the panel shows; modelling Claude Code's full conflict semantics is
 /// out of scope for v1 and would require grammar Claude Code does not
 /// publicly document.
-fn combined_permissions(views: &[ScopeView]) -> PermissionRules {
-    let mut out = PermissionRules::default();
+fn combined_permissions(views: &[ScopeView]) -> (PermissionRules, PermissionRuleOrigins) {
+    let mut rules = PermissionRules::default();
+    let mut origins = PermissionRuleOrigins::default();
+    // `views` is built from `Scope::ALL`, which iterates in precedence order
+    // (highest first), so an `origins` Vec built by appending in iteration
+    // order naturally lists contributing scopes highest-first too — matching
+    // the tooltip's documented order.
     for view in views {
-        for rule in &view.permissions.allow {
-            if !out.allow.iter().any(|r| r == rule) {
-                out.allow.push(rule.clone());
+        accumulate(
+            &view.permissions.allow,
+            view.scope,
+            &mut rules.allow,
+            &mut origins.allow,
+        );
+        accumulate(
+            &view.permissions.deny,
+            view.scope,
+            &mut rules.deny,
+            &mut origins.deny,
+        );
+        accumulate(
+            &view.permissions.ask,
+            view.scope,
+            &mut rules.ask,
+            &mut origins.ask,
+        );
+    }
+    (rules, origins)
+}
+
+fn accumulate(
+    incoming: &[String],
+    scope: Scope,
+    out_rules: &mut Vec<String>,
+    out_origins: &mut Vec<Vec<Scope>>,
+) {
+    for rule in incoming {
+        if let Some(existing) = out_rules.iter().position(|r| r == rule) {
+            // Guard against the same scope file listing the rule twice
+            // (legal JSON, possible after hand-editing): without this check
+            // the tooltip would render "Local, Local, User" instead of
+            // "Local, User". `contains` is O(scopes) and scopes maxes at 4.
+            if !out_origins[existing].contains(&scope) {
+                out_origins[existing].push(scope);
             }
-        }
-        for rule in &view.permissions.deny {
-            if !out.deny.iter().any(|r| r == rule) {
-                out.deny.push(rule.clone());
-            }
-        }
-        for rule in &view.permissions.ask {
-            if !out.ask.iter().any(|r| r == rule) {
-                out.ask.push(rule.clone());
-            }
+        } else {
+            out_rules.push(rule.clone());
+            out_origins.push(vec![scope]);
         }
     }
-    out
 }
 
 fn diff_move_impl(
@@ -1058,7 +1104,7 @@ mod tests {
                 parse_error: None,
             },
         ];
-        let combined = combined_permissions(&views);
+        let (combined, _origins) = combined_permissions(&views);
         assert_eq!(combined.allow, vec!["Bash(git status)", "Read(**)"]);
         assert_eq!(combined.deny, vec!["WebFetch(domain:evil.example)"]);
         assert!(combined.ask.is_empty());
@@ -1098,10 +1144,119 @@ mod tests {
                 parse_error: None,
             },
         ];
-        let combined = combined_permissions(&views);
+        let (combined, _origins) = combined_permissions(&views);
         assert_eq!(combined.allow, vec!["Bash(git push)"]);
         assert_eq!(combined.deny, vec!["Bash(git push)"]);
         assert!(combined.ask.is_empty());
+    }
+
+    #[test]
+    fn combined_origins_list_contributing_scopes_in_precedence_order() {
+        // A rule that appears in three scopes should surface all three in
+        // origins, ordered highest-precedence first (Local before
+        // UserLocal before User). A rule unique to one scope lists only
+        // that scope. Locks down the contract the front-end tooltip relies
+        // on.
+        let views = vec![
+            ScopeView {
+                scope: Scope::Local,
+                path: None,
+                exists: true,
+                permissions: PermissionRules {
+                    allow: vec!["Bash(git status)".into(), "Read(**)".into()],
+                    deny: vec![],
+                    ask: vec![],
+                },
+                other_values: serde_json::Map::new(),
+                parse_error: None,
+            },
+            ScopeView {
+                scope: Scope::Project,
+                path: None,
+                exists: true,
+                permissions: PermissionRules::default(),
+                other_values: serde_json::Map::new(),
+                parse_error: None,
+            },
+            ScopeView {
+                scope: Scope::UserLocal,
+                path: None,
+                exists: true,
+                permissions: PermissionRules {
+                    allow: vec!["Bash(git status)".into()],
+                    deny: vec![],
+                    ask: vec![],
+                },
+                other_values: serde_json::Map::new(),
+                parse_error: None,
+            },
+            ScopeView {
+                scope: Scope::User,
+                path: None,
+                exists: true,
+                permissions: PermissionRules {
+                    allow: vec!["Bash(git status)".into(), "Bash(ls)".into()],
+                    deny: vec![],
+                    ask: vec![],
+                },
+                other_values: serde_json::Map::new(),
+                parse_error: None,
+            },
+        ];
+        let (combined, origins) = combined_permissions(&views);
+        assert_eq!(
+            combined.allow,
+            vec!["Bash(git status)", "Read(**)", "Bash(ls)"]
+        );
+        // Same rule across Local + UserLocal + User, in precedence order.
+        assert_eq!(
+            origins.allow[0],
+            vec![Scope::Local, Scope::UserLocal, Scope::User]
+        );
+        // Rule only in Local.
+        assert_eq!(origins.allow[1], vec![Scope::Local]);
+        // Rule only in User.
+        assert_eq!(origins.allow[2], vec![Scope::User]);
+        assert!(origins.deny.is_empty());
+        assert!(origins.ask.is_empty());
+    }
+
+    #[test]
+    fn combined_origins_dedupe_repeated_rule_within_one_scope() {
+        // A single settings file can legally contain the same rule string
+        // more than once after hand-editing. The combined rule list
+        // already de-dupes (via the cross-scope position check), but the
+        // origins list must also collapse same-scope repeats so the
+        // tooltip doesn't render "Local, Local, User".
+        let views = vec![
+            ScopeView {
+                scope: Scope::Local,
+                path: None,
+                exists: true,
+                permissions: PermissionRules {
+                    allow: vec!["Bash(git status)".into(), "Bash(git status)".into()],
+                    deny: vec![],
+                    ask: vec![],
+                },
+                other_values: serde_json::Map::new(),
+                parse_error: None,
+            },
+            ScopeView {
+                scope: Scope::User,
+                path: None,
+                exists: true,
+                permissions: PermissionRules {
+                    allow: vec!["Bash(git status)".into()],
+                    deny: vec![],
+                    ask: vec![],
+                },
+                other_values: serde_json::Map::new(),
+                parse_error: None,
+            },
+        ];
+        let (combined, origins) = combined_permissions(&views);
+        assert_eq!(combined.allow, vec!["Bash(git status)"]);
+        assert_eq!(origins.allow[0], vec![Scope::Local, Scope::User]);
     }
 
     #[test]

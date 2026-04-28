@@ -234,8 +234,19 @@ function combinedPanel(loaded: LoadedScopes, query: string, lowerQuery: string):
   const kinds: PermissionKind[] = ["allow", "deny", "ask"];
   for (const kind of kinds) {
     const all = loaded.combined_permissions[kind];
-    // Fast path when the filter is empty — no allocation, no iteration.
-    const matched = lowerQuery === "" ? all : all.filter((r) => matchesLoweredQuery(r, lowerQuery));
+    const allOrigins = loaded.combined_origins[kind];
+    // Iterate `all` by index so each chip can pull its parallel origin
+    // entry. Track match count separately for the "(m/n)" label without
+    // building a filtered copy.
+    let matchedCount = 0;
+    const isFiltering = lowerQuery !== "";
+    if (!isFiltering) {
+      matchedCount = all.length;
+    } else {
+      for (const rule of all) {
+        if (matchesLoweredQuery(rule, lowerQuery)) matchedCount++;
+      }
+    }
     const group = document.createElement("div");
     group.className = `combo-group combo-${kind}`;
     const label = document.createElement("span");
@@ -246,9 +257,11 @@ function combinedPanel(loaded: LoadedScopes, query: string, lowerQuery: string):
     label.textContent =
       query === "" || all.length === 0
         ? `${KIND_LABELS[kind]} (${all.length})`
-        : `${KIND_LABELS[kind]} (${matched.length}/${all.length})`;
+        : `${KIND_LABELS[kind]} (${matchedCount}/${all.length})`;
     group.appendChild(label);
-    for (const rule of matched) {
+    for (let i = 0; i < all.length; i++) {
+      const rule = all[i];
+      if (isFiltering && !matchesLoweredQuery(rule, lowerQuery)) continue;
       // Chip + optional badge wrap as a single flex item. Originally added
       // because `.combo-group` used `flex-wrap: wrap` (badges could orphan to
       // a new line without their chip); the group is now a vertical stack,
@@ -259,7 +272,8 @@ function combinedPanel(loaded: LoadedScopes, query: string, lowerQuery: string):
       const chip = document.createElement("code");
       chip.className = "chip";
       chip.textContent = rule;
-      chipWrap.appendChild(chip);
+      const originWrap = wrapWithOriginTooltip(chip, allOrigins[i] ?? []);
+      chipWrap.appendChild(originWrap);
       const badge = lintBadge(rule);
       if (badge) chipWrap.appendChild(badge);
       group.appendChild(chipWrap);
@@ -339,6 +353,54 @@ function lintBadge(rule: string): HTMLElement | null {
   wrap.appendChild(pop);
   return wrap;
 }
+
+/**
+ * Wrap a rule chip so it carries a hover/focus tooltip listing the scope(s)
+ * the rule originates from. Returns a positioned wrapper that should be
+ * inserted in place of the bare chip; the chip itself is appended inside.
+ *
+ * `scopes` is expected in precedence order (highest first); for combined
+ * rule rows that's all contributing scopes, for per-scope rule rows it's
+ * just that one scope. The chip is given `tabindex=0` so keyboard users
+ * can reveal the tooltip without a pointer (issue #82's a11y AC).
+ */
+function wrapWithOriginTooltip(chip: HTMLElement, scopes: Scope[]): HTMLElement {
+  const wrap = document.createElement("span");
+  wrap.className = "rule-origin-wrap";
+  wrap.appendChild(chip);
+  if (scopes.length === 0) {
+    // No origin data — render the wrap shell only so the layout stays
+    // consistent. Skip the popover and tabindex/aria wiring entirely so
+    // we don't introduce a focus stop with nothing behind it.
+    return wrap;
+  }
+  chip.tabIndex = 0;
+  const popoverId = `rule-origin-${++ruleOriginPopoverSeq}`;
+  chip.setAttribute("aria-describedby", popoverId);
+
+  const pop = document.createElement("span");
+  pop.id = popoverId;
+  pop.className = "rule-origin-popover";
+  pop.setAttribute("role", "tooltip");
+
+  const heading = document.createElement("span");
+  heading.className = "rule-origin-popover-heading";
+  heading.textContent = scopes.length === 1 ? "Defined in" : "Defined in (precedence order)";
+  pop.appendChild(heading);
+
+  const list = document.createElement("ul");
+  list.className = "rule-origin-popover-list";
+  for (const scope of scopes) {
+    const li = document.createElement("li");
+    li.textContent = SCOPE_LABELS[scope];
+    list.appendChild(li);
+  }
+  pop.appendChild(list);
+  wrap.appendChild(pop);
+  return wrap;
+}
+
+let ruleOriginPopoverSeq = 0;
 
 // Pinned-popover state. Hover/focus reveals are handled purely in CSS; this
 // state only tracks popovers that the user clicked to keep open.
@@ -768,7 +830,10 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
   if (!props.busy) {
     setupRuleDragSource(code, rule, kind, scope);
   }
-  row.appendChild(code);
+  // Per-scope rule rows share the same tooltip helper as the combined
+  // panel for consistency (issue #82). Origins is just `[scope]` here
+  // since the rule lives in exactly this scope's file.
+  row.appendChild(wrapWithOriginTooltip(code, [scope]));
 
   const badge = lintBadge(rule);
   if (badge) row.appendChild(badge);

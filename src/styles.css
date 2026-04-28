@@ -798,6 +798,91 @@ button:disabled {
   pointer-events: auto;
 }
 
+/* Scope-origin tooltip (issue #82). Wraps every permission-rule chip so
+   hovering or keyboard-focusing the chip reveals which scope(s) the rule
+   originates from. Reuses the lint-warn popover visuals so the two hover
+   surfaces feel like the same family of affordance. */
+.rule-origin-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Inside `.rule` (per-scope columns), the wrapper takes over `.rule-text`'s
+   former role as the flex-grow child so the chip still fills the row and
+   ellipsis-truncates. The chip inside re-receives `flex:1` so the wrap
+   doesn't collapse around the rule string. */
+.rule > .rule-origin-wrap {
+  flex: 1;
+  min-width: 0;
+}
+.rule > .rule-origin-wrap > .rule-text {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Make the chip's keyboard focus state visible without an outline-jolt. */
+.rule-origin-wrap > .chip:focus-visible,
+.rule-origin-wrap > .rule-text:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 4px;
+}
+
+.rule-origin-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  min-width: 180px;
+  max-width: 280px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: normal;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity 120ms ease,
+    visibility 120ms ease;
+}
+
+.rule-origin-popover-heading {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 4px;
+}
+
+.rule-origin-popover-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rule-origin-popover-list li {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.rule-origin-wrap:hover > .rule-origin-popover,
+.rule-origin-wrap:focus-within > .rule-origin-popover {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
 /* Settings dialog — reuses `.modal` shell with a different body layout.
    The modal defaults to a wide 2-column diff for moves; the settings
    body is narrower and vertical, so size + padding are tuned here. */
