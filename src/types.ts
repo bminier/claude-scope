@@ -37,12 +37,22 @@ export interface PermissionRules {
   ask: string[];
 }
 
+// Parallel to PermissionRules: for each rule at the same kind/index in
+// `combined_permissions`, the scopes that contribute it, in precedence order
+// (highest first). Drives the scope-origin tooltip on combined rule rows.
+export interface PermissionRuleOrigins {
+  allow: Scope[][];
+  deny: Scope[][];
+  ask: Scope[][];
+}
+
 export type PermissionKind = "allow" | "deny" | "ask";
 
 export interface LoadedScopes {
   project_dir: string;
   scopes: ScopeView[];
   combined_permissions: PermissionRules;
+  combined_origins: PermissionRuleOrigins;
 }
 
 export interface MoveRequest {
