@@ -5,6 +5,7 @@ import type {
   MoveKeyPreview,
   MoveKeyRequest,
   MoveKeySide,
+  MoveOptions,
   MovePreview,
   MoveRequest,
   MoveSide,
@@ -23,8 +24,8 @@ interface AppProps {
   preferences: Preferences;
   onPickProject: () => void;
   onReload: () => void;
-  onMove: (req: MoveRequest, trigger?: HTMLElement) => void;
-  onMoveKey: (req: MoveKeyRequest, trigger?: HTMLElement) => void;
+  onMove: (req: MoveRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
+  onMoveKey: (req: MoveKeyRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
   onOpenSettings: (trigger?: HTMLElement) => void;
   onQueryChange: (next: string) => void;
 }
@@ -720,15 +721,24 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
     col.classList.remove("col-drop-active");
     if (!dragSource || dragSource.from === view.scope || props.busy) return;
     const src = dragSource;
-    // Clear the singleton before dispatching the move — onMove can open a
-    // modal synchronously, and we don't want a stale `dragSource` lingering
-    // through the user's confirm interaction.
+    // Clear the singleton before dispatching the move so a stale
+    // `dragSource` doesn't linger past the dispatch.
     dragSource = null;
     const trigger = src.el.isConnected ? src.el : undefined;
+    // Drop on a target column expresses intent unambiguously, so skip the
+    // diff/confirm modal (#70). Click-to-move keeps the modal as the
+    // safer default for the less-explicit click gesture. The
+    // per-destination `.bak` is the recovery path until an audit log /
+    // undo lands (#19).
+    const opts: MoveOptions = { skipConfirm: true };
     if (src.kind === "rule") {
-      props.onMove({ rule: src.rule, kind: src.ruleKind, from: src.from, to: view.scope }, trigger);
+      props.onMove(
+        { rule: src.rule, kind: src.ruleKind, from: src.from, to: view.scope },
+        trigger,
+        opts,
+      );
     } else {
-      props.onMoveKey({ key: src.key, from: src.from, to: view.scope }, trigger);
+      props.onMoveKey({ key: src.key, from: src.from, to: view.scope }, trigger, opts);
     }
   });
 

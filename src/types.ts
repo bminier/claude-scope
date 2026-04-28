@@ -62,6 +62,18 @@ export interface MoveRequest {
   to: Scope;
 }
 
+/**
+ * Caller hints for `onMove` / `onMoveKey`. Drop handlers pass
+ * `skipConfirm: true` because dragging onto a target column already
+ * expresses intent — the diff/confirm modal is friction at that point.
+ * Click-to-move keeps the modal as the safer default for less explicit
+ * gestures. Recovery on accidental drops still falls back to the
+ * per-write `.bak` files until an audit log / undo lands (#19).
+ */
+export interface MoveOptions {
+  skipConfirm?: boolean;
+}
+
 export interface MoveSide {
   scope: Scope;
   path: string;
