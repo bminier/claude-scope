@@ -11,9 +11,28 @@ reviewer.
    ```sh
    npm install
    ```
-2. Point at a throwaway `.claude/` to avoid mutating your real config.
-   Pick any temp directory you don't mind deleting; the examples use
-   `/tmp/cs-smoke` on macOS / Linux and `$env:TEMP\cs-smoke` on Windows.
+2. **Recommended:** seed a sandbox tree with the helper script and launch
+   ClaudeScope against it. The `--home` override (#66) redirects User /
+   User-Local writes away from your real `~/.claude/`, so every move is
+   safe regardless of which target column you pick.
+
+   ```sh
+   python scripts/scratch-home.py
+   # → prints the exact env-var + npm command for your shell.
+   ```
+
+   For `npm run tauri dev`, use the env-var form (`CLAUDE_SCOPE_HOME` /
+   `CLAUDE_SCOPE_PROJECT`) — passing CLI flags through `npm`/`cargo run`
+   doesn't survive the arg-passing chain. CLI flags work against a built
+   binary. When the app launches, a yellow **Sandbox mode** banner sits
+   under the toolbar showing the active scratch paths.
+
+3. **Alternative (no sandbox flags):** if you're testing the non-sandbox
+   bootstrap path, point at a throwaway `.claude/` for the *project*
+   scope by hand and accept that User / User-Local writes hit your real
+   home. Either back those up (`cp ~/.claude/settings.json{,.smoke.bak}`),
+   or open **Settings** after launch and hide the User + User-Local
+   columns so the only available move targets are Project ↔ Local.
 
    **macOS / Linux (bash):**
    ```sh
@@ -22,6 +41,8 @@ reviewer.
      > /tmp/cs-smoke/.claude/settings.json
    echo '{"permissions":{"allow":["WebFetch(domain:example.com)"]}}' \
      > /tmp/cs-smoke/.claude/settings.local.json
+   npm run tauri dev
+   # → Open project… → pick /tmp/cs-smoke
    ```
 
    **Windows (PowerShell):**
@@ -35,26 +56,9 @@ reviewer.
      | Set-Content -Encoding utf8 "$proj\.claude\settings.json"
    '{"permissions":{"allow":["WebFetch(domain:example.com)"]}}' `
      | Set-Content -Encoding utf8 "$proj\.claude\settings.local.json"
-   ```
-3. Launch the dev build:
-   ```sh
    npm run tauri dev
+   # → Open project… → pick $env:TEMP\cs-smoke
    ```
-4. Click **Open project…** → pick the throwaway dir from step 2.
-
-> ⚠ **User-scope safety.** Moves targeting the **User** or
-> **User-Local** columns write to your real `~/.claude/` — the throwaway
-> project only isolates the Project / Local scopes. Either back those
-> files up first (e.g. `cp ~/.claude/settings.json{,.smoke.bak}`), or
-> after launch open **Settings** and hide the User + User-Local columns
-> so you can only move between Project ↔ Local. The app's own one-shot
-> `.bak` covers the *first* mutation per file per session, but not
-> subsequent ones in the same run.
-
-> Reminder: a real `~/.claude/settings.json` will be read regardless. If
-> you want the User column visibly populated, drop a couple of throwaway
-> entries there; otherwise expect User / User-Local to show
-> `(file not present)`.
 
 ## Golden path
 
@@ -139,6 +143,27 @@ After exercising the moves above, in the throwaway `.claude/` dir:
 - [ ] **No leftover tempfiles.** No `*.tmp*` / `.settings.json.swp`-style
       siblings — the atomic write should rename the temp into place and
       leave nothing behind on success.
+
+## Sandbox mode (only when launched with `--home` / `--project`)
+
+Skip this section if you set up via the "Alternative" path. Run when you
+launched via `scripts/scratch-home.py` so the sandbox plumbing is exercised.
+
+- [ ] **Banner present.** Yellow **Sandbox mode** banner sits directly
+      under the toolbar, listing both `home: <path>` and
+      `project: <path>` from the launch flags.
+- [ ] **User-scope writes land in the sandbox.** Move a rule from Project
+      to User. The destination column updates as expected, and the new
+      file is `<sandbox-home>/.claude/settings.json` — *not* your real
+      `~/.claude/settings.json`. (Confirm by inspecting both paths after
+      the move.)
+- [ ] **Real home is untouched.** After several moves across all four
+      scopes, `~/.claude/settings.json` and `~/.claude/settings.local.json`
+      have unchanged mtimes (compare against a `stat` taken before launch).
+- [ ] **Picker still works under `--home`.** Click **Open project…** and
+      pick a different directory. The Project + Local columns retarget,
+      but the banner still shows the original `home:` path and User /
+      User-Local stay rooted in the sandbox.
 
 ## When you're done
 

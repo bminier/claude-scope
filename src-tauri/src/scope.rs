@@ -117,11 +117,20 @@ pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
 /// directory. The starting directory becomes the project dir after
 /// [`find_project_root`] walks upward looking for a `.git` entry (preferred)
 /// and then a `.claude/` directory.
-pub fn resolve(start: Option<&Path>) -> std::io::Result<ScopePaths> {
+///
+/// When `home_override` is `Some`, that path replaces what `dirs::home_dir()`
+/// would return, so the `User` and `UserLocal` scopes look at
+/// `<override>/.claude/settings*.json` instead of the real user home. Used by
+/// sandbox / scratch-home mode (#66) so the app can be exercised without
+/// putting the user's actual Claude Code settings at risk.
+pub fn resolve_with_home(
+    start: Option<&Path>,
+    home_override: Option<&Path>,
+) -> std::io::Result<ScopePaths> {
     let project_dir = find_project_root(start)?;
     let local = Some(project_dir.join(".claude").join("settings.local.json"));
     let project = Some(project_dir.join(".claude").join("settings.json"));
-    let home = dirs::home_dir();
+    let home = home_override.map(Path::to_path_buf).or_else(dirs::home_dir);
     let user_local = home
         .as_ref()
         .map(|h| h.join(".claude").join("settings.local.json"));
@@ -242,7 +251,7 @@ mod tests {
     fn resolve_builds_local_and_project_paths() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
-        let paths = resolve(Some(tmp.path())).unwrap();
+        let paths = resolve_with_home(Some(tmp.path()), None).unwrap();
         assert_eq!(
             paths.local.as_deref().unwrap().file_name().unwrap(),
             "settings.local.json"
@@ -259,7 +268,7 @@ mod tests {
         // first-class scope, not hidden under the shared home-dir path
         // computation.
         let tmp = tempfile::tempdir().unwrap();
-        let paths = resolve(Some(tmp.path())).unwrap();
+        let paths = resolve_with_home(Some(tmp.path()), None).unwrap();
         if let (Some(ul), Some(u)) = (paths.user_local.as_deref(), paths.user.as_deref()) {
             assert_eq!(ul.file_name().unwrap(), "settings.local.json");
             assert_eq!(u.file_name().unwrap(), "settings.json");
@@ -269,6 +278,40 @@ mod tests {
             // then both must be None together.
             assert!(paths.user_local.is_none() && paths.user.is_none());
         }
+    }
+
+    #[test]
+    fn resolve_with_home_redirects_user_scopes() {
+        // Sandbox mode (#66): when home_override is set, User and UserLocal
+        // must root at that path — not the real $HOME and not None — so a
+        // dogfood session can't accidentally clobber the user's real
+        // ~/.claude/.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let fake_home = tmp.path().join("scratch-home");
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::create_dir_all(fake_home.join(".claude")).unwrap();
+        let paths = resolve_with_home(Some(&project), Some(&fake_home)).unwrap();
+        assert_eq!(
+            paths.user.as_deref().unwrap(),
+            fake_home.join(".claude").join("settings.json"),
+        );
+        assert_eq!(
+            paths.user_local.as_deref().unwrap(),
+            fake_home.join(".claude").join("settings.local.json"),
+        );
+        // Project + Local must still root at the project_dir, not the home
+        // override — promotion target columns should stay distinct.
+        assert!(paths
+            .project
+            .as_deref()
+            .unwrap()
+            .starts_with(&paths.project_dir));
+        assert!(paths
+            .local
+            .as_deref()
+            .unwrap()
+            .starts_with(&paths.project_dir));
     }
 
     #[test]

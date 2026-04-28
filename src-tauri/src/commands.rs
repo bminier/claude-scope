@@ -1,6 +1,6 @@
 //! Tauri command handlers exposed to the front-end.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::io_atomic::{self, BackupTracker};
 use crate::model::{key_policy, KeyPolicy, PermissionKind, PermissionRules, SettingsDoc};
 use crate::preferences::{self, Preferences};
+use crate::runtime::{RuntimeInfo, RuntimeOverrides};
 use crate::scope::{self, Scope, ScopePaths};
 use crate::watcher::WatchState;
 
@@ -128,14 +129,32 @@ pub struct MoveKeySide {
     pub note: Option<String>,
 }
 
+/// Resolve scope paths honoring the launch-time overrides. The `home`
+/// override is always applied so user / user-local lookups stay redirected for
+/// the whole session. The `project` override only kicks in when the
+/// front-end didn't supply its own `project_dir` (i.e. on first load before
+/// the user has picked a project) — once the user picks something explicitly
+/// we want that to win.
+fn resolve_with_overrides(
+    project_dir: Option<&str>,
+    overrides: &RuntimeOverrides,
+) -> std::io::Result<ScopePaths> {
+    let project_path: Option<PathBuf> = match project_dir {
+        Some(s) => Some(PathBuf::from(s)),
+        None => overrides.project().map(Path::to_path_buf),
+    };
+    scope::resolve_with_home(project_path.as_deref(), overrides.home())
+}
+
 #[tauri::command]
 pub fn load_scopes(
     project_dir: Option<String>,
     app: AppHandle,
     watch: State<'_, WatchState>,
+    overrides: State<'_, RuntimeOverrides>,
 ) -> Result<LoadedScopes, String> {
-    let start = project_dir.as_ref().map(Path::new);
-    let paths = scope::resolve(start).map_err(|e| e.to_string())?;
+    let paths =
+        resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
     let loaded = build_loaded(&paths).map_err(|e| e.to_string())?;
     // (Re)install the watcher every time we load. This handles both first
     // load and project-switch with no extra command surface area for the
@@ -151,9 +170,13 @@ pub fn load_scopes(
 }
 
 #[tauri::command]
-pub fn diff_move(req: MoveRequest, project_dir: Option<String>) -> Result<MovePreview, String> {
-    let start = project_dir.as_ref().map(Path::new);
-    let paths = scope::resolve(start).map_err(|e| e.to_string())?;
+pub fn diff_move(
+    req: MoveRequest,
+    project_dir: Option<String>,
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<MovePreview, String> {
+    let paths =
+        resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
     diff_move_impl(&paths, &req).map_err(|e| e.to_string())
 }
 
@@ -162,9 +185,10 @@ pub fn apply_move(
     req: MoveRequest,
     project_dir: Option<String>,
     watch: State<'_, WatchState>,
+    overrides: State<'_, RuntimeOverrides>,
 ) -> Result<(), String> {
-    let start = project_dir.as_ref().map(Path::new);
-    let paths = scope::resolve(start).map_err(|e| e.to_string())?;
+    let paths =
+        resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
     apply_move_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
 }
 
@@ -172,9 +196,10 @@ pub fn apply_move(
 pub fn diff_move_key(
     req: MoveKeyRequest,
     project_dir: Option<String>,
+    overrides: State<'_, RuntimeOverrides>,
 ) -> Result<MoveKeyPreview, String> {
-    let start = project_dir.as_ref().map(Path::new);
-    let paths = scope::resolve(start).map_err(|e| e.to_string())?;
+    let paths =
+        resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
     diff_move_key_impl(&paths, &req).map_err(|e| e.to_string())
 }
 
@@ -183,10 +208,19 @@ pub fn apply_move_key(
     req: MoveKeyRequest,
     project_dir: Option<String>,
     watch: State<'_, WatchState>,
+    overrides: State<'_, RuntimeOverrides>,
 ) -> Result<(), String> {
-    let start = project_dir.as_ref().map(Path::new);
-    let paths = scope::resolve(start).map_err(|e| e.to_string())?;
+    let paths =
+        resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
     apply_move_key_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
+}
+
+/// Snapshot of the launch-time overrides — the front-end uses this to
+/// render a persistent sandbox banner under the toolbar so the user can't
+/// forget they're in scratch mode.
+#[tauri::command]
+pub fn load_runtime_info(overrides: State<'_, RuntimeOverrides>) -> RuntimeInfo {
+    RuntimeInfo::from_overrides(&overrides)
 }
 
 /// Read user preferences. A missing / malformed config file falls back to
