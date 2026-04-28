@@ -138,7 +138,7 @@ function restoreSearchFocus(
  * `CLAUDE_SCOPE_HOME` (or the project counterpart). Sits directly under
  * the toolbar, full-width, persistent — the issue's acceptance criterion
  * is "the user can't forget they're in scratch mode," so we deliberately
- * don't make this dismissable.
+ * don't make this dismissible.
  */
 function sandboxBanner(runtime: RuntimeInfo): HTMLElement | null {
   if (!runtime.home_override && !runtime.project_override) return null;

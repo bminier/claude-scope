@@ -43,9 +43,10 @@ impl RuntimeOverrides {
     {
         let mut overrides = Self::default();
         let mut iter = args.into_iter().map(Into::into).peekable();
-        // Skip argv[0] (the executable path). Don't unwrap — tests pass an
-        // explicit slice that omits it, and an empty argv from a malformed
-        // launcher shouldn't panic the app.
+        // Skip argv[0] (the executable path). Tests still include a stub
+        // first element so this drop matches production behavior. Use
+        // `.next()` discard instead of unwrap so an empty argv from a
+        // malformed launcher doesn't panic the app.
         let _ = iter.next();
         // Consume the next arg as the value for `flag` only when it's a real
         // value (non-empty, doesn't itself start with `--`). Without the
