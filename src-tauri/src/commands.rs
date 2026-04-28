@@ -298,7 +298,13 @@ fn accumulate(
 ) {
     for rule in incoming {
         if let Some(existing) = out_rules.iter().position(|r| r == rule) {
-            out_origins[existing].push(scope);
+            // Guard against the same scope file listing the rule twice
+            // (legal JSON, possible after hand-editing): without this check
+            // the tooltip would render "Local, Local, User" instead of
+            // "Local, User". `contains` is O(scopes) and scopes maxes at 4.
+            if !out_origins[existing].contains(&scope) {
+                out_origins[existing].push(scope);
+            }
         } else {
             out_rules.push(rule.clone());
             out_origins.push(vec![scope]);
@@ -1213,6 +1219,44 @@ mod tests {
         assert_eq!(origins.allow[2], vec![Scope::User]);
         assert!(origins.deny.is_empty());
         assert!(origins.ask.is_empty());
+    }
+
+    #[test]
+    fn combined_origins_dedupe_repeated_rule_within_one_scope() {
+        // A single settings file can legally contain the same rule string
+        // more than once after hand-editing. The combined rule list
+        // already de-dupes (via the cross-scope position check), but the
+        // origins list must also collapse same-scope repeats so the
+        // tooltip doesn't render "Local, Local, User".
+        let views = vec![
+            ScopeView {
+                scope: Scope::Local,
+                path: None,
+                exists: true,
+                permissions: PermissionRules {
+                    allow: vec!["Bash(git status)".into(), "Bash(git status)".into()],
+                    deny: vec![],
+                    ask: vec![],
+                },
+                other_values: serde_json::Map::new(),
+                parse_error: None,
+            },
+            ScopeView {
+                scope: Scope::User,
+                path: None,
+                exists: true,
+                permissions: PermissionRules {
+                    allow: vec!["Bash(git status)".into()],
+                    deny: vec![],
+                    ask: vec![],
+                },
+                other_values: serde_json::Map::new(),
+                parse_error: None,
+            },
+        ];
+        let (combined, origins) = combined_permissions(&views);
+        assert_eq!(combined.allow, vec!["Bash(git status)"]);
+        assert_eq!(origins.allow[0], vec![Scope::Local, Scope::User]);
     }
 
     #[test]
