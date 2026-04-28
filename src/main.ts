@@ -7,6 +7,7 @@ import type {
   LoadedScopes,
   MoveKeyPreview,
   MoveKeyRequest,
+  MoveOptions,
   MovePreview,
   MoveRequest,
   Preferences,
@@ -96,25 +97,35 @@ async function reload(): Promise<void> {
   await load(state.projectDir);
 }
 
-async function moveRule(req: MoveRequest, trigger?: HTMLElement): Promise<void> {
+async function moveRule(
+  req: MoveRequest,
+  trigger?: HTMLElement,
+  opts?: MoveOptions,
+): Promise<void> {
   if (moveInFlight) return;
   moveInFlight = true;
   try {
     const projectDir = state.projectDir;
-    // Intentionally *don't* flip state.busy / re-render before diff_move:
-    // it's fast, the modal itself blocks interaction once open, and keeping
-    // the triggering button alive lets confirmMove restore focus to it on
-    // Cancel/Esc.
-    let preview: MovePreview;
-    try {
-      preview = await invoke<MovePreview>("diff_move", { req, project_dir: projectDir });
-    } catch (err) {
-      alert(`Move failed: ${err}`);
-      return;
-    }
+    // Drag-and-drop drops set `skipConfirm`: the user already expressed
+    // intent by dragging onto a target column, so the diff/confirm modal
+    // becomes friction (#70). Click-to-move stays gated on the modal as
+    // the safer default for the less-explicit click gesture.
+    if (!opts?.skipConfirm) {
+      // Intentionally *don't* flip state.busy / re-render before diff_move:
+      // it's fast, the modal itself blocks interaction once open, and keeping
+      // the triggering button alive lets confirmMove restore focus to it on
+      // Cancel/Esc.
+      let preview: MovePreview;
+      try {
+        preview = await invoke<MovePreview>("diff_move", { req, project_dir: projectDir });
+      } catch (err) {
+        alert(`Move failed: ${err}`);
+        return;
+      }
 
-    const apply = await confirmMove(preview, trigger);
-    if (!apply) return;
+      const apply = await confirmMove(preview, trigger);
+      if (!apply) return;
+    }
 
     state.busy = true;
     render();
@@ -142,21 +153,29 @@ async function moveRule(req: MoveRequest, trigger?: HTMLElement): Promise<void> 
   }
 }
 
-async function moveKey(req: MoveKeyRequest, trigger?: HTMLElement): Promise<void> {
+async function moveKey(
+  req: MoveKeyRequest,
+  trigger?: HTMLElement,
+  opts?: MoveOptions,
+): Promise<void> {
   if (moveInFlight) return;
   moveInFlight = true;
   try {
     const projectDir = state.projectDir;
-    let preview: MoveKeyPreview;
-    try {
-      preview = await invoke<MoveKeyPreview>("diff_move_key", { req, project_dir: projectDir });
-    } catch (err) {
-      alert(`Move failed: ${err}`);
-      return;
-    }
+    // Same skip-confirm contract as moveRule (#70): drops bypass the
+    // diff/confirm modal because dragging already expresses intent.
+    if (!opts?.skipConfirm) {
+      let preview: MoveKeyPreview;
+      try {
+        preview = await invoke<MoveKeyPreview>("diff_move_key", { req, project_dir: projectDir });
+      } catch (err) {
+        alert(`Move failed: ${err}`);
+        return;
+      }
 
-    const apply = await confirmMoveKey(preview, trigger);
-    if (!apply) return;
+      const apply = await confirmMoveKey(preview, trigger);
+      if (!apply) return;
+    }
 
     state.busy = true;
     render();
