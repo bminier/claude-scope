@@ -11,6 +11,7 @@ import type {
   MovePreview,
   MoveRequest,
   Preferences,
+  RuntimeInfo,
   Scope,
 } from "./types.ts";
 import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
@@ -30,12 +31,17 @@ const state: {
   busy: boolean;
   query: string;
   preferences: Preferences;
+  runtime: RuntimeInfo;
 } = {
   scopes: null,
   projectDir: null,
   busy: false,
   query: "",
   preferences: DEFAULT_PREFERENCES,
+  // Default to "no overrides" until load_runtime_info resolves; the title
+  // bar simply omits the sandbox banner in that case, so a slow IPC boot
+  // doesn't flash a misleading "Sandbox: …" line.
+  runtime: { home_override: null, project_override: null },
 };
 
 // Set by the scopes-changed listener when it fires while another load or
@@ -262,6 +268,7 @@ function render(): void {
     busy: state.busy,
     query: state.query,
     preferences: state.preferences,
+    runtime: state.runtime,
     onPickProject: pickProject,
     onReload: reload,
     onMove: moveRule,
@@ -326,14 +333,23 @@ listen<string>("watcher-error", (evt) => {
 });
 
 async function bootstrap(): Promise<void> {
-  // Load preferences before the first scope load so the initial render
-  // applies them (e.g. column visibility) instead of flashing defaults
-  // first and then switching. A failed load falls back to defaults;
-  // there's no useful user action on "couldn't read config file."
-  try {
-    state.preferences = await invoke<Preferences>("load_preferences");
-  } catch (err) {
-    console.warn("failed to load preferences, using defaults:", err);
+  // Load preferences + runtime info before the first scope load so the
+  // initial render applies them (column visibility, sandbox banner)
+  // instead of flashing defaults first and then switching. Both calls are
+  // independent — fire them in parallel and tolerate either failing.
+  const [prefsResult, runtimeResult] = await Promise.allSettled([
+    invoke<Preferences>("load_preferences"),
+    invoke<RuntimeInfo>("load_runtime_info"),
+  ]);
+  if (prefsResult.status === "fulfilled") {
+    state.preferences = prefsResult.value;
+  } else {
+    console.warn("failed to load preferences, using defaults:", prefsResult.reason);
+  }
+  if (runtimeResult.status === "fulfilled") {
+    state.runtime = runtimeResult.value;
+  } else {
+    console.warn("failed to load runtime info:", runtimeResult.reason);
   }
   await load(null);
 }

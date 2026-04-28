@@ -43,6 +43,25 @@ body {
   flex-wrap: wrap;
 }
 
+/* Sandbox banner — only rendered when --home / --project (or env-var
+ * equivalent) is set at launch. Amber on dark amber to read as a warning
+ * without escalating to an error red. */
+.sandbox-banner {
+  background: #3a2e10;
+  color: #ffd479;
+  border-bottom: 1px solid #5a4416;
+  padding: 8px 16px;
+  font-size: 13px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: baseline;
+}
+
+.sandbox-banner strong {
+  color: #ffe2a0;
+}
+
 .search {
   position: relative;
   flex: 0 1 320px;

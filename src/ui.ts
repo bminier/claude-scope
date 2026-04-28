@@ -11,6 +11,7 @@ import type {
   MoveSide,
   PermissionKind,
   Preferences,
+  RuntimeInfo,
   Scope,
   ScopeView,
 } from "./types.ts";
@@ -22,6 +23,7 @@ interface AppProps {
   busy: boolean;
   query: string;
   preferences: Preferences;
+  runtime: RuntimeInfo;
   onPickProject: () => void;
   onReload: () => void;
   onMove: (req: MoveRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
@@ -93,6 +95,8 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
     lastRenderedProjectDir = props.projectDir;
   }
   root.appendChild(header(props));
+  const banner = sandboxBanner(props.runtime);
+  if (banner) root.appendChild(banner);
 
   if (!props.scopes) {
     const empty = document.createElement("div");
@@ -127,6 +131,32 @@ function restoreSearchFocus(
       // embedded webviews might not — fall through silently.
     }
   }
+}
+
+/**
+ * Sandbox banner shown when the user launched with `--home` /
+ * `CLAUDE_SCOPE_HOME` (or the project counterpart). Sits directly under
+ * the toolbar, full-width, persistent — the issue's acceptance criterion
+ * is "the user can't forget they're in scratch mode," so we deliberately
+ * don't make this dismissable.
+ */
+function sandboxBanner(runtime: RuntimeInfo): HTMLElement | null {
+  if (!runtime.home_override && !runtime.project_override) return null;
+  const banner = document.createElement("div");
+  banner.className = "sandbox-banner";
+  banner.setAttribute("role", "status");
+
+  const label = document.createElement("strong");
+  label.textContent = "Sandbox mode";
+  banner.appendChild(label);
+
+  const detail = document.createElement("span");
+  const parts: string[] = [];
+  if (runtime.home_override) parts.push(`home: ${runtime.home_override}`);
+  if (runtime.project_override) parts.push(`project: ${runtime.project_override}`);
+  detail.textContent = ` — ${parts.join(" · ")}`;
+  banner.appendChild(detail);
+  return banner;
 }
 
 function header(props: AppProps): HTMLElement {

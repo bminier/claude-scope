@@ -132,3 +132,14 @@ export const SEARCH_INPUT_ID = "rule-search";
 export interface Preferences {
   visible_scopes: Scope[];
 }
+
+/**
+ * Launch-time override snapshot from the Rust side. Mirrors `RuntimeInfo`
+ * in `src-tauri/src/runtime.rs`. Both fields are null when the app is
+ * running unsandboxed; either being set means the user is in scratch mode
+ * (#66) and the title bar should warn them.
+ */
+export interface RuntimeInfo {
+  home_override: string | null;
+  project_override: string | null;
+}

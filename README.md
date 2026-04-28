@@ -91,6 +91,41 @@ npm install
 npm run tauri dev
 ```
 
+### Testing safely (sandbox / scratch home)
+
+Running ClaudeScope against your real `~/.claude/` while developing risks corrupting your actual Claude Code settings if a write path regresses. Two ways to dogfood without that risk (#66):
+
+#### `--home` / `--project` flags + `CLAUDE_SCOPE_*` env vars
+
+Override scope discovery so all "user" / "user-local" lookups root at a throwaway directory instead of your real `$HOME` / `%USERPROFILE%`. The current project root can be pinned with `--project` (otherwise the front-end picker / cwd walk-up behave normally).
+
+For `npm run tauri dev`, **use the env vars** — the npm → tauri-cli → cargo chain mangles `--` separators and tauri-cli forwards trailing args as cargo flags (so `cargo run --home …` errors out). Env vars sidestep the whole chain. CLI flags work fine against a built binary.
+
+```sh
+# Dev build (Linux / macOS):
+CLAUDE_SCOPE_HOME=/tmp/scratch CLAUDE_SCOPE_PROJECT=/tmp/scratch/project npm run tauri dev
+
+# Dev build (Windows PowerShell):
+$env:CLAUDE_SCOPE_HOME = "$env:TEMP\cs-scratch"
+$env:CLAUDE_SCOPE_PROJECT = "$env:TEMP\cs-scratch\project"
+npm run tauri dev
+
+# Built binary — CLI flags:
+claude-scope --home /tmp/scratch --project /tmp/scratch/project
+```
+
+When either override is active, a yellow **Sandbox mode** banner sits under the toolbar showing the active paths, so you can't forget you're in scratch mode. The picker still works — `--home` keeps redirecting user-scope writes regardless of which project you switch to mid-session.
+
+#### `scripts/scratch-home.py`
+
+One-shot helper that seeds a fresh scratch dir with realistic example settings (allow / deny / ask rules across all four scopes, plus `env` / `hooks` / `theme` blocks so the move-key flow has data) and prints the launch command.
+
+```sh
+python scripts/scratch-home.py            # seeds a temp dir, prints launch line
+python scripts/scratch-home.py /tmp/sb    # seeds /tmp/sb explicitly, idempotent
+python scripts/scratch-home.py /tmp/sb --force   # wipe + reseed
+```
+
 ### Tests
 
 ```sh
