@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import shutil
 import sys
 import tempfile
@@ -201,11 +202,13 @@ def main() -> int:
         print(f'    set "CLAUDE_SCOPE_PROJECT={project}"')
         print("    npm run tauri dev")
     else:
+        # shlex.quote handles embedded single quotes (`O'Reilly` etc.) and
+        # other shell metacharacters, which a hand-written single-quote wrap
+        # would silently break.
+        dest_q = shlex.quote(str(dest))
+        project_q = shlex.quote(str(project))
         print("    # Dev build:")
-        print(
-            f"    CLAUDE_SCOPE_HOME='{dest}' "
-            f"CLAUDE_SCOPE_PROJECT='{project}' npm run tauri dev"
-        )
+        print(f"    CLAUDE_SCOPE_HOME={dest_q} CLAUDE_SCOPE_PROJECT={project_q} npm run tauri dev")
     print()
     # Quote the path arguments for the same reason — a built binary call
     # `claude-scope --home C:\path with spaces\X` would otherwise split.
@@ -213,7 +216,10 @@ def main() -> int:
     if sys.platform == "win32":
         print(f'    claude-scope --home "{dest}" --project "{project}"')
     else:
-        print(f"    claude-scope --home '{dest}' --project '{project}'")
+        print(
+            f"    claude-scope --home {shlex.quote(str(dest))} "
+            f"--project {shlex.quote(str(project))}"
+        )
     return 0
 
 

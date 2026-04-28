@@ -56,6 +56,11 @@ body {
   flex-wrap: wrap;
   gap: 4px;
   align-items: baseline;
+  /* Long Windows paths (e.g. C:\Users\…\AppData\Local\Temp\…) are unbroken
+   * tokens and would force horizontal scroll inside the flex layout
+   * otherwise. `anywhere` lets the browser break inside the path so the
+   * banner stays inside the viewport. */
+  overflow-wrap: anywhere;
 }
 
 .sandbox-banner strong {
