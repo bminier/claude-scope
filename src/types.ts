@@ -137,7 +137,8 @@ export interface Preferences {
  * Launch-time override snapshot from the Rust side. Mirrors `RuntimeInfo`
  * in `src-tauri/src/runtime.rs`. Both fields are null when the app is
  * running unsandboxed; either being set means the user is in scratch mode
- * (#66) and the title bar should warn them.
+ * (#66) and the UI should show the persistent warning banner under the
+ * toolbar.
  */
 export interface RuntimeInfo {
   home_override: string | null;

@@ -192,9 +192,13 @@ def main() -> int:
         print(f'    $env:CLAUDE_SCOPE_PROJECT = "{project}"')
         print("    npm run tauri dev")
         print()
+        # cmd.exe: wrap the whole NAME=VALUE in double quotes so spaces in
+        # the dest path don't get split into separate tokens. The `set
+        # "VAR=value"` form is the canonical cmd-safe spelling — the outer
+        # quotes are stripped by `set` and never end up in the variable.
         print("    # Dev build (cmd.exe):")
-        print(f'    set CLAUDE_SCOPE_HOME={dest}')
-        print(f'    set CLAUDE_SCOPE_PROJECT={project}')
+        print(f'    set "CLAUDE_SCOPE_HOME={dest}"')
+        print(f'    set "CLAUDE_SCOPE_PROJECT={project}"')
         print("    npm run tauri dev")
     else:
         print("    # Dev build:")
@@ -203,8 +207,13 @@ def main() -> int:
             f"CLAUDE_SCOPE_PROJECT='{project}' npm run tauri dev"
         )
     print()
+    # Quote the path arguments for the same reason — a built binary call
+    # `claude-scope --home C:\path with spaces\X` would otherwise split.
     print("    # Built binary (CLI flags):")
-    print(f"    claude-scope --home {dest} --project {project}")
+    if sys.platform == "win32":
+        print(f'    claude-scope --home "{dest}" --project "{project}"')
+    else:
+        print(f"    claude-scope --home '{dest}' --project '{project}'")
     return 0
 
 

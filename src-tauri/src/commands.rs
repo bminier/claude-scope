@@ -216,7 +216,7 @@ pub fn apply_move_key(
 }
 
 /// Snapshot of the launch-time overrides — the front-end uses this to
-/// surface a "Sandbox: <path>" warning in the title bar so the user can't
+/// render a persistent sandbox banner under the toolbar so the user can't
 /// forget they're in scratch mode.
 #[tauri::command]
 pub fn load_runtime_info(overrides: State<'_, RuntimeOverrides>) -> RuntimeInfo {

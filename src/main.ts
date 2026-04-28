@@ -38,8 +38,8 @@ const state: {
   busy: false,
   query: "",
   preferences: DEFAULT_PREFERENCES,
-  // Default to "no overrides" until load_runtime_info resolves; the title
-  // bar simply omits the sandbox banner in that case, so a slow IPC boot
+  // Default to "no overrides" until load_runtime_info resolves; the
+  // sandbox banner is simply omitted in that case, so a slow IPC boot
   // doesn't flash a misleading "Sandbox: …" line.
   runtime: { home_override: null, project_override: null },
 };

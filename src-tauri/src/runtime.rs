@@ -11,8 +11,8 @@
 //!   3. Real `dirs::home_dir()` and the front-end's project picker
 //!
 //! Both overrides survive the lifetime of the process and are exposed to the
-//! front-end via `load_runtime_info` so the title bar can warn the user that
-//! they're in scratch mode.
+//! front-end via `load_runtime_info` so the UI can render a persistent banner
+//! under the toolbar warning the user that they're in scratch mode.
 
 use std::path::{Path, PathBuf};
 
@@ -42,22 +42,40 @@ impl RuntimeOverrides {
         S: Into<String>,
     {
         let mut overrides = Self::default();
-        let mut iter = args.into_iter().map(Into::into);
+        let mut iter = args.into_iter().map(Into::into).peekable();
         // Skip argv[0] (the executable path). Don't unwrap — tests pass an
         // explicit slice that omits it, and an empty argv from a malformed
         // launcher shouldn't panic the app.
         let _ = iter.next();
+        // Consume the next arg as the value for `flag` only when it's a real
+        // value (non-empty, doesn't itself start with `--`). Without the
+        // flag-shape guard, `--home --project /p` would set home="--project"
+        // and silently drop the real project override; without the empty-
+        // string guard, `--home=` would set home to PathBuf("") instead of
+        // matching the env-var convention where empty means unset.
+        fn take_value<I: Iterator<Item = String>>(
+            iter: &mut std::iter::Peekable<I>,
+        ) -> Option<String> {
+            match iter.peek() {
+                Some(v) if !v.is_empty() && !v.starts_with("--") => iter.next(),
+                _ => None,
+            }
+        }
         while let Some(arg) = iter.next() {
             if let Some(rest) = arg.strip_prefix("--home=") {
-                overrides.home = Some(PathBuf::from(rest));
+                if !rest.is_empty() {
+                    overrides.home = Some(PathBuf::from(rest));
+                }
             } else if arg == "--home" {
-                if let Some(value) = iter.next() {
+                if let Some(value) = take_value(&mut iter) {
                     overrides.home = Some(PathBuf::from(value));
                 }
             } else if let Some(rest) = arg.strip_prefix("--project=") {
-                overrides.project = Some(PathBuf::from(rest));
+                if !rest.is_empty() {
+                    overrides.project = Some(PathBuf::from(rest));
+                }
             } else if arg == "--project" {
-                if let Some(value) = iter.next() {
+                if let Some(value) = take_value(&mut iter) {
                     overrides.project = Some(PathBuf::from(value));
                 }
             }
@@ -97,8 +115,8 @@ impl EnvSource for RealEnv {
 }
 
 /// Snapshot exposed to the front-end. Paths are stringified for IPC; both
-/// fields are `None` when the user is running unsandboxed, so the title bar
-/// can render the override hint conditionally.
+/// fields are `None` when the user is running unsandboxed, so the sandbox
+/// banner is omitted in that case.
 #[derive(Debug, Default, Serialize)]
 pub struct RuntimeInfo {
     pub home_override: Option<String>,
@@ -180,6 +198,38 @@ mod tests {
         // rather than panic on a missing iterator next().
         let got = RuntimeOverrides::from_env_and_args(["claude-scope", "--home"], &empty_env());
         assert!(got.home().is_none());
+    }
+
+    #[test]
+    fn flag_followed_by_another_flag_does_not_consume_it() {
+        // Regression: `--home --project /p` previously set home="--project"
+        // and silently dropped the real project flag. Now `--home` finds no
+        // value (next token is flag-shaped), home stays unset, and parsing
+        // continues so `--project /p` is honored.
+        let args = ["claude-scope", "--home", "--project", "/p"];
+        let got = RuntimeOverrides::from_env_and_args(args, &empty_env());
+        assert!(got.home().is_none(), "home should not be set to --project");
+        assert_eq!(got.project(), Some(Path::new("/p")));
+    }
+
+    #[test]
+    fn empty_equals_form_is_treated_as_unset() {
+        // Match the env-var convention: an explicitly empty value means
+        // "no override" rather than "override with the empty path".
+        let args = ["claude-scope", "--home=", "--project="];
+        let got = RuntimeOverrides::from_env_and_args(args, &empty_env());
+        assert!(got.home().is_none());
+        assert!(got.project().is_none());
+    }
+
+    #[test]
+    fn empty_separated_value_is_treated_as_unset() {
+        // `--home ""` (empty string passed as the next arg) — same convention
+        // as the equals form. Drops home rather than path-of-empty-string.
+        let args = ["claude-scope", "--home", "", "--project", "/p"];
+        let got = RuntimeOverrides::from_env_and_args(args, &empty_env());
+        assert!(got.home().is_none());
+        assert_eq!(got.project(), Some(Path::new("/p")));
     }
 
     #[test]
