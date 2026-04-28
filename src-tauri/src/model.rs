@@ -171,17 +171,20 @@ impl SettingsDoc {
     /// If the key isn't present yet, the value is inserted unchanged. If the
     /// key already exists, the policy decides what happens:
     ///
-    /// - [`KeyPolicy::Replace`] / [`KeyPolicy::ReplaceComplex`] /
-    ///   [`KeyPolicy::ReplaceUnknown`]: the destination is overwritten.
+    /// - [`KeyPolicy::Replace`] / [`KeyPolicy::ReplaceUnknown`]: the
+    ///   destination is overwritten.
     /// - [`KeyPolicy::DeepMerge`]: object trees are merged recursively, with
     ///   source values winning on scalar/non-object conflicts.
     /// - [`KeyPolicy::ArrayUnion`]: arrays are concatenated with duplicates
     ///   removed; mismatched shapes fall back to overwrite.
+    /// - [`KeyPolicy::Sandbox`]: object tree walked per [`SANDBOX_SCHEMA`];
+    ///   leaves under the schema's array-union paths union, every other
+    ///   leaf replaces. Mismatched shapes fall back to overwrite.
     pub fn merge_top_level(&mut self, key: &str, value: Value) {
         let policy = key_policy(key);
         let obj = ensure_object(&mut self.root);
         match policy {
-            KeyPolicy::Replace | KeyPolicy::ReplaceComplex | KeyPolicy::ReplaceUnknown => {
+            KeyPolicy::Replace | KeyPolicy::ReplaceUnknown => {
                 obj.insert(key.to_string(), value);
             }
             KeyPolicy::DeepMerge => match obj.get_mut(key) {
@@ -192,6 +195,12 @@ impl SettingsDoc {
             },
             KeyPolicy::ArrayUnion => match obj.get_mut(key) {
                 Some(existing) => array_union_in_place(existing, value),
+                None => {
+                    obj.insert(key.to_string(), value);
+                }
+            },
+            KeyPolicy::Sandbox => match obj.get_mut(key) {
+                Some(existing) => sandbox_merge_in_place(existing, value),
                 None => {
                     obj.insert(key.to_string(), value);
                 }
@@ -239,10 +248,11 @@ pub(crate) enum KeyPolicy {
     /// Array-valued key whose entries are concatenated and deduplicated
     /// across scopes (e.g. `allowedHttpHookUrls`).
     ArrayUnion,
-    /// Known key with complex per-subkey merge semantics that ClaudeScope
-    /// doesn't model yet (currently `sandbox`). Replace-with-warning so the
-    /// user sees the diff and can decide; structured merge is a follow-up.
-    ReplaceComplex,
+    /// `sandbox` — object whose nested fields have mixed semantics: some
+    /// arrays under `filesystem.*`/`network.*`/`excludedCommands` are
+    /// concatenated and deduplicated, every other leaf is override-only.
+    /// Walked per [`SANDBOX_SCHEMA`].
+    Sandbox,
     /// Key not in our known-keys table. Conservative replace-with-warning so
     /// new Claude Code keys still work but the user is told we don't have a
     /// documented policy for them.
@@ -263,7 +273,7 @@ pub(crate) fn key_policy(key: &str) -> KeyPolicy {
     match key {
         "env" => KeyPolicy::DeepMerge,
         "allowedHttpHookUrls" | "httpHookAllowedEnvVars" => KeyPolicy::ArrayUnion,
-        "sandbox" => KeyPolicy::ReplaceComplex,
+        "sandbox" => KeyPolicy::Sandbox,
         k if OVERRIDE_ONLY_KEYS.contains(&k) => KeyPolicy::Replace,
         _ => KeyPolicy::ReplaceUnknown,
     }
@@ -394,6 +404,86 @@ fn array_union_in_place(dest: &mut Value, src: Value) {
         }
         (dest_slot, src) => {
             *dest_slot = src;
+        }
+    }
+}
+
+/// Dotted paths inside the `sandbox` object whose values are arrays that
+/// Claude Code documents as concatenated-and-deduplicated across scopes.
+/// Anything else under `sandbox` (scalars, unknown subkeys) is treated as
+/// override-only — the source value replaces whatever was at the same path
+/// in the destination. New entries should match the docs at
+/// <https://code.claude.com/docs/en/settings>.
+pub(crate) const SANDBOX_SCHEMA: &[&str] = &[
+    "excludedCommands",
+    "filesystem.allowRead",
+    "filesystem.allowWrite",
+    "filesystem.denyRead",
+    "filesystem.denyWrite",
+    "network.allowMachLookup",
+    "network.allowUnixSockets",
+    "network.allowedDomains",
+    "network.deniedDomains",
+];
+
+/// Merge a `sandbox` object using the documented per-subkey semantics in
+/// [`SANDBOX_SCHEMA`]. Used for [`KeyPolicy::Sandbox`].
+///
+/// At each key, the walker dispatches in this order:
+/// - If both sides are objects, recurse into them. Object subtrees always
+///   recurse regardless of whether their dotted path appears in the schema —
+///   the schema describes leaves, not branches.
+/// - Else if the dotted path matches an entry in [`SANDBOX_SCHEMA`], the
+///   leaf goes through [`array_union_in_place`].
+/// - Else the destination's leaf is replaced by the source's value.
+/// - Subkeys present only on the source are inserted as-is.
+///
+/// If either side at the top level isn't an object — e.g. a hand-edited
+/// file where `sandbox` ended up as a string — the source replaces the
+/// destination outright. The move flow's preview note inspects the runtime
+/// shapes (see `policy_preview_note` in `commands.rs`) so the user is
+/// warned ahead of time when that fallback applies.
+fn sandbox_merge_in_place(dest: &mut Value, src: Value) {
+    if !dest.is_object() || !src.is_object() {
+        *dest = src;
+        return;
+    }
+    structured_merge_in_place(dest, src, SANDBOX_SCHEMA, "");
+}
+
+/// Recursive helper for [`sandbox_merge_in_place`]: walk the source object
+/// key-by-key against `dest`, building up a dotted path so each leaf can
+/// be matched against `array_union_paths`. Nested objects on both sides
+/// recurse; everywhere else, the array-union schema decides between
+/// `array_union_in_place` and a straight overwrite.
+fn structured_merge_in_place(
+    dest: &mut Value,
+    src: Value,
+    array_union_paths: &[&str],
+    base_path: &str,
+) {
+    let (Value::Object(d), Value::Object(s)) = (dest, src) else {
+        return;
+    };
+    for (k, v) in s {
+        let path = if base_path.is_empty() {
+            k.clone()
+        } else {
+            format!("{base_path}.{k}")
+        };
+        match d.get_mut(&k) {
+            Some(existing) if existing.is_object() && v.is_object() => {
+                structured_merge_in_place(existing, v, array_union_paths, &path);
+            }
+            Some(existing) if array_union_paths.contains(&path.as_str()) => {
+                array_union_in_place(existing, v);
+            }
+            Some(existing) => {
+                *existing = v;
+            }
+            None => {
+                d.insert(k, v);
+            }
         }
     }
 }
@@ -688,23 +778,178 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_uses_replace_complex_pending_structured_merge() {
-        // sandbox has per-subkey merge semantics (some arrays union, some
-        // scalars override) that ClaudeScope doesn't model yet. Until then
-        // the destination is replaced wholesale; the user sees this in the
-        // preview note. See the follow-up issue tracked in commands.rs.
-        assert_eq!(key_policy("sandbox"), KeyPolicy::ReplaceComplex);
+    fn sandbox_uses_structured_merge_policy() {
+        assert_eq!(key_policy("sandbox"), KeyPolicy::Sandbox);
+    }
+
+    #[test]
+    fn sandbox_unions_filesystem_allow_write_arrays() {
+        // The acceptance criterion for #84: array fields under
+        // sandbox.filesystem.* concatenate and deduplicate across scopes
+        // rather than the source replacing the destination wholesale.
         let mut doc = SettingsDoc::from_value(
-            serde_json::json!({"sandbox": {"enabled": false, "filesystem": {"allowWrite": ["/old"]}}}),
+            serde_json::json!({"sandbox": {"filesystem": {"allowWrite": ["/dest", "/shared"]}}}),
             Indent::Spaces(2),
         );
         doc.merge_top_level(
             "sandbox",
-            serde_json::json!({"enabled": true, "filesystem": {"allowWrite": ["/new"]}}),
+            serde_json::json!({"filesystem": {"allowWrite": ["/shared", "/source"]}}),
         );
         assert_eq!(
             *doc.get_top_level("sandbox").unwrap(),
-            serde_json::json!({"enabled": true, "filesystem": {"allowWrite": ["/new"]}})
+            serde_json::json!({
+                "filesystem": {"allowWrite": ["/dest", "/shared", "/source"]}
+            })
+        );
+    }
+
+    #[test]
+    fn sandbox_replaces_scalar_enabled() {
+        // Scalar fields (and any subkey not in SANDBOX_SCHEMA) are
+        // override-only — the source's value replaces whatever was there.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"sandbox": {"enabled": false, "failIfUnavailable": false}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level("sandbox", serde_json::json!({"enabled": true}));
+        assert_eq!(
+            *doc.get_top_level("sandbox").unwrap(),
+            serde_json::json!({"enabled": true, "failIfUnavailable": false})
+        );
+    }
+
+    #[test]
+    fn sandbox_combines_array_union_and_scalar_replace() {
+        // Mixed move: array leaves union, scalar leaves replace, untouched
+        // destination keys survive. Network array (allowedDomains) and
+        // filesystem array (denyRead) both go through the schema; the
+        // scalar `enabled` flips; the dest-only `httpProxyPort` survives.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({
+                "sandbox": {
+                    "enabled": false,
+                    "filesystem": {"denyRead": ["~/.aws/credentials"]},
+                    "network": {
+                        "allowedDomains": ["github.com"],
+                        "httpProxyPort": 8080
+                    }
+                }
+            }),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level(
+            "sandbox",
+            serde_json::json!({
+                "enabled": true,
+                "filesystem": {"denyRead": ["~/.ssh/id_rsa"]},
+                "network": {"allowedDomains": ["*.npmjs.org"]}
+            }),
+        );
+        assert_eq!(
+            *doc.get_top_level("sandbox").unwrap(),
+            serde_json::json!({
+                "enabled": true,
+                "filesystem": {
+                    "denyRead": ["~/.aws/credentials", "~/.ssh/id_rsa"]
+                },
+                "network": {
+                    "allowedDomains": ["github.com", "*.npmjs.org"],
+                    "httpProxyPort": 8080
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn sandbox_inserts_source_only_subtrees() {
+        // Subkeys present only on the source should be added to the
+        // destination wholesale.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"sandbox": {"enabled": true}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level(
+            "sandbox",
+            serde_json::json!({"network": {"allowedDomains": ["github.com"]}}),
+        );
+        assert_eq!(
+            *doc.get_top_level("sandbox").unwrap(),
+            serde_json::json!({
+                "enabled": true,
+                "network": {"allowedDomains": ["github.com"]}
+            })
+        );
+    }
+
+    #[test]
+    fn sandbox_replaces_arrays_not_in_schema() {
+        // Only the dotted paths listed in SANDBOX_SCHEMA union — an
+        // arbitrary array under filesystem.* (or anywhere else) that isn't
+        // in the schema must replace, not union, so the preview note
+        // doesn't overpromise. Regression test for PR review on #84.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"sandbox": {"filesystem": {"unknownArrayField": ["dest"]}}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level(
+            "sandbox",
+            serde_json::json!({"filesystem": {"unknownArrayField": ["src"]}}),
+        );
+        assert_eq!(
+            *doc.get_top_level("sandbox").unwrap(),
+            serde_json::json!({"filesystem": {"unknownArrayField": ["src"]}})
+        );
+    }
+
+    #[test]
+    fn sandbox_recurses_into_nested_objects_outside_schema() {
+        // Object subtrees always recurse when both sides are objects, even
+        // when the path isn't in SANDBOX_SCHEMA (the schema describes
+        // leaves, not branches). A scalar inside the unknown subtree should
+        // still replace at the leaf, but sibling keys must survive.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"sandbox": {"futureFeature": {"a": 1, "b": 2}}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level("sandbox", serde_json::json!({"futureFeature": {"b": 99}}));
+        assert_eq!(
+            *doc.get_top_level("sandbox").unwrap(),
+            serde_json::json!({"futureFeature": {"a": 1, "b": 99}})
+        );
+    }
+
+    #[test]
+    fn sandbox_array_union_leaves_replace_on_leaf_shape_mismatch() {
+        // A documented array-union path (filesystem.allowWrite) where one
+        // side isn't an array — e.g. hand-edited file that left a string
+        // there — falls back to leaf replacement via array_union_in_place's
+        // shape-mismatch path. The preview note now documents this caveat.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"sandbox": {"filesystem": {"allowWrite": "broken-string"}}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level(
+            "sandbox",
+            serde_json::json!({"filesystem": {"allowWrite": ["/src"]}}),
+        );
+        assert_eq!(
+            *doc.get_top_level("sandbox").unwrap(),
+            serde_json::json!({"filesystem": {"allowWrite": ["/src"]}})
+        );
+    }
+
+    #[test]
+    fn sandbox_falls_back_to_replace_on_shape_mismatch() {
+        // Hand-edited file where sandbox ended up as a string. The
+        // structured walker can't recurse into a non-object; source replaces.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"sandbox": "broken-string"}),
+            Indent::Spaces(2),
+        );
+        doc.merge_top_level("sandbox", serde_json::json!({"enabled": true}));
+        assert_eq!(
+            *doc.get_top_level("sandbox").unwrap(),
+            serde_json::json!({"enabled": true})
         );
     }
 
