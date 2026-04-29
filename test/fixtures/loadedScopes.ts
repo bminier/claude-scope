@@ -59,11 +59,14 @@ interface LoadedScopesOverrides {
 
 /**
  * Builds a `LoadedScopes` payload for a given set of per-scope overrides.
- * Any scope not listed gets a present-but-empty view so the renderer's
- * "exists/no rules" branch is exercised by default. The combined panel
- * is derived from the per-scope `allow`/`deny`/`ask` lists (origin lists
- * point at the scopes that contributed each rule, in declaration order)
- * unless the caller overrides.
+ * Any scope not listed gets an `exists: false` view so the renderer's
+ * "(file not present)" branch is exercised by default — that's the
+ * realistic baseline for a project where most scope files don't exist.
+ * The combined panel is derived from the per-scope `allow`/`deny`/`ask`
+ * lists, mirroring the Rust backend in two ways: contributors are
+ * accumulated in precedence order (highest first — Local→Project→
+ * UserLocal→User), and a rule repeated within a single scope only
+ * counts that scope once. Caller can override either field directly.
  */
 export function buildLoadedScopes(overrides: LoadedScopesOverrides = {}): LoadedScopes {
   const overrideByScope = new Map(overrides.scopes?.map((s) => [s.scope, s]) ?? []);
@@ -71,21 +74,30 @@ export function buildLoadedScopes(overrides: LoadedScopesOverrides = {}): Loaded
     buildScopeView(overrideByScope.get(scope) ?? { scope, exists: false }),
   );
 
+  // SCOPES is UI order (broadest first); the backend iterates precedence
+  // order (highest first), which is the reverse. Walk that order so the
+  // origin lists match what the real `combined_permissions()` produces
+  // and what the scope-origin tooltip claims to show.
+  const precedenceOrder = [...scopes].reverse();
   const combined = emptyPermissions();
   const origins = emptyOrigins();
   const kinds: PermissionKind[] = ["allow", "deny", "ask"];
   for (const kind of kinds) {
-    const seen = new Map<string, Scope[]>();
-    for (const view of scopes) {
+    for (const view of precedenceOrder) {
       for (const rule of view.permissions[kind]) {
-        const list = seen.get(rule);
-        if (list) list.push(view.scope);
-        else seen.set(rule, [view.scope]);
+        const idx = combined[kind].indexOf(rule);
+        if (idx === -1) {
+          combined[kind].push(rule);
+          origins[kind].push([view.scope]);
+        } else if (!origins[kind][idx].includes(view.scope)) {
+          // Same rule listed twice inside one scope file is legal JSON
+          // (and easy to produce by hand-editing); the real backend
+          // dedupes the per-rule contributor list, so the fixture must
+          // too — otherwise the tooltip-order test would render
+          // "Local, Local" where the app shows "Local".
+          origins[kind][idx].push(view.scope);
+        }
       }
-    }
-    for (const [rule, scopesForRule] of seen) {
-      combined[kind].push(rule);
-      origins[kind].push(scopesForRule);
     }
   }
 

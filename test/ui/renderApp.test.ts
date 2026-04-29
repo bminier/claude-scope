@@ -26,9 +26,17 @@ interface PropsOverrides {
 }
 
 function makeProps(overrides: PropsOverrides = {}) {
+  const scopes = overrides.scopes ?? null;
+  // Default `projectDir` from the loaded scopes' `project_dir` so tests
+  // exercise the same render path the real app does (header text, the
+  // `lastRenderedProjectDir` reset that clears `openTreeNodes` when the
+  // project changes). Callers can still pass `projectDir: null` explicitly
+  // to cover the no-project branch.
+  const projectDir =
+    overrides.projectDir !== undefined ? overrides.projectDir : (scopes?.project_dir ?? null);
   return {
-    scopes: overrides.scopes ?? null,
-    projectDir: overrides.projectDir ?? null,
+    scopes,
+    projectDir,
     busy: overrides.busy ?? false,
     query: overrides.query ?? "",
     preferences: overrides.preferences ?? buildPreferences(),
