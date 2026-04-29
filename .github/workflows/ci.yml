@@ -56,6 +56,13 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      # Renderer unit tests are Ubuntu-only for now: this layer is pure
+      # JSDOM-style work in happy-dom, so cross-OS coverage adds runtime
+      # without buying signal until something proves OS-specific. Issue #69.
+      - name: JS unit tests
+        if: startsWith(matrix.os, 'ubuntu-')
+        run: npm run test:unit
+
       - name: Rust unit tests
         working-directory: src-tauri
         run: cargo test --lib --locked
