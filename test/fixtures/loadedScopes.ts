@@ -40,9 +40,15 @@ export function emptyOrigins(): PermissionRuleOrigins {
 
 export function buildScopeView(overrides: ScopeViewOverrides): ScopeView {
   const permissions = { ...emptyPermissions(), ...(overrides.permissions ?? {}) };
+  // `path` is `string | null` on the wire — the Rust backend serializes
+  // null when it can't resolve a scope path. `??` would collapse a
+  // caller-supplied null into the default string, hiding that branch from
+  // tests, so check for `undefined` explicitly.
+  const path =
+    overrides.path !== undefined ? overrides.path : `/fake/${overrides.scope}/settings.json`;
   return {
     scope: overrides.scope,
-    path: overrides.path ?? `/fake/${overrides.scope}/settings.json`,
+    path,
     exists: overrides.exists ?? true,
     permissions,
     other_values: overrides.other_values ?? {},
