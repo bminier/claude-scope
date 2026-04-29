@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Sync the local-package version in src-tauri/Cargo.lock with src-tauri/Cargo.toml.
+
+release-please's TOML updater bumps `[package].version` in `Cargo.toml`, but
+`Cargo.lock` carries an independent copy of that version under the
+`[[package]] name = "claude-scope"` entry. CI runs `cargo --locked`, so a
+stale lockfile fails the release-please PR's CI run.
+
+This script does a surgical regex update of just that one version line. We
+deliberately avoid invoking cargo: a full `cargo update` could touch the
+dependency tree, which would conflate a release version bump with a
+dependency churn we don't want bundled into the release-please PR.
+
+Usage:
+    python scripts/sync-cargo-lock.py
+
+Run from the repo root. Exits non-zero if the [package].version can't be
+parsed from Cargo.toml or if Cargo.lock has zero or multiple matching
+[[package]] entries (either case is unexpected and a silent skip would mask
+a real problem).
+"""
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+CARGO_TOML = Path("src-tauri/Cargo.toml")
+CARGO_LOCK = Path("src-tauri/Cargo.lock")
+PACKAGE_NAME = "claude-scope"
+
+
+def read_target_version() -> str:
+    text = CARGO_TOML.read_text(encoding="utf-8")
+    # Match [package] table, then the first version key inside it. Stop at
+    # the next [section] header so a [dependencies] version field can't be
+    # confused for the package version.
+    match = re.search(
+        r'^\s*\[package\]\s*\n([^\[]*?)^\s*version\s*=\s*"([^"]+)"',
+        text,
+        re.MULTILINE,
+    )
+    if not match:
+        sys.exit(f"could not find [package].version in {CARGO_TOML}")
+    return match.group(2)
+
+
+def update_lock(version: str) -> bool:
+    text = CARGO_LOCK.read_text(encoding="utf-8")
+    pattern = re.compile(
+        r'(\[\[package\]\]\nname\s*=\s*"' + re.escape(PACKAGE_NAME) + r'"\nversion\s*=\s*")[^"]*(")'
+    )
+    matches = list(pattern.finditer(text))
+    if len(matches) == 0:
+        sys.exit(f"no [[package]] entry for {PACKAGE_NAME!r} in {CARGO_LOCK}")
+    if len(matches) > 1:
+        sys.exit(
+            f"unexpected: {len(matches)} [[package]] entries for {PACKAGE_NAME!r} in {CARGO_LOCK}"
+        )
+    new_text = pattern.sub(rf"\g<1>{version}\g<2>", text)
+    if new_text == text:
+        return False
+    CARGO_LOCK.write_text(new_text, encoding="utf-8")
+    return True
+
+
+def main() -> None:
+    version = read_target_version()
+    changed = update_lock(version)
+    if changed:
+        print(f"{CARGO_LOCK}: synced {PACKAGE_NAME} -> {version}")
+    else:
+        print(f"{CARGO_LOCK}: already at {version}")
+
+
+if __name__ == "__main__":
+    main()

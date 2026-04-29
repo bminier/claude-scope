@@ -14,15 +14,22 @@ Work on feature branches. Open PRs targeting `dev`. Follow conventional commits.
 
 ## Versioning
 
-A version bump must update four files in lockstep: `package.json`,
-`package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`.
-`src-tauri/Cargo.lock` regenerates on the next `cargo` run.
+Version bumps are automated by release-please (see `CONTRIBUTING.md`).
+release-please opens a "release PR" against `dev` whenever a conventional
+`feat:` / `fix:` / `perf:` lands, bumps every version-carrying file in
+lockstep (`package.json`, `package-lock.json`, `src-tauri/Cargo.toml`,
+`src-tauri/tauri.conf.json`, plus `src-tauri/Cargo.lock` via a follow-up
+sync step in `release-please.yml`), and rewrites `CHANGELOG.md`. Merging
+that PR pushes a `vX.Y.Z` tag, which triggers `release.yml` to build and
+upload installers + `SHA256SUMS.txt`.
 
-Do **not** regenerate `package-lock.json` with `npm install --package-lock-only`
-on Windows — npm drops Linux-only optional deps (e.g. `@emnapi/*`,
-`@napi-rs/*`) and `npm ci` then fails on the Linux CI runner. For a pure
-version bump, edit only the two top-level `"version"` fields in the lockfile;
-leave the dependency tree alone.
+If you ever need to bump versions by hand (e.g. release-please is broken),
+do **not** regenerate `package-lock.json` with
+`npm install --package-lock-only` on Windows — npm drops Linux-only
+optional deps (e.g. `@emnapi/*`, `@napi-rs/*`) and `npm ci` then fails on
+the Linux CI runner. Edit only the two `"version"` fields in the lockfile
+and leave the dependency tree alone. `scripts/sync-cargo-lock.py` updates
+the `claude-scope` entry in `Cargo.lock` without touching anything else.
 
 ## Bootstrap
 
