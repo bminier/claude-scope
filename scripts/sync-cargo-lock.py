@@ -41,7 +41,12 @@ def read_target_version() -> str:
 
 
 def update_lock(version: str) -> bool:
-    text = CARGO_LOCK.read_text(encoding="utf-8")
+    # Read/write in binary so platform newline translation can't sneak CRLF
+    # into the lockfile when this script runs on Windows as a manual fallback.
+    # The repo is LF-only and pre-commit's mixed-line-ending hook would fix
+    # it, but better not to dirty the file in the first place.
+    raw = CARGO_LOCK.read_bytes()
+    text = raw.decode("utf-8")
     pattern = re.compile(
         r'(\[\[package\]\]\nname\s*=\s*"' + re.escape(PACKAGE_NAME) + r'"\nversion\s*=\s*")[^"]*(")'
     )
@@ -55,7 +60,7 @@ def update_lock(version: str) -> bool:
     new_text = pattern.sub(rf"\g<1>{version}\g<2>", text)
     if new_text == text:
         return False
-    CARGO_LOCK.write_text(new_text, encoding="utf-8")
+    CARGO_LOCK.write_bytes(new_text.encode("utf-8"))
     return True
 
 
