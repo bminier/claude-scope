@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 CARGO_TOML = Path("src-tauri/Cargo.toml")
@@ -31,18 +32,12 @@ PACKAGE_NAME = "claude-scope"
 
 
 def read_target_version() -> str:
-    text = CARGO_TOML.read_text(encoding="utf-8")
-    # Match [package] table, then the first version key inside it. Stop at
-    # the next [section] header so a [dependencies] version field can't be
-    # confused for the package version.
-    match = re.search(
-        r'^\s*\[package\]\s*\n([^\[]*?)^\s*version\s*=\s*"([^"]+)"',
-        text,
-        re.MULTILINE,
-    )
-    if not match:
+    with CARGO_TOML.open("rb") as f:
+        data = tomllib.load(f)
+    try:
+        return data["package"]["version"]
+    except KeyError:
         sys.exit(f"could not find [package].version in {CARGO_TOML}")
-    return match.group(2)
 
 
 def update_lock(version: str) -> bool:
