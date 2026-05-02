@@ -32,7 +32,8 @@ if sys.version_info < (3, 11):
     sys.exit(
         "sync-cargo-lock requires Python 3.11+ (uses stdlib tomllib); "
         f"got {sys.version_info.major}.{sys.version_info.minor}. "
-        "CI pins Python 3.12 (.github/workflows/ci.yml, release-please.yml)."
+        "CI pins Python 3.12 (.github/workflows/ci.yml, "
+        ".github/workflows/release-please.yml)."
     )
 
 import re
