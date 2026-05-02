@@ -1,0 +1,88 @@
+name: Release Please
+
+# release-please reads conventional-commit messages on `dev`, opens (or
+# updates) a "release PR" that bumps every version-carrying file in lockstep,
+# and — when that PR is merged — creates the `vX.Y.Z` tag and a GitHub
+# Release. The tag push then fans out to release.yml, which builds and
+# uploads the Tauri installers + SHA256SUMS.txt to that same release.
+#
+# The release PR therefore goes through normal CI before merge, so a broken
+# tree never gets tagged.
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # Serialize so two pushes can't open conflicting release PRs.
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    # Scoped here (rather than workflow-level) so future jobs don't
+    # silently inherit PR write access.
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      pr: ${{ steps.release.outputs.pr }}
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          target-branch: dev
+
+  # release-please's TOML updater bumps src-tauri/Cargo.toml's package
+  # version, but does not touch src-tauri/Cargo.lock — so the [[package]]
+  # name = "claude-scope" entry there stays at the old version. CI runs
+  # cargo with --locked and would fail the release PR. Sync it here.
+  #
+  # Caveat: this push uses the default GITHUB_TOKEN, which by GitHub policy
+  # does NOT trigger downstream workflow runs (specifically the
+  # `pull_request: synchronize` event on ci.yml). If CI raced ahead of this
+  # job and ran on the stale release PR, the maintainer must manually
+  # re-run CI on the PR before merging. This is documented in
+  # CONTRIBUTING.md.
+  sync-cargo-lock:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.pr != '' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+
+      # Pinned to match ci.yml so the script's pre-3.11 guard message stays
+      # accurate, and so a future ubuntu-24.04 image refresh that changes the
+      # default Python doesn't silently break the sync step.
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Sync src-tauri/Cargo.lock to bumped Cargo.toml version
+        run: python scripts/sync-cargo-lock.py
+
+      - name: Commit & push if changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src-tauri/Cargo.lock; then
+            echo "Cargo.lock already in sync — nothing to push"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/Cargo.lock
+          git commit -m "chore: sync Cargo.lock to release-please version bump"
+          git push

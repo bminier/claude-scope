@@ -310,3 +310,110 @@ jobs:
           gh api --method PATCH "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
             -f "name=${new_name}"
           echo "renamed ${matched_name} → ${new_name}"
+
+  # Compute SHA-256 sums for every artifact on the (still-draft) release and
+  # upload SHA256SUMS.txt as an extra asset. Builds are unsigned, so the sums
+  # are the only integrity guarantee a downloader has. Runs once after every
+  # matrix leg has finished uploading, so a single sums file covers all
+  # platforms.
+  #
+  # Idempotency: an existing SHA256SUMS.txt is deleted before re-upload so
+  # workflow_dispatch reruns of the same tag converge cleanly.
+  sums:
+    needs: [setup, release]
+    # The release matrix is fail-fast: false on purpose — a single failed
+    # platform leg shouldn't suppress checksums for the legs that did
+    # publish. Run as long as setup succeeded (we need the release tag) and
+    # the workflow wasn't cancelled. The asset_count==0 guard below still
+    # exits 1 if every leg failed, so we don't silently publish an empty
+    # SHA256SUMS.txt.
+    if: ${{ !cancelled() && needs.setup.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          # Draft releases don't have a git tag pushed yet, so /releases/tags/<tag>
+          # 404s. List all releases and filter by tag_name — same trick the
+          # macOS Version-stamp step uses above.
+          release_id=$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+              | jq --slurp -r --arg tag "$RELEASE_TAG" \
+                  '[.[][] | select(.tag_name == $tag)] | (.[0].id // empty) | tostring'
+          )
+          if [ -z "$release_id" ] || [ "$release_id" = "null" ]; then
+            echo "::error::no release found with tag ${RELEASE_TAG}"
+            exit 1
+          fi
+
+          mkdir -p /tmp/release-assets
+          cd /tmp/release-assets
+
+          # List assets, skipping any prior SHA256SUMS.txt (we rewrite it).
+          # Pull the binary bytes via the asset API directly so this works for
+          # draft releases — `gh release download` only works on published.
+          assets=$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" \
+              --paginate \
+              | jq --slurp -c '[.[][] | select(.name != "SHA256SUMS.txt")]'
+          )
+          asset_count=$(echo "$assets" | jq 'length')
+          if [ "$asset_count" -eq 0 ]; then
+            echo "::error::release ${RELEASE_TAG} has no assets to checksum"
+            exit 1
+          fi
+
+          # Download every asset by id. base64-roundtrip is the standard jq+bash
+          # trick for handling rows that may contain spaces/quotes safely.
+          for row in $(echo "$assets" | jq -r '.[] | @base64'); do
+            row_json=$(echo "$row" | base64 -d)
+            asset_id=$(echo "$row_json" | jq -r '.id')
+            name=$(echo "$row_json" | jq -r '.name')
+            # Defense in depth: asset names come from our Tauri matrix and
+            # shouldn't contain path separators, but reject any that do so a
+            # compromised upload can't escape the working directory.
+            case "$name" in
+              */*|*..*|"")
+                echo "::error::refusing suspicious asset name: $name"
+                exit 1
+                ;;
+            esac
+            gh api -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "$name"
+          done
+
+          # `--tag` produces BSD-style output (`SHA256 (file) = hash`) which
+          # `sha256sum -c` can verify on any platform. `--` terminates option
+          # parsing so a hypothetical asset name starting with `-` can't be
+          # interpreted as a flag.
+          sha256sum --tag -- * | sort > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+          # Drop a stale SHA256SUMS.txt from a previous run (e.g.
+          # workflow_dispatch rebuild of the same tag). Otherwise the upload
+          # below would fail with 422 "already_exists".
+          stale_id=$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" \
+              --paginate \
+              | jq --slurp -r '[.[][] | select(.name == "SHA256SUMS.txt")] | (.[0].id // empty) | tostring'
+          )
+          if [ -n "$stale_id" ] && [ "$stale_id" != "null" ]; then
+            gh api --method DELETE "/repos/${GITHUB_REPOSITORY}/releases/assets/${stale_id}"
+          fi
+
+          # Upload via the assets endpoint directly. `gh release upload` looks
+          # up the release by tag, which works for drafts but only when the
+          # auth user has permission *and* the `releases/tags/<tag>` endpoint
+          # surfaces drafts — both have historically been wobbly. The macOS
+          # Version-stamp step above already uses the assets endpoint
+          # directly; mirror that pattern.
+          gh api --method POST \
+            -H "Content-Type: text/plain" \
+            "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?name=SHA256SUMS.txt" \
+            --input SHA256SUMS.txt
