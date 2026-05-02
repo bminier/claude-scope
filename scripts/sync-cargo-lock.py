@@ -11,6 +11,11 @@ deliberately avoid invoking cargo: a full `cargo update` could touch the
 dependency tree, which would conflate a release version bump with a
 dependency churn we don't want bundled into the release-please PR.
 
+Side effect: a CRLF Cargo.lock (e.g. a Windows clone with
+`core.autocrlf=true`) gets normalized to LF on write, matching the
+repo's LF-only convention. CI's checkout is already LF, so this is a
+no-op there.
+
 Usage:
     python scripts/sync-cargo-lock.py
 

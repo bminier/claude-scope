@@ -38,7 +38,7 @@ forces a major bump — except pre-1.0, where it bumps the minor instead
 (release-please's default behavior, matching semver's "anything goes
 before 1.0" guidance).
 
-A scope is encouraged but optional: `feat(ui): drop commits the move`
+A scope is encouraged but optional: `feat(ui): drag-and-drop applies the move`
 reads cleaner in the changelog than a bare `feat:`.
 
 ## Releases

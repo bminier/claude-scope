@@ -16,7 +16,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency:
   # Serialize so two pushes can't open conflicting release PRs.
@@ -26,6 +25,11 @@ concurrency:
 jobs:
   release-please:
     runs-on: ubuntu-24.04
+    # Scoped here (rather than workflow-level) so future jobs don't
+    # silently inherit PR write access.
+    permissions:
+      contents: write
+      pull-requests: write
     outputs:
       pr: ${{ steps.release.outputs.pr }}
       release_created: ${{ steps.release.outputs.release_created }}
