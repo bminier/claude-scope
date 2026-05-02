@@ -8,7 +8,7 @@ stale lockfile fails the release-please PR's CI run.
 
 This script does a surgical regex update of just that one version line. We
 deliberately avoid invoking cargo: a full `cargo update` could touch the
-dependency tree, which would conflate a release version bump with a
+dependency tree, which would conflate a release version bump with
 dependency churn we don't want bundled into the release-please PR.
 
 Side effect: a CRLF Cargo.lock (e.g. a Windows clone with

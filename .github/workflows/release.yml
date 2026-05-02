@@ -367,14 +367,25 @@ jobs:
             row_json=$(echo "$row" | base64 -d)
             asset_id=$(echo "$row_json" | jq -r '.id')
             name=$(echo "$row_json" | jq -r '.name')
+            # Defense in depth: asset names come from our Tauri matrix and
+            # shouldn't contain path separators, but reject any that do so a
+            # compromised upload can't escape the working directory.
+            case "$name" in
+              */*|*..*|"")
+                echo "::error::refusing suspicious asset name: $name"
+                exit 1
+                ;;
+            esac
             gh api -H "Accept: application/octet-stream" \
               "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
               > "$name"
           done
 
           # `--tag` produces BSD-style output (`SHA256 (file) = hash`) which
-          # `sha256sum -c` can verify on any platform.
-          sha256sum --tag * | sort > SHA256SUMS.txt
+          # `sha256sum -c` can verify on any platform. `--` terminates option
+          # parsing so a hypothetical asset name starting with `-` can't be
+          # interpreted as a flag.
+          sha256sum --tag -- * | sort > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
           # Drop a stale SHA256SUMS.txt from a previous run (e.g.
