@@ -321,6 +321,13 @@ jobs:
   # workflow_dispatch reruns of the same tag converge cleanly.
   sums:
     needs: [setup, release]
+    # The release matrix is fail-fast: false on purpose — a single failed
+    # platform leg shouldn't suppress checksums for the legs that did
+    # publish. Run as long as setup succeeded (we need the release tag) and
+    # the workflow wasn't cancelled. The asset_count==0 guard below still
+    # exits 1 if every leg failed, so we don't silently publish an empty
+    # SHA256SUMS.txt.
+    if: ${{ !cancelled() && needs.setup.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
