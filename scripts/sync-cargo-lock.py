@@ -54,7 +54,10 @@ def update_lock(version: str) -> bool:
     # The repo is LF-only and pre-commit's mixed-line-ending hook would fix
     # it, but better not to dirty the file in the first place.
     raw = CARGO_LOCK.read_bytes()
-    text = raw.decode("utf-8")
+    # A Windows clone with core.autocrlf=true can put CRLF in Cargo.lock,
+    # which defeats the LF-literal regex below. The repo is LF-only, so
+    # normalize on read and let the byte-mode write below restore that.
+    text = raw.decode("utf-8").replace("\r\n", "\n")
     pattern = re.compile(
         r'(\[\[package\]\]\nname\s*=\s*"' + re.escape(PACKAGE_NAME) + r'"\nversion\s*=\s*")[^"]*(")'
     )
