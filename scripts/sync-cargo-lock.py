@@ -21,8 +21,16 @@ a real problem).
 """
 from __future__ import annotations
 
-import re
 import sys
+
+if sys.version_info < (3, 11):
+    sys.exit(
+        "sync-cargo-lock requires Python 3.11+ (uses stdlib tomllib); "
+        f"got {sys.version_info.major}.{sys.version_info.minor}. "
+        "CI pins Python 3.12 (.github/workflows/ci.yml, release-please.yml)."
+    )
+
+import re
 import tomllib
 from pathlib import Path
 
