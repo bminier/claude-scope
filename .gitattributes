@@ -1,0 +1,10 @@
+# Enforce LF line endings on checkout for all text files, regardless of the
+# user's core.autocrlf setting. See issue #92.
+* text=auto eol=lf
+
+# Tracked binaries — never normalize.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.icns binary
