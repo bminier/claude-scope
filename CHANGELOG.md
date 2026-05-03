@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.3.0](https://github.com/bminier/claude-scope/compare/claude-scope-v0.2.0...claude-scope-v0.3.0) (2026-05-03)
+## 0.3.0 (2026-05-03)
 
 
 ### Features
