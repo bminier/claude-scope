@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "claude-scope"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dirs",
  "notify-debouncer-mini",
