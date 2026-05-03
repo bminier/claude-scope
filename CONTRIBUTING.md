@@ -15,23 +15,23 @@ how releases are cut.
 
 Every commit on `dev` (and therefore every PR title that gets squash-merged)
 must follow [Conventional Commits](https://www.conventionalcommits.org/).
-The release pipeline reads commit subjects to decide the next version and to
-generate `CHANGELOG.md`.
+The release pipeline reads commit subjects to decide the next version and
+to populate the GitHub Release notes.
 
 The types release-please cares about:
 
-| Type        | Bump on `dev` | Appears in CHANGELOG | Notes                                             |
-|-------------|---------------|----------------------|---------------------------------------------------|
-| `feat:`     | minor         | **Features**         | New user-visible functionality.                   |
-| `fix:`      | patch         | **Bug Fixes**        | Bug fixes.                                        |
-| `perf:`     | patch         | **Performance**      | Perf improvements without behavior change.        |
-| `revert:`   | patch         | **Reverts**          | Reverts a previous commit.                        |
-| `refactor:` | none          | hidden               | Internal refactor; no user-visible change.        |
-| `test:`     | none          | hidden               | Test-only changes.                                |
-| `docs:`     | none          | hidden               | Documentation changes.                            |
-| `build:`    | none          | hidden               | Build-system / packaging tweaks.                  |
-| `ci:`       | none          | hidden               | CI workflow / pipeline changes.                   |
-| `chore:`    | none          | hidden               | Anything else (deps bumps, infra, housekeeping).  |
+| Type        | Bump on `dev` | Appears in release notes | Notes                                             |
+|-------------|---------------|--------------------------|---------------------------------------------------|
+| `feat:`     | minor         | **Features**             | New user-visible functionality.                   |
+| `fix:`      | patch         | **Bug Fixes**            | Bug fixes.                                        |
+| `perf:`     | patch         | **Performance**          | Perf improvements without behavior change.        |
+| `revert:`   | patch         | **Reverts**              | Reverts a previous commit.                        |
+| `refactor:` | none          | hidden                   | Internal refactor; no user-visible change.        |
+| `test:`     | none          | hidden                   | Test-only changes.                                |
+| `docs:`     | none          | hidden                   | Documentation changes.                            |
+| `build:`    | none          | hidden                   | Build-system / packaging tweaks.                  |
+| `ci:`       | none          | hidden                   | CI workflow / pipeline changes.                   |
+| `chore:`    | none          | hidden                   | Anything else (deps bumps, infra, housekeeping).  |
 
 A `!` after the type (e.g. `feat!:` / `fix!:`) or a `BREAKING CHANGE:` footer
 forces a major bump — except pre-1.0, where it bumps the minor instead
@@ -53,8 +53,9 @@ The flow:
 2. `.github/workflows/release-please.yml` opens (and keeps rebased) a
    "release PR" that bumps the version in `package.json`,
    `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`,
-   and `src-tauri/Cargo.lock`, and rewrites `CHANGELOG.md` from the
-   commits since the last release.
+   and `src-tauri/Cargo.lock`. Release notes are generated onto the GitHub
+   Release itself rather than into a tracked `CHANGELOG.md` (`skip-changelog`
+   in `release-please-config.json`).
 3. Merge the release PR. release-please then pushes the `vX.Y.Z` tag and
    creates the GitHub Release.
 4. The tag push triggers `.github/workflows/release.yml`, which builds the

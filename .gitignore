@@ -37,3 +37,9 @@ src-tauri/WixTools/
 # run lychee locally (e.g. for the smoke test or to reproduce a CI run).
 # Never commit; CI runs use a fresh cache each invocation.
 .lycheecache
+
+# release-please is configured with skip-changelog (see release-please-config.json),
+# so CHANGELOG.md should never be regenerated; release notes live on GitHub
+# Releases. Belt-and-suspenders ignore in case a stale config or local run
+# resurrects the file.
+CHANGELOG.md
