@@ -14,16 +14,17 @@ Work on feature branches. Open PRs targeting `dev`. Follow conventional commits.
 
 ## Versioning
 
-Version bumps are automated by release-please (see `CONTRIBUTING.md`).
-release-please opens a "release PR" against `dev` whenever a conventional
-`feat:` / `fix:` / `perf:` lands, bumps every version-carrying file in
-lockstep (`package.json`, `package-lock.json`, `src-tauri/Cargo.toml`,
-`src-tauri/tauri.conf.json`, plus `src-tauri/Cargo.lock` via a follow-up
-sync step in `release-please.yml`). Merging that PR pushes a `vX.Y.Z`
-tag, which triggers `release.yml` to build and upload installers +
-`SHA256SUMS.txt`. Release notes live on the GitHub Release itself —
-`skip-changelog` is set in `release-please-config.json`, so there is
-no tracked `CHANGELOG.md`.
+Version bumps are automated by release-please (see `CONTRIBUTING.md`),
+but **manually triggered** — release-please does not run on every push to
+`dev`. To cut a release, run **Actions → Release Please → Run workflow**;
+release-please walks `dev` since the last tag, opens a "release PR" that
+bumps every version-carrying file in lockstep (`package.json`,
+`package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`,
+plus `src-tauri/Cargo.lock` via a follow-up sync step in
+`release-please.yml`). Merging that PR pushes a `vX.Y.Z` tag, which
+triggers `release.yml` to build and upload installers + `SHA256SUMS.txt`.
+Release notes live on the GitHub Release itself — `skip-changelog` is set
+in `release-please-config.json`, so there is no tracked `CHANGELOG.md`.
 
 If you ever need to bump versions by hand (e.g. release-please is broken),
 do **not** regenerate `package-lock.json` with

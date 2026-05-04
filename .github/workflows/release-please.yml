@@ -8,10 +8,14 @@ name: Release Please
 #
 # The release PR therefore goes through normal CI before merge, so a broken
 # tree never gets tagged.
+#
+# Manual-trigger only: previously this fired on every push to `dev`, which
+# meant a release PR sat open after every `feat:`/`fix:`/`perf:` merge.
+# Maintainer now invokes it via the Actions UI ("Run workflow") when ready
+# to cut a release. release-please walks `dev` since the last tag and opens
+# the release PR on that single dispatch.
 
 on:
-  push:
-    branches: [dev]
   workflow_dispatch:
 
 permissions:
