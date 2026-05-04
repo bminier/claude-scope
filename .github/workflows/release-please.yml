@@ -8,23 +8,35 @@ name: Release Please
 #
 # The release PR therefore goes through normal CI before merge, so a broken
 # tree never gets tagged.
+#
+# Manual-trigger only: previously this fired on every push to `dev`, which
+# meant a release PR sat open after every `feat:`/`fix:`/`perf:` merge.
+# Maintainer now invokes it via the Actions UI ("Run workflow") when ready
+# to cut a release. release-please walks `dev` since the last tag and opens
+# the release PR on that single dispatch.
 
 on:
-  push:
-    branches: [dev]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  # Serialize so two pushes can't open conflicting release PRs.
-  group: release-please-${{ github.ref }}
+  # release-please always operates on `dev` (target-branch is hardcoded
+  # below), regardless of which ref the dispatch fires from. Pin the group
+  # to that target so two simultaneous dispatches from different refs still
+  # serialize — keying on github.ref would let them race and produce
+  # conflicting release PRs.
+  group: release-please-dev
   cancel-in-progress: false
 
 jobs:
   release-please:
     runs-on: ubuntu-24.04
+    # Belt-and-suspenders: target-branch is hardcoded to `dev` below, so
+    # dispatching from any other ref would just run a (possibly stale) copy
+    # of this workflow against `dev`'s history. Refuse outright instead.
+    if: github.ref_name == 'dev'
     # Scoped here (rather than workflow-level) so future jobs don't
     # silently inherit PR write access.
     permissions:

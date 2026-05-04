@@ -43,25 +43,31 @@ reads cleaner in the changelog than a bare `feat:`.
 
 ## Releases
 
-Releases are fully automated via
-[release-please](https://github.com/googleapis/release-please-action) plus
-the existing tag-driven `release.yml`. There's nothing to do by hand.
+Releases use [release-please](https://github.com/googleapis/release-please-action)
+plus the existing tag-driven `release.yml`. The cut is **maintainer-triggered**
+— release-please does not open a release PR on every merge into `dev`.
 
 The flow:
 
 1. Land conventional-commit PRs into `dev`.
-2. `.github/workflows/release-please.yml` opens (and keeps rebased) a
-   "release PR" that bumps the version in `package.json`,
-   `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`,
-   and `src-tauri/Cargo.lock`. Release notes are generated onto the GitHub
-   Release itself rather than into a tracked `CHANGELOG.md` (`skip-changelog`
-   in `release-please-config.json`).
+2. When ready to cut a release, manually run **Actions → Release Please →
+   Run workflow** on `dev`. release-please walks `dev` since the last tag,
+   computes the next semver bump from commit subjects, and opens a "release
+   PR" that bumps the version in `package.json`, `package-lock.json`,
+   `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, and
+   `src-tauri/Cargo.lock`. Release notes are generated onto the GitHub
+   Release itself rather than into a tracked `CHANGELOG.md`
+   (`skip-changelog` in `release-please-config.json`).
 3. Merge the release PR. release-please then pushes the `vX.Y.Z` tag and
    creates the GitHub Release.
 4. The tag push triggers `.github/workflows/release.yml`, which builds the
    Tauri installers for Linux / Windows / macOS-universal and uploads them
    plus a `SHA256SUMS.txt` to that release as a draft.
 5. Review the draft release in the GitHub UI and click "Publish".
+
+If you re-run the workflow after additional commits land on `dev`, the
+existing release PR is rebased to include them — same machinery, just
+triggered on demand instead of on every push.
 
 ### Caveats
 
