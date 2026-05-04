@@ -15,12 +15,12 @@
     "test:unit": "vitest run"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.3.0",
-    "@tauri-apps/plugin-dialog": "^2.2.0"
+    "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.4.13",
-    "@tauri-apps/cli": "^2.3.0",
+    "@biomejs/biome": "2.4.14",
+    "@tauri-apps/cli": "^2.11.0",
     "happy-dom": "^20.0.0",
     "typescript": "^6.0.3",
     "vite": "^8.0.10",
