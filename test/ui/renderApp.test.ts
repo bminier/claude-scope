@@ -196,9 +196,7 @@ describe("openSettings – theme radios", () => {
   }
 
   function getThemeRadios(): HTMLInputElement[] {
-    return Array.from(
-      document.querySelectorAll<HTMLInputElement>('input[name="settings-theme"]'),
-    );
+    return Array.from(document.querySelectorAll<HTMLInputElement>('input[name="settings-theme"]'));
   }
 
   it("renders three theme radios (auto, light, dark)", () => {
@@ -222,15 +220,18 @@ describe("openSettings – theme radios", () => {
     openSettings(makeSettingsProps("auto", onChangeTheme));
     const darkRadio = getThemeRadios().find((r) => r.value === "dark");
     expect(darkRadio).toBeDefined();
-    darkRadio!.checked = true;
-    darkRadio!.dispatchEvent(new Event("change"));
+    if (!darkRadio) return;
+    darkRadio.checked = true;
+    darkRadio.dispatchEvent(new Event("change"));
     expect(onChangeTheme).toHaveBeenCalledTimes(1);
     expect(onChangeTheme).toHaveBeenCalledWith("dark");
   });
 
   it("radio group has ARIA radiogroup role with label pointing to the heading", () => {
     openSettings(makeSettingsProps());
-    const group = document.querySelector('[role="radiogroup"][aria-labelledby="settings-theme-heading"]');
+    const group = document.querySelector(
+      '[role="radiogroup"][aria-labelledby="settings-theme-heading"]',
+    );
     expect(group).not.toBeNull();
     const heading = document.getElementById("settings-theme-heading");
     expect(heading?.textContent).toBe("Theme");
