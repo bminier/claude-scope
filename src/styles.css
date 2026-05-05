@@ -38,6 +38,8 @@
   --sandbox-text: #ffd479;
   --sandbox-text-strong: #ffe2a0;
   --sandbox-border: #5a4416;
+
+  color-scheme: dark;
 }
 
 :root[data-theme="light"] {
@@ -67,6 +69,8 @@
   --sandbox-text: #6a4c00;
   --sandbox-text-strong: #4a3500;
   --sandbox-border: #e0c373;
+
+  color-scheme: light;
 }
 
 * {

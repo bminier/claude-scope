@@ -228,9 +228,9 @@ describe("openSettings – theme radios", () => {
     expect(onChangeTheme).toHaveBeenCalledWith("dark");
   });
 
-  it("radio group has ARIA group role with label pointing to the heading", () => {
+  it("radio group has ARIA radiogroup role with label pointing to the heading", () => {
     openSettings(makeSettingsProps());
-    const group = document.querySelector('[role="group"][aria-labelledby="settings-theme-heading"]');
+    const group = document.querySelector('[role="radiogroup"][aria-labelledby="settings-theme-heading"]');
     expect(group).not.toBeNull();
     const heading = document.getElementById("settings-theme-heading");
     expect(heading?.textContent).toBe("Theme");
