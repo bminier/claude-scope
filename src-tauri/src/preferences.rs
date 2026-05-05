@@ -44,7 +44,7 @@ pub struct Preferences {
     pub visible_scopes: Vec<Scope>,
     /// Color theme override. `Auto` defers to the OS at the JS layer;
     /// `Light`/`Dark` pin the palette regardless of OS preference.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_theme")]
     pub theme: Theme,
 }
 
@@ -85,6 +85,22 @@ where
 {
     let raw = Vec::<Scope>::deserialize(deserializer)?;
     Ok(normalize_visible_scopes(raw))
+}
+
+/// Deserialize a `Theme` value, falling back to `Auto` for any unrecognized
+/// string. Without this, an unknown variant (e.g. from a hand-edited config or
+/// a future version adding a new theme) would cause `serde_json::from_slice`
+/// to fail and `load()` to silently reset *all* preferences via `unwrap_or_default`.
+fn deserialize_theme<'de, D>(deserializer: D) -> Result<Theme, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer).unwrap_or_default();
+    Ok(match s.as_str() {
+        "light" => Theme::Light,
+        "dark" => Theme::Dark,
+        _ => Theme::Auto,
+    })
 }
 
 /// Resolve the on-disk path for the config file. `None` when the OS couldn't
@@ -223,6 +239,17 @@ mod tests {
             let parsed: Preferences = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed.theme, theme);
         }
+    }
+
+    #[test]
+    fn unknown_theme_value_falls_back_to_auto_without_losing_other_fields() {
+        // A hand-edited config or a future schema with an unrecognized theme
+        // variant must degrade to Auto rather than failing the whole parse and
+        // resetting visible_scopes (and any other fields) via unwrap_or_default.
+        let prefs: Preferences =
+            serde_json::from_str(r#"{"visible_scopes":["project"],"theme":"sepia"}"#).unwrap();
+        assert_eq!(prefs.theme, Theme::Auto);
+        assert_eq!(prefs.visible_scopes, vec![Scope::Project]);
     }
 
     #[test]

@@ -1278,6 +1278,7 @@ function settingsThemeSection(props: SettingsProps): HTMLElement {
   section.className = "settings-section";
 
   const heading = document.createElement("h3");
+  heading.id = "settings-theme-heading";
   heading.className = "settings-heading";
   heading.textContent = "Theme";
   section.appendChild(heading);
@@ -1293,6 +1294,8 @@ function settingsThemeSection(props: SettingsProps): HTMLElement {
   // settings-checklist sibling already follows that pattern).
   const list = document.createElement("div");
   list.className = "settings-checklist";
+  list.setAttribute("role", "group");
+  list.setAttribute("aria-labelledby", "settings-theme-heading");
   const groupName = "settings-theme";
   for (const opt of THEME_OPTIONS) {
     const row = document.createElement("label");

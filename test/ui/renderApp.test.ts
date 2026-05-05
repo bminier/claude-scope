@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MoveOptions, MoveRequest, Scope } from "../../src/types.ts";
+import type { MoveOptions, MoveRequest, Scope, Theme } from "../../src/types.ts";
 import { SEARCH_INPUT_ID } from "../../src/types.ts";
-import { renderApp } from "../../src/ui.ts";
+import { openSettings, renderApp } from "../../src/ui.ts";
 import { buildLoadedScopes, buildPreferences, buildRuntimeInfo } from "../fixtures/loadedScopes.ts";
 
 function makeRoot(): HTMLElement {
@@ -179,5 +179,60 @@ describe("renderApp", () => {
     );
     const headings = Array.from(root.querySelectorAll(".col h3")).map((el) => el.textContent);
     expect(headings).toEqual(["Project"]);
+  });
+});
+
+describe("openSettings – theme radios", () => {
+  afterEach(() => {
+    clearBody();
+  });
+
+  function makeSettingsProps(theme: Theme = "auto", onChangeTheme = vi.fn()) {
+    return {
+      preferences: buildPreferences({ theme }),
+      onToggleScopeVisibility: vi.fn(),
+      onChangeTheme,
+    };
+  }
+
+  function getThemeRadios(): HTMLInputElement[] {
+    return Array.from(
+      document.querySelectorAll<HTMLInputElement>('input[name="settings-theme"]'),
+    );
+  }
+
+  it("renders three theme radios (auto, light, dark)", () => {
+    openSettings(makeSettingsProps());
+    const radios = getThemeRadios();
+    expect(radios).toHaveLength(3);
+    expect(radios.map((r) => r.value)).toEqual(["auto", "light", "dark"]);
+  });
+
+  it("checks the radio matching the current theme preference", () => {
+    for (const theme of ["auto", "light", "dark"] as Theme[]) {
+      clearBody();
+      openSettings(makeSettingsProps(theme));
+      const checked = getThemeRadios().find((r) => r.checked);
+      expect(checked?.value).toBe(theme);
+    }
+  });
+
+  it("calls onChangeTheme with the selected value when a radio is changed", () => {
+    const onChangeTheme = vi.fn();
+    openSettings(makeSettingsProps("auto", onChangeTheme));
+    const darkRadio = getThemeRadios().find((r) => r.value === "dark");
+    expect(darkRadio).toBeDefined();
+    darkRadio!.checked = true;
+    darkRadio!.dispatchEvent(new Event("change"));
+    expect(onChangeTheme).toHaveBeenCalledTimes(1);
+    expect(onChangeTheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("radio group has ARIA group role with label pointing to the heading", () => {
+    openSettings(makeSettingsProps());
+    const group = document.querySelector('[role="group"][aria-labelledby="settings-theme-heading"]');
+    expect(group).not.toBeNull();
+    const heading = document.getElementById("settings-theme-heading");
+    expect(heading?.textContent).toBe("Theme");
   });
 });
