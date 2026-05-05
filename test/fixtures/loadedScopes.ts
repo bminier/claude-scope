@@ -118,6 +118,7 @@ export function buildLoadedScopes(overrides: LoadedScopesOverrides = {}): Loaded
 export function buildPreferences(overrides: Partial<Preferences> = {}): Preferences {
   return {
     visible_scopes: overrides.visible_scopes ?? [...SCOPES],
+    theme: overrides.theme ?? "auto",
   };
 }
 

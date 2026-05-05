@@ -1,3 +1,16 @@
+/*
+ * Palette tokens. The default `:root` block is the dark palette — it's also
+ * what paints during the brief window between first paint and `applyTheme()`
+ * resolving on cold start, so a dark-flash on light-themed launches is the
+ * trade we accepted (vs. introducing a localStorage shadow). The
+ * `[data-theme="light"]` block overrides every token whose dark value would
+ * be wrong on a light background.
+ *
+ * Semantic tokens (--ring-focus, --shadow-modal, etc.) exist so component
+ * styles don't have to know whether they're rendering against a light or
+ * dark background — they always reference the same variable, and the
+ * variable resolves correctly in either palette.
+ */
 :root {
   --bg: #0f1115;
   --panel: #161a21;
@@ -10,6 +23,50 @@
   --deny: #e67e7e;
   --ask: #e8c374;
   --err: #ff6b6b;
+
+  --ring-focus: rgba(122, 162, 247, 0.25);
+  --shadow-modal: rgba(0, 0, 0, 0.5);
+  --backdrop: rgba(0, 0, 0, 0.55);
+  --drop-target-bg: rgba(122, 162, 247, 0.05);
+  --drop-target-border: rgba(122, 162, 247, 0.25);
+  --diff-add-bg: rgba(143, 201, 127, 0.15);
+  --diff-remove-bg: rgba(230, 126, 126, 0.12);
+  --lint-warn-bg: rgba(232, 195, 116, 0.12);
+  --lint-warn-ring: rgba(232, 195, 116, 0.35);
+  --popover-shadow: rgba(0, 0, 0, 0.45);
+  --sandbox-bg: #3a2e10;
+  --sandbox-text: #ffd479;
+  --sandbox-text-strong: #ffe2a0;
+  --sandbox-border: #5a4416;
+}
+
+:root[data-theme="light"] {
+  --bg: #f7f8fa;
+  --panel: #ffffff;
+  --panel-2: #eef0f4;
+  --border: #d4d8e0;
+  --text: #14161a;
+  --muted: #5b6472;
+  --accent: #3760c5;
+  --allow: #2f7a26;
+  --deny: #b3261e;
+  --ask: #8a6212;
+  --err: #b3261e;
+
+  --ring-focus: rgba(55, 96, 197, 0.25);
+  --shadow-modal: rgba(20, 22, 26, 0.18);
+  --backdrop: rgba(20, 22, 26, 0.35);
+  --drop-target-bg: rgba(55, 96, 197, 0.07);
+  --drop-target-border: rgba(55, 96, 197, 0.3);
+  --diff-add-bg: rgba(47, 122, 38, 0.1);
+  --diff-remove-bg: rgba(179, 38, 30, 0.08);
+  --lint-warn-bg: rgba(138, 98, 18, 0.1);
+  --lint-warn-ring: rgba(138, 98, 18, 0.3);
+  --popover-shadow: rgba(20, 22, 26, 0.22);
+  --sandbox-bg: #fff4d4;
+  --sandbox-text: #6a4c00;
+  --sandbox-text-strong: #4a3500;
+  --sandbox-border: #e0c373;
 }
 
 * {
@@ -47,9 +104,9 @@ body {
  * equivalent) is set at launch. Amber on dark amber to read as a warning
  * without escalating to an error red. */
 .sandbox-banner {
-  background: #3a2e10;
-  color: #ffd479;
-  border-bottom: 1px solid #5a4416;
+  background: var(--sandbox-bg);
+  color: var(--sandbox-text);
+  border-bottom: 1px solid var(--sandbox-border);
   padding: 8px 16px;
   font-size: 13px;
   display: flex;
@@ -64,7 +121,7 @@ body {
 }
 
 .sandbox-banner strong {
-  color: #ffe2a0;
+  color: var(--sandbox-text-strong);
 }
 
 .search {
@@ -96,7 +153,7 @@ body {
   border-color: var(--accent);
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-  box-shadow: 0 0 0 2px rgba(122, 162, 247, 0.25);
+  box-shadow: 0 0 0 2px var(--ring-focus);
 }
 
 .search-input:disabled {
@@ -302,8 +359,8 @@ button:disabled {
    consistently across mouse and keyboard input. */
 .col-drop-active {
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(122, 162, 247, 0.25);
-  background: rgba(122, 162, 247, 0.05);
+  box-shadow: 0 0 0 2px var(--drop-target-border);
+  background: var(--drop-target-bg);
 }
 
 /* Grab cursors on the actual drag handles. Only applied when JS marks the
@@ -507,7 +564,7 @@ button:disabled {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -523,7 +580,7 @@ button:disabled {
   width: min(900px, 100%);
   max-height: 90vh;
   overflow: auto;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 20px 60px var(--shadow-modal);
 }
 
 .modal-title {
@@ -655,13 +712,13 @@ button:disabled {
 }
 
 .modal-diff-list .diff-removed {
-  background: rgba(230, 126, 126, 0.12);
+  background: var(--diff-remove-bg);
   color: var(--deny);
   text-decoration: line-through;
 }
 
 .modal-diff-list .diff-added {
-  background: rgba(143, 201, 127, 0.15);
+  background: var(--diff-add-bg);
   color: var(--allow);
 }
 
@@ -742,14 +799,14 @@ button:disabled {
      warning color explicitly so the badge stays in its lint palette. */
   color: var(--ask);
   border-color: var(--ask);
-  background: rgba(232, 195, 116, 0.12);
+  background: var(--lint-warn-bg);
 }
 
 .lint-warn:focus-visible {
   outline: none;
   color: var(--ask);
   border-color: var(--ask);
-  box-shadow: 0 0 0 2px rgba(232, 195, 116, 0.35);
+  box-shadow: 0 0 0 2px var(--lint-warn-ring);
 }
 
 .lint-warn-popover {
@@ -765,7 +822,7 @@ button:disabled {
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 6px;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 6px 18px var(--popover-shadow);
   font-size: 12px;
   line-height: 1.35;
   white-space: normal;
@@ -865,7 +922,7 @@ button:disabled {
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 6px;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 6px 18px var(--popover-shadow);
   font-size: 12px;
   line-height: 1.35;
   white-space: normal;

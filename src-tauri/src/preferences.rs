@@ -20,6 +20,16 @@ use crate::scope::Scope;
 /// Shape of the persisted config file. Every field carries a `#[serde(default)]`
 /// so unknown or missing keys degrade gracefully to sensible defaults — the
 /// schema can evolve without forcing a migration on every launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    /// Follow the OS `prefers-color-scheme` value at runtime.
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preferences {
     /// Scope columns the user wants visible. Defaults to all four. The
@@ -32,12 +42,17 @@ pub struct Preferences {
         deserialize_with = "deserialize_visible_scopes"
     )]
     pub visible_scopes: Vec<Scope>,
+    /// Color theme override. `Auto` defers to the OS at the JS layer;
+    /// `Light`/`Dark` pin the palette regardless of OS preference.
+    #[serde(default)]
+    pub theme: Theme,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             visible_scopes: default_visible_scopes(),
+            theme: Theme::default(),
         }
     }
 }
@@ -176,10 +191,50 @@ mod tests {
     fn round_trips_through_json() {
         let prefs = Preferences {
             visible_scopes: vec![Scope::Local, Scope::Project],
+            theme: Theme::Light,
         };
         let json = serde_json::to_string(&prefs).unwrap();
         let parsed: Preferences = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, prefs);
+    }
+
+    #[test]
+    fn theme_defaults_to_auto() {
+        let prefs = Preferences::default();
+        assert_eq!(prefs.theme, Theme::Auto);
+    }
+
+    #[test]
+    fn deserializes_with_missing_theme_field() {
+        // Older configs predate the theme field; missing key must collapse
+        // to the default rather than fail the whole load.
+        let prefs: Preferences = serde_json::from_str(r#"{"visible_scopes":["project"]}"#).unwrap();
+        assert_eq!(prefs.theme, Theme::Auto);
+    }
+
+    #[test]
+    fn theme_round_trips_through_json_for_each_variant() {
+        for theme in [Theme::Auto, Theme::Light, Theme::Dark] {
+            let prefs = Preferences {
+                visible_scopes: default_visible_scopes(),
+                theme,
+            };
+            let json = serde_json::to_string(&prefs).unwrap();
+            let parsed: Preferences = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.theme, theme);
+        }
+    }
+
+    #[test]
+    fn theme_serializes_lowercase() {
+        let prefs = Preferences {
+            visible_scopes: default_visible_scopes(),
+            theme: Theme::Dark,
+        };
+        let json = serde_json::to_string(&prefs).unwrap();
+        // The JS side reads this string verbatim — pinning the casing
+        // here keeps the IPC contract from drifting silently.
+        assert!(json.contains(r#""theme":"dark""#));
     }
 
     /// Exercise the save path against a real filesystem so the
@@ -194,6 +249,7 @@ mod tests {
 
         let first = Preferences {
             visible_scopes: vec![Scope::Local],
+            theme: Theme::Auto,
         };
         let body = serde_json::to_vec_pretty(&first).unwrap();
         let parent = target.parent().unwrap();
@@ -207,6 +263,7 @@ mod tests {
         // alone would fail on Windows.
         let second = Preferences {
             visible_scopes: vec![Scope::Project, Scope::User],
+            theme: Theme::Dark,
         };
         let body2 = serde_json::to_vec_pretty(&second).unwrap();
         let mut tmpfile2 = tempfile::NamedTempFile::new_in(parent).unwrap();

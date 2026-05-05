@@ -125,12 +125,21 @@ export interface MoveKeyPreview {
 export const SEARCH_INPUT_ID = "rule-search";
 
 /**
+ * Color theme override. `auto` defers to the OS `prefers-color-scheme`
+ * value at runtime; `light` / `dark` pin the palette regardless of OS
+ * preference. Keep the variants lowercase — the Rust side serializes via
+ * `serde(rename_all = "lowercase")` and these strings cross the IPC verbatim.
+ */
+export type Theme = "auto" | "light" | "dark";
+
+/**
  * User preferences persisted to the OS config dir. Schema mirrors the Rust
  * `Preferences` struct; the backend fills in defaults for missing fields,
  * so this is always complete as read from the IPC.
  */
 export interface Preferences {
   visible_scopes: Scope[];
+  theme: Theme;
 }
 
 /**
