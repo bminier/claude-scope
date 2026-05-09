@@ -19,6 +19,115 @@ pub enum PermissionKind {
     Ask,
 }
 
+/// One segment of a JSON path. The frontend ships paths as mixed arrays of
+/// strings and numbers (`["permissions", "allow", 2]`), so an untagged enum
+/// over `String` / `usize` keeps the wire format identical to JSON Pointer
+/// shape without forcing every caller to escape numeric indices.
+///
+/// `Key` is tried first by serde, which is the right preference: object keys
+/// are strings on the wire even when they happen to look numeric, and
+/// `serde_json` only feeds the `usize` arm an actual JSON number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PathSeg {
+    Key(String),
+    Index(usize),
+}
+
+impl PathSeg {
+    /// Borrow the key segment if this is one. Used by the diff/apply flows
+    /// to pull the affected top-level key off a validated path; index
+    /// segments don't appear at index 0 of any movable shape.
+    pub fn as_key(&self) -> Option<&str> {
+        match self {
+            PathSeg::Key(s) => Some(s.as_str()),
+            PathSeg::Index(_) => None,
+        }
+    }
+}
+
+/// Shape of a path the move-leaf primitive accepts. `validate_movable_path`
+/// classifies every incoming request into one of these so the diff/apply
+/// impls can dispatch on a small, exhaustive enum instead of scrutinizing the
+/// path slice in three places. The set deliberately mirrors today's two-IPC
+/// capabilities (whole top-level key, whole permission kind array, single
+/// permission rule) — broader sub-path moves into other keys (`env.PATH`,
+/// `hooks.PreToolUse[0]`, etc.) are explicitly rejected for v1; they're a
+/// natural follow-up but out of scope for issue #67.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MovablePath<'a> {
+    /// Whole top-level key. Mirrors the old key-move flow.
+    TopLevelKey(&'a str),
+    /// Whole `permissions.<kind>` array (allow / deny / ask). Array-union into
+    /// the destination's matching array.
+    PermissionList(PermissionKind),
+    /// Single rule entry under `permissions.<kind>`. Array-union into the
+    /// destination's matching array (push if not already present).
+    PermissionRule(PermissionKind, usize),
+}
+
+/// Classify a wire-level path into a `MovablePath`, or reject it with a
+/// descriptive error. Centralizing the rules here keeps the diff path, apply
+/// path, and any future caller in lockstep — a path that's invalid at
+/// validation time is impossible at the dispatch site.
+pub fn validate_movable_path(path: &[PathSeg]) -> Result<MovablePath<'_>, String> {
+    match path {
+        [PathSeg::Key(k)] if k == "permissions" => Err(
+            "the permissions key is not movable as a whole; move a specific rule list \
+             (allow / deny / ask) or a single rule"
+                .into(),
+        ),
+        [PathSeg::Key(k)] => Ok(MovablePath::TopLevelKey(k.as_str())),
+        [PathSeg::Key(perm), PathSeg::Key(kind)] if perm == "permissions" => {
+            permission_kind_from_str(kind).map(MovablePath::PermissionList)
+        }
+        [PathSeg::Key(perm), PathSeg::Key(kind), PathSeg::Index(i)] if perm == "permissions" => {
+            permission_kind_from_str(kind).map(|k| MovablePath::PermissionRule(k, *i))
+        }
+        [] => Err("path is empty; move requires a target".into()),
+        _ => Err(format!(
+            "path is not movable in this version: {}",
+            describe_path(path)
+        )),
+    }
+}
+
+fn permission_kind_from_str(s: &str) -> Result<PermissionKind, String> {
+    match s {
+        "allow" => Ok(PermissionKind::Allow),
+        "deny" => Ok(PermissionKind::Deny),
+        "ask" => Ok(PermissionKind::Ask),
+        other => Err(format!(
+            "unknown permission kind `{other}`: expected allow / deny / ask"
+        )),
+    }
+}
+
+/// Render a path slice in JSON-Pointer-ish form for error messages. Uses dot
+/// separators for keys and bracketed indices for array entries (e.g.
+/// `permissions.allow[2]`) — readable in error toasts without needing the
+/// caller to construct the string themselves.
+pub fn describe_path(path: &[PathSeg]) -> String {
+    let mut out = String::new();
+    for seg in path {
+        match seg {
+            PathSeg::Key(k) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(k);
+            }
+            PathSeg::Index(i) => {
+                out.push_str(&format!("[{i}]"));
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push_str("(root)");
+    }
+    out
+}
+
 impl PermissionKind {
     pub const ALL: [PermissionKind; 3] = [
         PermissionKind::Allow,
@@ -208,6 +317,100 @@ impl SettingsDoc {
         }
     }
 
+    /// Read the JSON value at `path` if every segment resolves. Object keys
+    /// are matched verbatim; array indices must be in-bounds. Returns `None`
+    /// when any segment misses, which the move flow distinguishes from
+    /// `Some(Value::Null)` (a real null value at that path).
+    pub fn get_at_path(&self, path: &[PathSeg]) -> Option<&Value> {
+        let mut cur = &self.root;
+        for seg in path {
+            cur = match (cur, seg) {
+                (Value::Object(obj), PathSeg::Key(k)) => obj.get(k)?,
+                (Value::Array(arr), PathSeg::Index(i)) => arr.get(*i)?,
+                _ => return None,
+            };
+        }
+        Some(cur)
+    }
+
+    /// Remove the value at `path`. Mirrors `get_at_path`'s navigation but
+    /// removes the trailing segment instead of returning the value: keys are
+    /// removed from their parent object, array indices are spliced out (which
+    /// shifts later indices). Returns true iff a removal happened — a missing
+    /// path is a no-op `false` so callers can detect a stale request.
+    pub fn remove_at_path(&mut self, path: &[PathSeg]) -> bool {
+        let Some((last, parents)) = path.split_last() else {
+            return false;
+        };
+        let mut cur = &mut self.root;
+        for seg in parents {
+            cur = match (cur, seg) {
+                (Value::Object(obj), PathSeg::Key(k)) => match obj.get_mut(k) {
+                    Some(v) => v,
+                    None => return false,
+                },
+                (Value::Array(arr), PathSeg::Index(i)) => match arr.get_mut(*i) {
+                    Some(v) => v,
+                    None => return false,
+                },
+                _ => return false,
+            };
+        }
+        match (cur, last) {
+            (Value::Object(obj), PathSeg::Key(k)) => obj.remove(k).is_some(),
+            (Value::Array(arr), PathSeg::Index(i)) if *i < arr.len() => {
+                arr.remove(*i);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Merge `value` into the destination using the move-leaf semantics
+    /// classified by `validate_movable_path`. The caller is expected to have
+    /// already validated `path`; passing an invalid path here is a bug, so
+    /// this returns an error rather than silently dropping the write.
+    ///
+    /// - `MovablePath::TopLevelKey(k)` defers to `merge_top_level` so the
+    ///   existing per-key policy table (Replace / DeepMerge / ArrayUnion /
+    ///   Sandbox / ReplaceUnknown) governs the merge.
+    /// - `MovablePath::PermissionList(kind)` array-unions the incoming list
+    ///   into `permissions.<kind>`. Non-array sources fall back to overwrite,
+    ///   matching `array_union_in_place`'s shape-mismatch contract.
+    /// - `MovablePath::PermissionRule(kind, _)` ignores the source index (the
+    ///   destination's array order is independent) and pushes the rule string
+    ///   into `permissions.<kind>` if not already present.
+    pub fn merge_at_path(&mut self, path: &[PathSeg], value: Value) -> Result<(), String> {
+        let movable = validate_movable_path(path)?;
+        match movable {
+            MovablePath::TopLevelKey(k) => {
+                self.merge_top_level(k, value);
+                Ok(())
+            }
+            MovablePath::PermissionList(kind) => {
+                let arr = ensure_permission_list(&mut self.root, kind);
+                array_union_in_place(arr, value);
+                Ok(())
+            }
+            MovablePath::PermissionRule(kind, _) => {
+                let Some(rule) = value.as_str() else {
+                    return Err(format!(
+                        "permission rule must be a JSON string, got {}",
+                        json_type_name(&value)
+                    ));
+                };
+                let arr_value = ensure_permission_list(&mut self.root, kind);
+                let arr = arr_value
+                    .as_array_mut()
+                    .expect("ensure_permission_list returns array");
+                if !arr.iter().any(|v| v.as_str() == Some(rule)) {
+                    arr.push(Value::String(rule.to_string()));
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Render to JSON using the detected indentation. We intentionally avoid
     /// serde_json's pretty printer configuration because it doesn't support
     /// tab indents; hand-rolling keeps our options open.
@@ -229,6 +432,43 @@ fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
         *value = Value::Object(Map::new());
     }
     value.as_object_mut().expect("just made it an object")
+}
+
+/// Resolve `root.permissions.<kind>` to a mutable array slot, creating any
+/// missing intermediates. If `permissions` exists but is the wrong shape
+/// (e.g. a hand-edited file where `permissions` ended up as a string), the
+/// non-object value is replaced with a fresh map — matching the conservative
+/// "rather create than fail" stance of `add_rule`. Returns the array slot as
+/// a `&mut Value` so callers can hand it straight to `array_union_in_place`.
+fn ensure_permission_list(root: &mut Value, kind: PermissionKind) -> &mut Value {
+    let obj = ensure_object(root);
+    let perms_entry = obj
+        .entry("permissions".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !perms_entry.is_object() {
+        *perms_entry = Value::Object(Map::new());
+    }
+    let perms = perms_entry.as_object_mut().expect("permissions is object");
+    let list_entry = perms
+        .entry(kind.key().to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !list_entry.is_array() {
+        *list_entry = Value::Array(Vec::new());
+    }
+    list_entry
+}
+
+/// Human-readable name for a JSON value's runtime shape, used in error
+/// messages. Lifted to a helper so the move-leaf API can stay terse.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 /// How a top-level settings key should be combined when its value is moved
@@ -1013,5 +1253,287 @@ mod tests {
         assert!(!doc.remove_top_level("theme"));
         assert!(doc.get_top_level("theme").is_none());
         assert!(doc.get_top_level("env").is_some());
+    }
+
+    fn key(s: &str) -> PathSeg {
+        PathSeg::Key(s.to_string())
+    }
+
+    fn idx(i: usize) -> PathSeg {
+        PathSeg::Index(i)
+    }
+
+    #[test]
+    fn validate_movable_path_classifies_top_level_key() {
+        assert_eq!(
+            validate_movable_path(&[key("env")]).unwrap(),
+            MovablePath::TopLevelKey("env")
+        );
+    }
+
+    #[test]
+    fn validate_movable_path_classifies_permission_list() {
+        assert_eq!(
+            validate_movable_path(&[key("permissions"), key("allow")]).unwrap(),
+            MovablePath::PermissionList(PermissionKind::Allow)
+        );
+        assert_eq!(
+            validate_movable_path(&[key("permissions"), key("deny")]).unwrap(),
+            MovablePath::PermissionList(PermissionKind::Deny)
+        );
+    }
+
+    #[test]
+    fn validate_movable_path_classifies_permission_rule() {
+        assert_eq!(
+            validate_movable_path(&[key("permissions"), key("ask"), idx(3)]).unwrap(),
+            MovablePath::PermissionRule(PermissionKind::Ask, 3)
+        );
+    }
+
+    #[test]
+    fn validate_movable_path_rejects_bare_permissions_key() {
+        // Whole-block permissions moves bypass the per-rule policy and would
+        // surprise users — reject so the UI never offers the gesture.
+        assert!(validate_movable_path(&[key("permissions")]).is_err());
+    }
+
+    #[test]
+    fn validate_movable_path_rejects_unknown_permission_kind() {
+        assert!(validate_movable_path(&[key("permissions"), key("maybe")]).is_err());
+    }
+
+    #[test]
+    fn validate_movable_path_rejects_intermediate_subkeys() {
+        // v1 only carries today's two-IPC capabilities forward; sub-path moves
+        // into other keys (`env.PATH`, `hooks.PreToolUse[0]`) are explicitly
+        // out of scope until a follow-up issue.
+        assert!(validate_movable_path(&[key("env"), key("PATH")]).is_err());
+        assert!(validate_movable_path(&[key("hooks"), key("PreToolUse"), idx(0)]).is_err());
+    }
+
+    #[test]
+    fn validate_movable_path_rejects_empty() {
+        assert!(validate_movable_path(&[]).is_err());
+    }
+
+    #[test]
+    fn describe_path_renders_dot_and_brackets() {
+        assert_eq!(
+            describe_path(&[key("permissions"), key("allow"), idx(2)]),
+            "permissions.allow[2]"
+        );
+        assert_eq!(describe_path(&[key("env")]), "env");
+        assert_eq!(describe_path(&[]), "(root)");
+    }
+
+    #[test]
+    fn get_at_path_navigates_object_and_array() {
+        let doc = SettingsDoc::from_value(
+            serde_json::json!({
+                "permissions": {"allow": ["Bash(git status)", "Read(**)"]},
+                "env": {"PATH": "/bin"}
+            }),
+            Indent::Spaces(2),
+        );
+        assert_eq!(
+            doc.get_at_path(&[key("permissions"), key("allow"), idx(1)])
+                .unwrap(),
+            &serde_json::json!("Read(**)")
+        );
+        assert_eq!(
+            doc.get_at_path(&[key("env"), key("PATH")]).unwrap(),
+            &serde_json::json!("/bin")
+        );
+    }
+
+    #[test]
+    fn get_at_path_returns_none_on_miss() {
+        let doc = SettingsDoc::from_value(
+            serde_json::json!({"permissions": {"allow": ["x"]}}),
+            Indent::Spaces(2),
+        );
+        // Index out of bounds.
+        assert!(doc
+            .get_at_path(&[key("permissions"), key("allow"), idx(7)])
+            .is_none());
+        // Wrong segment kind for the runtime shape.
+        assert!(doc.get_at_path(&[key("permissions"), idx(0)]).is_none());
+        // Missing key.
+        assert!(doc.get_at_path(&[key("nope")]).is_none());
+    }
+
+    #[test]
+    fn get_at_path_distinguishes_null_value_from_absence() {
+        // Real `null` round-trips as `Some(Value::Null)`; absence is `None`.
+        // The move flow keys off this distinction (skip_serializing_if).
+        let doc = SettingsDoc::from_value(serde_json::json!({"theme": null}), Indent::Spaces(2));
+        assert_eq!(doc.get_at_path(&[key("theme")]), Some(&Value::Null));
+        assert_eq!(doc.get_at_path(&[key("missing")]), None);
+    }
+
+    #[test]
+    fn remove_at_path_removes_top_level_key() {
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"theme": "dark", "env": {"A": "1"}}),
+            Indent::Spaces(2),
+        );
+        assert!(doc.remove_at_path(&[key("theme")]));
+        assert!(doc.get_top_level("theme").is_none());
+        assert!(doc.get_top_level("env").is_some());
+    }
+
+    #[test]
+    fn remove_at_path_splices_array_element_and_shifts() {
+        // Removing an element shifts later indices left — caller responsibility
+        // to re-fetch by value, not by stale index.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"permissions": {"allow": ["a", "b", "c"]}}),
+            Indent::Spaces(2),
+        );
+        assert!(doc.remove_at_path(&[key("permissions"), key("allow"), idx(1)]));
+        assert_eq!(
+            doc.get_at_path(&[key("permissions"), key("allow")])
+                .unwrap(),
+            &serde_json::json!(["a", "c"])
+        );
+    }
+
+    #[test]
+    fn remove_at_path_returns_false_on_miss() {
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"permissions": {"allow": ["x"]}}),
+            Indent::Spaces(2),
+        );
+        assert!(!doc.remove_at_path(&[key("permissions"), key("allow"), idx(7)]));
+        assert!(!doc.remove_at_path(&[key("permissions"), key("deny"), idx(0)]));
+        assert!(!doc.remove_at_path(&[key("nope")]));
+        assert!(!doc.remove_at_path(&[]));
+    }
+
+    #[test]
+    fn merge_at_path_top_level_key_dispatches_to_existing_policy() {
+        // env's KeyPolicy::DeepMerge must apply through merge_at_path so the
+        // unified primitive doesn't change semantics for keys that already had
+        // a policy under merge_top_level.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"env": {"PATH": "/old", "HOME": "/h"}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_at_path(&[key("env")], serde_json::json!({"PATH": "/new", "X": "1"}))
+            .unwrap();
+        assert_eq!(
+            *doc.get_top_level("env").unwrap(),
+            serde_json::json!({"PATH": "/new", "HOME": "/h", "X": "1"})
+        );
+    }
+
+    #[test]
+    fn merge_at_path_permission_list_unions_array() {
+        // Whole-list move: array-union into the destination's matching kind,
+        // matching the rule-move semantics rather than a wholesale replace.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"permissions": {"allow": ["a", "b"]}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_at_path(
+            &[key("permissions"), key("allow")],
+            serde_json::json!(["b", "c"]),
+        )
+        .unwrap();
+        assert_eq!(
+            *doc.get_top_level("permissions").unwrap(),
+            serde_json::json!({"allow": ["a", "b", "c"]})
+        );
+    }
+
+    #[test]
+    fn merge_at_path_permission_rule_pushes_when_absent() {
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"permissions": {"allow": ["a"]}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_at_path(
+            &[key("permissions"), key("allow"), idx(0)],
+            serde_json::json!("b"),
+        )
+        .unwrap();
+        assert_eq!(
+            *doc.get_top_level("permissions").unwrap(),
+            serde_json::json!({"allow": ["a", "b"]})
+        );
+    }
+
+    #[test]
+    fn merge_at_path_permission_rule_is_idempotent() {
+        // Existing rule already in the destination is a no-op merge; the
+        // source-removal half of the move flow handles the cleanup.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"permissions": {"allow": ["a"]}}),
+            Indent::Spaces(2),
+        );
+        doc.merge_at_path(
+            &[key("permissions"), key("allow"), idx(0)],
+            serde_json::json!("a"),
+        )
+        .unwrap();
+        assert_eq!(
+            *doc.get_top_level("permissions").unwrap(),
+            serde_json::json!({"allow": ["a"]})
+        );
+    }
+
+    #[test]
+    fn merge_at_path_permission_rule_creates_missing_kind_array() {
+        // Destination has no `deny` array yet — the helper should create it
+        // and insert, mirroring `add_rule`'s self-bootstrapping behavior.
+        let mut doc = SettingsDoc::empty();
+        doc.merge_at_path(
+            &[key("permissions"), key("deny"), idx(0)],
+            serde_json::json!("WebFetch(domain:evil.example)"),
+        )
+        .unwrap();
+        assert_eq!(
+            *doc.get_top_level("permissions").unwrap(),
+            serde_json::json!({"deny": ["WebFetch(domain:evil.example)"]})
+        );
+    }
+
+    #[test]
+    fn merge_at_path_rejects_non_string_permission_rule() {
+        let mut doc = SettingsDoc::empty();
+        let err = doc
+            .merge_at_path(
+                &[key("permissions"), key("allow"), idx(0)],
+                serde_json::json!(42),
+            )
+            .unwrap_err();
+        assert!(err.contains("must be a JSON string"));
+    }
+
+    #[test]
+    fn merge_at_path_rejects_invalid_path() {
+        let mut doc = SettingsDoc::empty();
+        // Bare permissions key — same rejection as validate_movable_path.
+        assert!(doc
+            .merge_at_path(&[key("permissions")], serde_json::json!({}))
+            .is_err());
+        // Sub-key under env not yet supported.
+        assert!(doc
+            .merge_at_path(&[key("env"), key("PATH")], serde_json::json!("/bin"))
+            .is_err());
+    }
+
+    #[test]
+    fn path_seg_serde_roundtrip_matches_wire_format() {
+        // Frontend ships paths as JSON arrays of strings + numbers. The
+        // untagged enum has to preserve that shape exactly so the IPC wire
+        // format never needs an escape hatch.
+        let path: Vec<PathSeg> =
+            serde_json::from_value(serde_json::json!(["permissions", "allow", 2])).unwrap();
+        assert_eq!(path, vec![key("permissions"), key("allow"), idx(2)]);
+
+        let back = serde_json::to_value(&path).unwrap();
+        assert_eq!(back, serde_json::json!(["permissions", "allow", 2]));
     }
 }

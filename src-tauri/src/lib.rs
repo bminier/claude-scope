@@ -35,6 +35,8 @@ pub fn run() {
             commands::apply_move,
             commands::diff_move_key,
             commands::apply_move_key,
+            commands::diff_move_leaf,
+            commands::apply_move_leaf,
             commands::load_preferences,
             commands::save_preferences,
             commands::load_runtime_info,
