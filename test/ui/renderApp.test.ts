@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MoveOptions, MoveRequest, Scope, Theme } from "../../src/types.ts";
+import type { MoveLeafRequest, MoveOptions, Scope, Theme } from "../../src/types.ts";
 import { SEARCH_INPUT_ID } from "../../src/types.ts";
 import { openSettings, renderApp } from "../../src/ui.ts";
 import { buildLoadedScopes, buildPreferences, buildRuntimeInfo } from "../fixtures/loadedScopes.ts";
@@ -22,7 +22,7 @@ interface PropsOverrides {
   query?: string;
   preferences?: ReturnType<typeof buildPreferences>;
   runtime?: ReturnType<typeof buildRuntimeInfo>;
-  onMove?: (req: MoveRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
+  onMoveLeaf?: (req: MoveLeafRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
 }
 
 function makeProps(overrides: PropsOverrides = {}) {
@@ -43,8 +43,7 @@ function makeProps(overrides: PropsOverrides = {}) {
     runtime: overrides.runtime ?? buildRuntimeInfo(),
     onPickProject: vi.fn(),
     onReload: vi.fn(),
-    onMove: overrides.onMove ?? vi.fn(),
-    onMoveKey: vi.fn(),
+    onMoveLeaf: overrides.onMoveLeaf ?? vi.fn(),
     onOpenSettings: vi.fn(),
     onQueryChange: vi.fn(),
   };
@@ -128,25 +127,25 @@ describe("renderApp", () => {
     expect(after?.selectionEnd).toBe(2);
   });
 
-  it("invokes onMove with the expected request when a per-scope move button is clicked", () => {
-    const onMove = vi.fn();
+  it("invokes onMoveLeaf with a path-based request when a per-scope move button is clicked", () => {
+    // Permission rules now live as tree leaves under `permissions.allow[*]`,
+    // so the move button rides on the leaf's `.rule .rule-moves .move-btn`
+    // and the request payload carries a JSON path instead of {rule, kind}.
+    const onMoveLeaf = vi.fn();
     const scopes = buildLoadedScopes({
       scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
     });
-    renderApp(root, makeProps({ scopes, onMove }));
-    // The project column has buttons targeting every other visible scope.
-    // Pick the one targeting "user" so the click is unambiguous.
+    renderApp(root, makeProps({ scopes, onMoveLeaf }));
     const buttons = Array.from(
-      root.querySelectorAll<HTMLButtonElement>(".rule-group .rule-moves .move-btn"),
+      root.querySelectorAll<HTMLButtonElement>(".rule.rule-allow .rule-moves .move-btn"),
     );
     const toUser = buttons.find((b) => b.textContent === "→ User");
     expect(toUser).toBeDefined();
     toUser?.click();
-    expect(onMove).toHaveBeenCalledTimes(1);
-    const [req] = onMove.mock.calls[0];
+    expect(onMoveLeaf).toHaveBeenCalledTimes(1);
+    const [req] = onMoveLeaf.mock.calls[0];
     expect(req).toEqual({
-      rule: "Bash(git status)",
-      kind: "allow",
+      path: ["permissions", "allow", 0],
       from: "project",
       to: "user",
     });

@@ -151,16 +151,6 @@ pub struct PermissionRules {
     pub ask: Vec<String>,
 }
 
-impl PermissionRules {
-    pub fn get(&self, kind: PermissionKind) -> &[String] {
-        match kind {
-            PermissionKind::Allow => &self.allow,
-            PermissionKind::Deny => &self.deny,
-            PermissionKind::Ask => &self.ask,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SettingsDoc {
     root: Value,
@@ -179,9 +169,12 @@ impl SettingsDoc {
         Self { root, indent }
     }
 
-    /// Top-level non-permission entries (key + value) in the order they were
-    /// written on disk. Used by the UI tree-view so it can show what's in
-    /// `env`, `hooks`, `theme`, and any future keys — not just their names.
+    /// Top-level non-permission entries (key + value) in on-disk order.
+    /// The UI consumes `all_entries` instead since the migration in #67
+    /// rendered `permissions` inline with the other top-level keys; this
+    /// accessor is kept under `#[cfg(test)]` so unit tests can still make
+    /// "permissions vs everything else" assertions compactly.
+    #[cfg(test)]
     pub fn other_entries(&self) -> Map<String, Value> {
         let Some(obj) = self.root.as_object() else {
             return Map::new();
@@ -192,9 +185,22 @@ impl SettingsDoc {
             .collect()
     }
 
+    /// Every top-level key + value in on-disk order, including `permissions`.
+    /// Drives the unified scope-column tree on the frontend.
+    pub fn all_entries(&self) -> Map<String, Value> {
+        let Some(obj) = self.root.as_object() else {
+            return Map::new();
+        };
+        obj.clone()
+    }
+
     /// Read the permissions block as a `PermissionRules` snapshot. Missing or
     /// malformed shapes produce empty lists rather than failing; a partially
     /// corrupt settings file shouldn't stop the whole UI from loading.
+    /// Production code reaches permissions through the unified `values`
+    /// map (see `commands::permissions_from_values`); this accessor is
+    /// kept for test convenience.
+    #[cfg(test)]
     pub fn permissions(&self) -> PermissionRules {
         let mut out = PermissionRules::default();
         let Some(perms) = self.root.get("permissions").and_then(Value::as_object) else {
@@ -216,62 +222,11 @@ impl SettingsDoc {
         out
     }
 
-    /// Add a rule to the given list if it isn't already present. Ensures
-    /// `permissions.<kind>` exists as an array. Returns true if the document
-    /// was actually mutated (i.e. the rule wasn't already present).
-    pub fn add_rule(&mut self, kind: PermissionKind, rule: &str) -> bool {
-        let obj = ensure_object(&mut self.root);
-        let perms_entry = obj
-            .entry("permissions".to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        if !perms_entry.is_object() {
-            *perms_entry = Value::Object(Map::new());
-        }
-        let perms = perms_entry.as_object_mut().expect("permissions is object");
-        let list_entry = perms
-            .entry(kind.key().to_string())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if !list_entry.is_array() {
-            *list_entry = Value::Array(Vec::new());
-        }
-        let arr = list_entry.as_array_mut().expect("rule list is array");
-        if arr.iter().any(|v| v.as_str() == Some(rule)) {
-            return false;
-        }
-        arr.push(Value::String(rule.to_string()));
-        true
-    }
-
-    /// Remove every occurrence of `rule` from `permissions.<kind>`. Returns
-    /// true if at least one entry was removed.
-    pub fn remove_rule(&mut self, kind: PermissionKind, rule: &str) -> bool {
-        let Some(perms) = self
-            .root
-            .get_mut("permissions")
-            .and_then(Value::as_object_mut)
-        else {
-            return false;
-        };
-        let Some(Value::Array(arr)) = perms.get_mut(kind.key()) else {
-            return false;
-        };
-        let before = arr.len();
-        arr.retain(|v| v.as_str() != Some(rule));
-        before != arr.len()
-    }
-
-    /// Read a single top-level key (any type). Used by the key-move flow to
-    /// inspect the raw JSON value before applying a merge.
+    /// Read a single top-level key (any type). Tests and the move-leaf
+    /// diff/apply use it for one-shot reads; production callers that need
+    /// path-based access go through `get_at_path`.
     pub fn get_top_level(&self, key: &str) -> Option<&Value> {
         self.root.get(key)
-    }
-
-    /// Remove a top-level key. Returns true if the key was present.
-    pub fn remove_top_level(&mut self, key: &str) -> bool {
-        self.root
-            .as_object_mut()
-            .and_then(|o| o.remove(key))
-            .is_some()
     }
 
     /// Merge `value` into the top-level `key` using the documented Claude
@@ -853,26 +808,6 @@ mod tests {
     }
 
     #[test]
-    fn add_then_remove_roundtrip() {
-        let mut doc = SettingsDoc::empty();
-        doc.add_rule(PermissionKind::Allow, "Bash(git status)");
-        assert!(doc
-            .permissions()
-            .allow
-            .contains(&"Bash(git status)".to_string()));
-        assert!(doc.remove_rule(PermissionKind::Allow, "Bash(git status)"));
-        assert!(doc.permissions().allow.is_empty());
-    }
-
-    #[test]
-    fn add_rule_is_idempotent_and_reports_mutation() {
-        let mut doc = SettingsDoc::empty();
-        assert!(doc.add_rule(PermissionKind::Deny, "Bash(rm -rf /)"));
-        assert!(!doc.add_rule(PermissionKind::Deny, "Bash(rm -rf /)"));
-        assert_eq!(doc.permissions().deny.len(), 1);
-    }
-
-    #[test]
     fn render_preserves_key_order_and_indent() {
         let doc = SettingsDoc::from_value(
             serde_json::from_str(r#"{"theme":"dark","permissions":{"allow":["a"],"deny":[]}}"#)
@@ -903,12 +838,6 @@ mod tests {
         let doc = SettingsDoc::empty();
         let out = doc.render();
         assert_eq!(out.trim_end(), "{}");
-    }
-
-    #[test]
-    fn remove_rule_on_missing_is_noop() {
-        let mut doc = SettingsDoc::empty();
-        assert!(!doc.remove_rule(PermissionKind::Allow, "nope"));
     }
 
     #[test]
@@ -1241,18 +1170,6 @@ mod tests {
             *doc.get_top_level("allowedHttpHookUrls").unwrap(),
             serde_json::json!(["https://a.example"])
         );
-    }
-
-    #[test]
-    fn remove_top_level_reports_presence() {
-        let mut doc = SettingsDoc::from_value(
-            serde_json::json!({"env": {"A": "1"}, "theme": "dark"}),
-            Indent::Spaces(2),
-        );
-        assert!(doc.remove_top_level("theme"));
-        assert!(!doc.remove_top_level("theme"));
-        assert!(doc.get_top_level("theme").is_none());
-        assert!(doc.get_top_level("env").is_some());
     }
 
     fn key(s: &str) -> PathSeg {

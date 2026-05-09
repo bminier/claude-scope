@@ -5,18 +5,16 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 import type {
   LoadedScopes,
-  MoveKeyPreview,
-  MoveKeyRequest,
+  MoveLeafPreview,
+  MoveLeafRequest,
   MoveOptions,
-  MovePreview,
-  MoveRequest,
   Preferences,
   RuntimeInfo,
   Scope,
   Theme,
 } from "./types.ts";
 import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
-import { confirmMove, confirmMoveKey, openSettings, renderApp } from "./ui.ts";
+import { confirmMoveLeaf, openSettings, renderApp } from "./ui.ts";
 
 // Mirror of the Rust `Preferences::default()` — used until the real payload
 // arrives from the backend so renders before load_preferences() resolves
@@ -105,8 +103,8 @@ async function reload(): Promise<void> {
   await load(state.projectDir);
 }
 
-async function moveRule(
-  req: MoveRequest,
+async function moveLeaf(
+  req: MoveLeafRequest,
   trigger?: HTMLElement,
   opts?: MoveOptions,
 ): Promise<void> {
@@ -119,26 +117,29 @@ async function moveRule(
     // becomes friction (#70). Click-to-move stays gated on the modal as
     // the safer default for the less-explicit click gesture.
     if (!opts?.skipConfirm) {
-      // Intentionally *don't* flip state.busy / re-render before diff_move:
-      // it's fast, the modal itself blocks interaction once open, and keeping
-      // the triggering button alive lets confirmMove restore focus to it on
-      // Cancel/Esc.
-      let preview: MovePreview;
+      // Intentionally *don't* flip state.busy / re-render before
+      // diff_move_leaf: it's fast, the modal itself blocks interaction once
+      // open, and keeping the triggering button alive lets confirmMoveLeaf
+      // restore focus to it on Cancel/Esc.
+      let preview: MoveLeafPreview;
       try {
-        preview = await invoke<MovePreview>("diff_move", { req, project_dir: projectDir });
+        preview = await invoke<MoveLeafPreview>("diff_move_leaf", {
+          req,
+          project_dir: projectDir,
+        });
       } catch (err) {
         alert(`Move failed: ${err}`);
         return;
       }
 
-      const apply = await confirmMove(preview, trigger);
+      const apply = await confirmMoveLeaf(preview, trigger);
       if (!apply) return;
     }
 
     state.busy = true;
     render();
     try {
-      await invoke("apply_move", { req, project_dir: projectDir });
+      await invoke("apply_move_leaf", { req, project_dir: projectDir });
       // load() owns busy cleanup + final render on success — don't
       // duplicate that work in a finally block.
       await load(projectDir);
@@ -154,49 +155,6 @@ async function moveRule(
     // were in the middle of a move). Drain it here so an external edit
     // during the confirm step still gets picked up after the modal
     // closes. load()'s finally does the same thing for the load case.
-    if (externalReloadPending && !state.busy) {
-      externalReloadPending = false;
-      void load(state.projectDir);
-    }
-  }
-}
-
-async function moveKey(
-  req: MoveKeyRequest,
-  trigger?: HTMLElement,
-  opts?: MoveOptions,
-): Promise<void> {
-  if (moveInFlight) return;
-  moveInFlight = true;
-  try {
-    const projectDir = state.projectDir;
-    // Same skip-confirm contract as moveRule (#70): drops bypass the
-    // diff/confirm modal because dragging already expresses intent.
-    if (!opts?.skipConfirm) {
-      let preview: MoveKeyPreview;
-      try {
-        preview = await invoke<MoveKeyPreview>("diff_move_key", { req, project_dir: projectDir });
-      } catch (err) {
-        alert(`Move failed: ${err}`);
-        return;
-      }
-
-      const apply = await confirmMoveKey(preview, trigger);
-      if (!apply) return;
-    }
-
-    state.busy = true;
-    render();
-    try {
-      await invoke("apply_move_key", { req, project_dir: projectDir });
-      await load(projectDir);
-    } catch (err) {
-      alert(`Move failed: ${err}`);
-      state.busy = false;
-      render();
-    }
-  } finally {
-    moveInFlight = false;
     if (externalReloadPending && !state.busy) {
       externalReloadPending = false;
       void load(state.projectDir);
@@ -324,8 +282,7 @@ function render(): void {
     runtime: state.runtime,
     onPickProject: pickProject,
     onReload: reload,
-    onMove: moveRule,
-    onMoveKey: moveKey,
+    onMoveLeaf: moveLeaf,
     onOpenSettings,
     onQueryChange: setQuery,
   });

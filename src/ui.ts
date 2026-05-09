@@ -2,13 +2,11 @@ import { lintRule } from "./lint.ts";
 import type {
   JsonValue,
   LoadedScopes,
-  MoveKeyPreview,
-  MoveKeyRequest,
-  MoveKeySide,
+  MoveLeafPreview,
+  MoveLeafRequest,
+  MoveLeafSide,
   MoveOptions,
-  MovePreview,
-  MoveRequest,
-  MoveSide,
+  PathSeg,
   PermissionKind,
   Preferences,
   RuntimeInfo,
@@ -27,10 +25,47 @@ interface AppProps {
   runtime: RuntimeInfo;
   onPickProject: () => void;
   onReload: () => void;
-  onMove: (req: MoveRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
-  onMoveKey: (req: MoveKeyRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
+  onMoveLeaf: (req: MoveLeafRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
   onOpenSettings: (trigger?: HTMLElement) => void;
   onQueryChange: (next: string) => void;
+}
+
+const PERMISSION_KINDS: ReadonlyArray<PermissionKind> = ["allow", "deny", "ask"];
+
+/**
+ * Mirror of Rust's `validate_movable_path`: which JSON paths the move-leaf
+ * primitive accepts. Three shapes for v1:
+ *   1. `[<top-level-key>]` (any key except `permissions`)
+ *   2. `["permissions", "allow"|"deny"|"ask"]` — whole rule list
+ *   3. `["permissions", "allow"|"deny"|"ask", <index>]` — single rule
+ * Other intermediate sub-paths (e.g. `env.PATH`) are explicitly out of
+ * scope for issue #67 and a backend rejection would round-trip as a
+ * confusing error toast — better to gate the affordance here.
+ */
+function isMovablePath(path: PathSeg[]): boolean {
+  if (path.length === 1) return path[0] !== "permissions" && typeof path[0] === "string";
+  if (path[0] === "permissions") {
+    if (path.length === 2 && typeof path[1] === "string") {
+      return PERMISSION_KINDS.includes(path[1] as PermissionKind);
+    }
+    if (path.length === 3 && typeof path[1] === "string" && typeof path[2] === "number") {
+      return PERMISSION_KINDS.includes(path[1] as PermissionKind);
+    }
+  }
+  return false;
+}
+
+/**
+ * The kind under `permissions.<kind>...` for paths that target permission
+ * data, or `null` for any other path. Drives the allow/deny/ask styling on
+ * permission tree leaves and the chip-row diff in the confirm modal.
+ */
+function permissionKindForPath(path: PathSeg[]): PermissionKind | null {
+  if (path.length < 2 || path[0] !== "permissions") return null;
+  const kind = path[1];
+  if (typeof kind !== "string") return null;
+  if (PERMISSION_KINDS.includes(kind as PermissionKind)) return kind as PermissionKind;
+  return null;
 }
 
 function matchesLoweredQuery(rule: string, lowerQuery: string): boolean {
@@ -488,15 +523,21 @@ const openTreeNodes = new Set<string>();
 // in a different project that happens to share scope+path strings.
 let lastRenderedProjectDir: string | null = null;
 
-// HTML5 drag-and-drop source state. Set by `dragstart` on a chip or
-// top-level tree key, cleared by `dragend` (or by renderApp on a re-render
-// that tears down the source mid-drag). Lives at module scope because
-// `dragover` on drop targets needs to read the source scope without a
-// closure over the source element, and the lifecycle is one short user
-// gesture — same shape as `openTreeNodes` / `lastRenderedProjectDir`.
-type DragSource =
-  | { kind: "rule"; rule: string; ruleKind: PermissionKind; from: Scope; el: HTMLElement }
-  | { kind: "key"; key: string; from: Scope; el: HTMLElement };
+// HTML5 drag-and-drop source state. Set by `dragstart` on a movable tree
+// node, cleared by `dragend` (or by renderApp on a re-render that tears
+// down the source mid-drag). Lives at module scope because `dragover` on
+// drop targets needs to read the source without a closure over the source
+// element, and the lifecycle is one short user gesture — same shape as
+// `openTreeNodes` / `lastRenderedProjectDir`.
+//
+// `path` mirrors the Rust `Vec<PathSeg>` wire shape. `dropEffectClass` is
+// purely cosmetic — applied to the destination column's hover style so a
+// permission-rule drop highlights the rule list, not the entire column.
+interface DragSource {
+  path: PathSeg[];
+  from: Scope;
+  el: HTMLElement;
+}
 let dragSource: DragSource | null = null;
 
 function clearDragState(): void {
@@ -509,64 +550,55 @@ function clearDragState(): void {
   }
 }
 
-function setupRuleDragSource(
-  el: HTMLElement,
-  rule: string,
-  kind: PermissionKind,
-  scope: Scope,
-): void {
+function setupLeafDragSource(el: HTMLElement, scope: Scope, path: PathSeg[]): void {
   el.draggable = true;
   el.addEventListener("dragstart", (e) => {
-    dragSource = { kind: "rule", rule, ruleKind: kind, from: scope, el };
+    dragSource = { path, from: scope, el };
     if (e.dataTransfer) {
       // Custom MIME type used in dragover to reject foreign drags from other
       // apps or browser tabs before checking dragSource. The payload lives in
       // dragSource; the MIME value is just a discriminator.
-      e.dataTransfer.setData("application/x-claude-scope-move", "rule");
+      e.dataTransfer.setData("application/x-claude-scope-move", "leaf");
       e.dataTransfer.effectAllowed = "move";
     }
   });
   el.addEventListener("dragend", clearDragState);
 }
 
-function setupKeyDragSource(el: HTMLElement, scope: Scope, key: string): void {
-  el.draggable = true;
-  el.addEventListener("dragstart", (e) => {
-    dragSource = { kind: "key", key, from: scope, el };
-    if (e.dataTransfer) {
-      e.dataTransfer.setData("application/x-claude-scope-move", "key");
-      e.dataTransfer.effectAllowed = "move";
-    }
-  });
-  el.addEventListener("dragend", clearDragState);
-}
-
-function treeKey(scope: Scope, path: (string | number)[]): string {
+function treeKey(scope: Scope, path: PathSeg[]): string {
   return `${scope}:${JSON.stringify(path)}`;
 }
 
 function treeNode(
   scope: Scope,
-  path: (string | number)[],
+  path: PathSeg[],
   label: string,
   value: JsonValue,
   props?: AppProps,
+  lowerQuery = "",
 ): HTMLElement {
   if (value !== null && typeof value === "object") {
-    return treeBranch(scope, path, label, value, props);
+    return treeBranch(scope, path, label, value, props, lowerQuery);
   }
-  return treeLeaf(scope, path, label, value, props);
+  return treeLeaf(scope, path, label, value, props, lowerQuery);
 }
 
 function treeBranch(
   scope: Scope,
-  path: (string | number)[],
+  path: PathSeg[],
   label: string,
   value: JsonValue[] | { [key: string]: JsonValue },
   props: AppProps | undefined,
+  lowerQuery = "",
 ): HTMLElement {
   const details = document.createElement("details");
   details.className = "tree-node tree-branch";
+  // Permission lists wear the allow/deny/ask color class on both the branch
+  // summary and the children, so the leaves don't need to redo it
+  // individually. Path-driven so the rule of "permissions.<kind>...
+  // inherits the kind class" lives in one place.
+  const permKind = permissionKindForPath(path);
+  if (permKind) details.classList.add(`tree-perm-${permKind}`);
   const key = treeKey(scope, path);
 
   const summary = document.createElement("summary");
@@ -574,24 +606,20 @@ function treeBranch(
   const name = document.createElement("span");
   name.className = "tree-key";
   name.textContent = label;
-  // Make the key span (not the whole <summary>) the drag source for whole
-  // top-level keys: starting a drag on the inner span lets the browser
-  // suppress the `<details>` toggle that would otherwise fire on click,
-  // and isolates the affordance from nested key labels which never become
-  // drag sources.
-  if (path.length === 1 && props && !props.busy) {
-    setupKeyDragSource(name, scope, String(path[0]));
+  // Make the key span (not the whole <summary>) the drag source for movable
+  // branches: starting a drag on the inner span lets the browser suppress
+  // the `<details>` toggle that would otherwise fire on click, and isolates
+  // the affordance from nested key labels which aren't movable.
+  if (props && !props.busy && isMovablePath(path)) {
+    setupLeafDragSource(name, scope, path);
   }
   summary.appendChild(name);
   const peek = document.createElement("span");
   peek.className = "tree-peek";
   peek.textContent = Array.isArray(value) ? `[${value.length}]` : `{${Object.keys(value).length}}`;
   summary.appendChild(peek);
-  // Move-target buttons only make sense for whole top-level keys; nested
-  // subtree moves aren't in scope for this PR. props is only provided at
-  // the top level, which keeps the guard implicit and cheap.
-  if (path.length === 1 && props) {
-    summary.appendChild(keyMoveButtons(scope, String(path[0]), props));
+  if (props && isMovablePath(path)) {
+    summary.appendChild(leafMoveButtons(scope, path, props));
   }
   details.appendChild(summary);
 
@@ -609,16 +637,27 @@ function treeBranch(
     populated = true;
     if (Array.isArray(value)) {
       value.forEach((child, i) => {
-        children.appendChild(treeNode(scope, [...path, i], `[${i}]`, child));
+        // Permission rule arrays carry their kind via the parent path; child
+        // construction passes `props` and `lowerQuery` through so the leaf
+        // gets its move buttons + drag + lint badge + filter test.
+        children.appendChild(treeNode(scope, [...path, i], `[${i}]`, child, props, lowerQuery));
       });
     } else {
       for (const [k, v] of Object.entries(value)) {
-        children.appendChild(treeNode(scope, [...path, k], k, v));
+        children.appendChild(treeNode(scope, [...path, k], k, v, props, lowerQuery));
       }
     }
   }
 
-  if (openTreeNodes.has(key)) {
+  // Auto-expand permission branches under the unified tree (parent is "permissions")
+  // so the user doesn't need to click into the tree to see allow / deny / ask
+  // — that was the old single-pane visibility before the migration.
+  const isPermissionsChild = path.length === 2 && path[0] === "permissions";
+  const shouldAutoOpen =
+    openTreeNodes.has(key) ||
+    (path.length === 1 && path[0] === "permissions") ||
+    isPermissionsChild;
+  if (shouldAutoOpen) {
     details.open = true;
     populate();
   }
@@ -636,33 +675,70 @@ function treeBranch(
 
 function treeLeaf(
   scope: Scope,
-  path: (string | number)[],
+  path: PathSeg[],
   label: string,
   value: JsonValue,
   props?: AppProps,
+  lowerQuery = "",
 ): HTMLElement {
+  const permKind = permissionKindForPath(path);
+  const isPermissionRule = permKind !== null && path.length === 3 && typeof value === "string";
+
+  // Permission rule leaves under `permissions.<kind>` get the rule-chip
+  // styling, lint badge, origin tooltip, drag handle, and per-target move
+  // buttons that the old `ruleRow` used to render. Filter the row out
+  // entirely when the search query is active and doesn't match — keeps the
+  // "(m/n)" hint on the parent branch summary truthful.
+  if (isPermissionRule && permKind) {
+    const rule = value as string;
+    if (lowerQuery !== "" && !matchesLoweredQuery(rule, lowerQuery)) {
+      const skip = document.createElement("span");
+      skip.hidden = true;
+      return skip;
+    }
+    const row = document.createElement("div");
+    row.className = `tree-node tree-leaf rule rule-${permKind}`;
+    const code = document.createElement("code");
+    code.className = "rule-text";
+    code.textContent = rule;
+    if (props && !props.busy) {
+      setupLeafDragSource(code, scope, path);
+    }
+    // Per-scope rule rows share the same tooltip helper as the combined
+    // panel for consistency (issue #82). Origins is just `[scope]` here
+    // since the rule lives in exactly this scope's file.
+    row.appendChild(wrapWithOriginTooltip(code, [scope]));
+    const badge = lintBadge(rule);
+    if (badge) row.appendChild(badge);
+    if (props) {
+      row.appendChild(leafMoveButtons(scope, path, props));
+    }
+    return row;
+  }
+
   const row = document.createElement("div");
   row.className = "tree-node tree-leaf";
   const name = document.createElement("span");
   name.className = "tree-key";
   name.textContent = label;
-  if (path.length === 1 && props && !props.busy) {
-    setupKeyDragSource(name, scope, String(path[0]));
+  if (props && !props.busy && isMovablePath(path)) {
+    setupLeafDragSource(name, scope, path);
   }
   row.appendChild(name);
   const val = document.createElement("span");
   val.className = `tree-value tree-value-${leafType(value)}`;
   val.textContent = formatLeaf(value);
   row.appendChild(val);
-  if (path.length === 1 && props) {
-    row.appendChild(keyMoveButtons(scope, String(path[0]), props));
+  if (props && isMovablePath(path)) {
+    row.appendChild(leafMoveButtons(scope, path, props));
   }
   return row;
 }
 
-function keyMoveButtons(scope: Scope, key: string, props: AppProps): HTMLElement {
+function leafMoveButtons(scope: Scope, path: PathSeg[], props: AppProps): HTMLElement {
   const moveBtns = document.createElement("div");
   moveBtns.className = "rule-moves tree-key-moves";
+  const describe = describePath(path);
   for (const target of SCOPES) {
     if (target === scope) continue;
     // Mirror scopeGrid: don't offer moves into columns the user hid — the
@@ -674,7 +750,7 @@ function keyMoveButtons(scope: Scope, key: string, props: AppProps): HTMLElement
     btn.textContent = `→ ${SCOPE_LABELS[target]}`;
     btn.setAttribute(
       "aria-label",
-      `Move settings key ${key} from ${SCOPE_LABELS[scope]} to ${SCOPE_LABELS[target]}`,
+      `Move ${describe} from ${SCOPE_LABELS[scope]} to ${SCOPE_LABELS[target]}`,
     );
     btn.disabled = props.busy;
     btn.addEventListener("click", (e) => {
@@ -682,11 +758,28 @@ function keyMoveButtons(scope: Scope, key: string, props: AppProps): HTMLElement
       // the move action is a distinct intent, so swallow propagation.
       e.preventDefault();
       e.stopPropagation();
-      props.onMoveKey({ key, from: scope, to: target }, e.currentTarget as HTMLElement);
+      props.onMoveLeaf({ path, from: scope, to: target }, e.currentTarget as HTMLElement);
     });
     moveBtns.appendChild(btn);
   }
   return moveBtns;
+}
+
+/**
+ * Render a path slice as a human-readable label for ARIA + error messages.
+ * Mirrors Rust's `describe_path`: `permissions.allow[2]` for a rule, `env`
+ * for a top-level key, `permissions.allow` for a whole rule list.
+ */
+function describePath(path: PathSeg[]): string {
+  let out = "";
+  for (const seg of path) {
+    if (typeof seg === "number") {
+      out += `[${seg}]`;
+    } else {
+      out += out === "" ? seg : `.${seg}`;
+    }
+  }
+  return out || "(root)";
 }
 
 function leafType(value: JsonValue): string {
@@ -766,15 +859,7 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
     // per-destination `.bak` is the recovery path until an audit log /
     // undo lands (#19).
     const opts: MoveOptions = { skipConfirm: true };
-    if (src.kind === "rule") {
-      props.onMove(
-        { rule: src.rule, kind: src.ruleKind, from: src.from, to: view.scope },
-        trigger,
-        opts,
-      );
-    } else {
-      props.onMoveKey({ key: src.key, from: src.from, to: view.scope }, trigger, opts);
-    }
+    props.onMoveLeaf({ path: src.path, from: src.from, to: view.scope }, trigger, opts);
   });
 
   const head = document.createElement("div");
@@ -797,114 +882,75 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
     status.textContent = "(file not present)";
     status.classList.add("muted");
   } else {
-    const totals =
-      view.permissions.allow.length + view.permissions.deny.length + view.permissions.ask.length;
+    const totals = countPermissionRules(view.values);
     status.textContent = `${totals} permission rule${totals === 1 ? "" : "s"}`;
   }
   head.appendChild(status);
   col.appendChild(head);
 
-  const kinds: PermissionKind[] = ["allow", "deny", "ask"];
-  const isFiltering = lowerQuery !== "";
-  // Compute all the groups up front so we can decide between the per-kind
-  // view and the column-level "no matches" placeholder without re-filtering.
-  const groups = kinds.map((kind) => {
-    const rules = view.permissions[kind];
-    const matched = isFiltering ? rules.filter((r) => matchesLoweredQuery(r, lowerQuery)) : rules;
-    return { kind, rules, matched };
-  });
-  const totalAll = groups.reduce((s, g) => s + g.rules.length, 0);
-  const totalMatched = groups.reduce((s, g) => s + g.matched.length, 0);
-
-  if (isFiltering && totalAll > 0 && totalMatched === 0) {
-    // Nothing matched anywhere in this scope — replace the group headers with
-    // a single column-level placeholder so the user doesn't see three empty
-    // "(0/N)" headers stacked on top of each other.
-    const none = document.createElement("div");
-    none.className = "col-no-matches";
-    none.textContent = `No rules match “${props.query}”.`;
-    col.appendChild(none);
-  } else {
-    for (const { kind, rules, matched } of groups) {
-      // Skip empty kinds outright. When filtering, kinds that exist but
-      // have 0 matches still render a header so the m/n count makes the
-      // hidden rules visible to the user.
-      if (rules.length === 0) continue;
-      const section = document.createElement("div");
-      section.className = `rule-group rule-${kind}`;
-      const label = document.createElement("h4");
-      label.textContent = isFiltering
-        ? `${KIND_LABELS[kind]} (${matched.length}/${rules.length})`
-        : `${KIND_LABELS[kind]} (${rules.length})`;
-      section.appendChild(label);
-      for (const rule of matched) {
-        section.appendChild(ruleRow(view.scope, kind, rule, props));
-      }
-      col.appendChild(section);
+  // Render every top-level key — `permissions` included — through the
+  // shared tree walker. Permissions render with leaf-level move buttons
+  // and allow/deny/ask styling thanks to `permissionKindForPath` /
+  // `treeLeaf`'s rule-leaf branch; other keys keep today's whole-key move
+  // behavior.
+  const keys = Object.keys(view.values);
+  if (keys.length === 0) {
+    if (view.exists && !view.parse_error) {
+      const empty = document.createElement("div");
+      empty.className = "col-empty";
+      empty.textContent = "(empty)";
+      col.appendChild(empty);
     }
+    return col;
   }
 
-  const otherKeys = Object.keys(view.other_values);
-  if (otherKeys.length > 0) {
-    const tree = document.createElement("div");
-    tree.className = "other-tree";
-    const heading = document.createElement("h4");
-    heading.className = "other-tree-heading";
-    heading.textContent = "Other settings";
-    tree.appendChild(heading);
-    for (const key of otherKeys) {
-      tree.appendChild(treeNode(view.scope, [key], key, view.other_values[key], props));
+  const tree = document.createElement("div");
+  tree.className = "scope-tree";
+  for (const key of keys) {
+    tree.appendChild(treeNode(view.scope, [key], key, view.values[key], props, lowerQuery));
+  }
+  col.appendChild(tree);
+
+  // Filter feedback. The tree leaves filter themselves silently when the
+  // query doesn't match a rule string; surface a column-level placeholder
+  // when a permissions block exists but every rule was filtered out, so
+  // empty-looking columns aren't mysterious.
+  if (lowerQuery !== "") {
+    const totalRules = countPermissionRules(view.values);
+    if (totalRules > 0 && countMatchingRules(view.values, lowerQuery) === 0) {
+      const none = document.createElement("div");
+      none.className = "col-no-matches";
+      none.textContent = `No rules match “${props.query}”.`;
+      col.appendChild(none);
     }
-    col.appendChild(tree);
   }
 
   return col;
 }
 
-function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppProps): HTMLElement {
-  const row = document.createElement("div");
-  row.className = "rule";
-
-  const code = document.createElement("code");
-  code.className = "rule-text";
-  code.textContent = rule;
-  // Drag affordance lives on the chip itself, not the row, so the move
-  // buttons stay clickable and the row keeps its hover semantics intact.
-  // Disabled while a write is in flight, mirroring how `move-btn` is
-  // gated on `props.busy` further down.
-  if (!props.busy) {
-    setupRuleDragSource(code, rule, kind, scope);
+function countPermissionRules(values: { [key: string]: JsonValue }): number {
+  const perms = values.permissions;
+  if (!perms || typeof perms !== "object" || Array.isArray(perms)) return 0;
+  let total = 0;
+  for (const kind of PERMISSION_KINDS) {
+    const list = (perms as { [k: string]: JsonValue })[kind];
+    if (Array.isArray(list)) total += list.length;
   }
-  // Per-scope rule rows share the same tooltip helper as the combined
-  // panel for consistency (issue #82). Origins is just `[scope]` here
-  // since the rule lives in exactly this scope's file.
-  row.appendChild(wrapWithOriginTooltip(code, [scope]));
+  return total;
+}
 
-  const badge = lintBadge(rule);
-  if (badge) row.appendChild(badge);
-
-  const moveBtns = document.createElement("div");
-  moveBtns.className = "rule-moves";
-  for (const target of SCOPES) {
-    if (target === scope) continue;
-    // Same reasoning as `keyMoveButtons`: hidden columns can't be move
-    // targets, since the result would be immediately invisible.
-    if (!isScopeVisible(target)) continue;
-    const btn = document.createElement("button");
-    btn.className = "move-btn";
-    btn.textContent = `→ ${SCOPE_LABELS[target]}`;
-    btn.setAttribute(
-      "aria-label",
-      `Move ${KIND_LABELS[kind]} rule ${rule} from ${SCOPE_LABELS[scope]} to ${SCOPE_LABELS[target]}`,
-    );
-    btn.disabled = props.busy;
-    btn.onclick = (e) =>
-      props.onMove({ rule, kind, from: scope, to: target }, e.currentTarget as HTMLElement);
-    moveBtns.appendChild(btn);
+function countMatchingRules(values: { [key: string]: JsonValue }, lowerQuery: string): number {
+  const perms = values.permissions;
+  if (!perms || typeof perms !== "object" || Array.isArray(perms)) return 0;
+  let matched = 0;
+  for (const kind of PERMISSION_KINDS) {
+    const list = (perms as { [k: string]: JsonValue })[kind];
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (typeof item === "string" && matchesLoweredQuery(item, lowerQuery)) matched++;
+    }
   }
-  row.appendChild(moveBtns);
-
-  return row;
+  return matched;
 }
 
 /**
@@ -920,12 +966,15 @@ function ruleRow(scope: Scope, kind: PermissionKind, rule: string, props: AppPro
  * If `trigger` is passed and still live in the DOM when the dialog closes,
  * focus is returned to it.
  */
-export function confirmMove(preview: MovePreview, trigger?: HTMLElement | null): Promise<boolean> {
+export function confirmMoveLeaf(
+  preview: MoveLeafPreview,
+  trigger?: HTMLElement | null,
+): Promise<boolean> {
   const subtitle = document.createDocumentFragment();
-  const ruleCode = document.createElement("code");
-  ruleCode.className = "chip";
-  ruleCode.textContent = preview.rule;
-  subtitle.appendChild(ruleCode);
+  const target = document.createElement("code");
+  target.className = "chip";
+  target.textContent = leafSubtitleLabel(preview);
+  subtitle.appendChild(target);
   subtitle.appendChild(
     document.createTextNode(
       ` from ${SCOPE_LABELS[preview.from.scope]} to ${SCOPE_LABELS[preview.to.scope]}`,
@@ -934,43 +983,214 @@ export function confirmMove(preview: MovePreview, trigger?: HTMLElement | null):
 
   const diff = document.createElement("div");
   diff.className = "modal-diff";
-  diff.appendChild(diffSide(preview.from, "remove", preview.rule));
-  diff.appendChild(diffSide(preview.to, "add", preview.rule));
+  diff.appendChild(leafDiffSide(preview, "remove"));
+  diff.appendChild(leafDiffSide(preview, "add"));
 
   return openConfirmModal({
-    titleText: `Move ${KIND_LABELS[preview.kind]} rule`,
+    titleText: leafModalTitle(preview),
     subtitle,
     body: diff,
     trigger,
   });
 }
 
-export function confirmMoveKey(
-  preview: MoveKeyPreview,
-  trigger?: HTMLElement | null,
-): Promise<boolean> {
-  const subtitle = document.createDocumentFragment();
-  const keyCode = document.createElement("code");
-  keyCode.className = "chip";
-  keyCode.textContent = preview.key;
-  subtitle.appendChild(keyCode);
-  subtitle.appendChild(
-    document.createTextNode(
-      ` from ${SCOPE_LABELS[preview.from.scope]} to ${SCOPE_LABELS[preview.to.scope]}`,
-    ),
-  );
+function leafModalTitle(preview: MoveLeafPreview): string {
+  switch (preview.kind) {
+    case "permission_rule": {
+      const kind = permissionKindForPath(preview.path);
+      return `Move ${kind ? KIND_LABELS[kind] : ""} rule`.trim();
+    }
+    case "permission_list": {
+      const kind = permissionKindForPath(preview.path);
+      return `Move ${kind ? KIND_LABELS[kind] : ""} rule list`.trim();
+    }
+    case "top_level_key":
+      return "Move settings key";
+  }
+}
 
-  const diff = document.createElement("div");
-  diff.className = "modal-diff";
-  diff.appendChild(keyDiffSide(preview.from, "remove"));
-  diff.appendChild(keyDiffSide(preview.to, "add"));
+function leafSubtitleLabel(preview: MoveLeafPreview): string {
+  // For a single rule the subtitle chip carries the rule string itself; for
+  // a list or top-level key it's the path so the user reads "Move env from
+  // ..." or "Move permissions.allow from ...".
+  if (preview.kind === "permission_rule") {
+    const rule = leafValueAtPath(preview.from.key_before, preview.path);
+    if (typeof rule === "string") return rule;
+  }
+  return describePath(preview.path);
+}
 
-  return openConfirmModal({
-    titleText: "Move settings key",
-    subtitle,
-    body: diff,
-    trigger,
-  });
+/**
+ * Drill into a `key_before` / `key_after` value using the leaf path
+ * (segments after the affected top-level key). Returns the leaf value or
+ * `undefined` if any segment misses — same skip-on-absent contract as the
+ * IPC.
+ */
+function leafValueAtPath(keyValue: JsonValue | undefined, path: PathSeg[]): JsonValue | undefined {
+  if (keyValue === undefined) return undefined;
+  let cur: JsonValue | undefined = keyValue;
+  for (let i = 1; i < path.length; i++) {
+    const seg = path[i];
+    if (cur === null || cur === undefined) return undefined;
+    if (typeof seg === "number") {
+      if (!Array.isArray(cur)) return undefined;
+      cur = cur[seg];
+    } else {
+      if (typeof cur !== "object" || Array.isArray(cur)) return undefined;
+      cur = (cur as { [k: string]: JsonValue })[seg];
+    }
+  }
+  return cur;
+}
+
+function leafDiffSide(preview: MoveLeafPreview, mode: "add" | "remove"): HTMLElement {
+  const side = mode === "remove" ? preview.from : preview.to;
+  const col = document.createElement("div");
+  col.className = `modal-side modal-side-${mode}`;
+
+  const head = document.createElement("div");
+  head.className = "modal-side-head";
+  const label = document.createElement("h3");
+  label.textContent = SCOPE_LABELS[side.scope];
+  head.appendChild(label);
+
+  const filePath = document.createElement("div");
+  filePath.className = "modal-side-path";
+  filePath.textContent = side.file_path;
+  head.appendChild(filePath);
+
+  const verdict = document.createElement("div");
+  verdict.className = "modal-side-verdict";
+  if (!side.will_write) {
+    verdict.textContent = "(no change)";
+    verdict.classList.add("muted");
+  } else if (mode === "remove") {
+    verdict.textContent = preview.kind === "top_level_key" ? "key removed" : "rule removed";
+    verdict.classList.add("removed");
+  } else {
+    // `key_before === undefined` is the absence sentinel (Rust skipped the
+    // field). For permission shapes the affected key is `permissions`,
+    // which usually pre-exists with empty arrays, so "merged" is the more
+    // accurate verdict than "added" — only show "added" when the whole
+    // affected top-level key is being created from nothing.
+    const created = side.key_before === undefined;
+    verdict.textContent =
+      preview.kind === "top_level_key"
+        ? created
+          ? "key added"
+          : "key merged"
+        : created
+          ? "rules added"
+          : "rule added";
+    verdict.classList.add("added");
+  }
+  head.appendChild(verdict);
+  col.appendChild(head);
+
+  if (side.note) {
+    const note = document.createElement("div");
+    note.className = "modal-side-note";
+    note.textContent = side.note;
+    col.appendChild(note);
+  }
+
+  // Body: chip-list rendering for permission shapes (preserves today's
+  // confirmMove readability), JSON dump for top-level key moves
+  // (preserves today's confirmMoveKey shape).
+  const body = document.createElement("div");
+  body.className = "modal-side-value";
+  if (preview.kind === "top_level_key") {
+    const pre = document.createElement("pre");
+    pre.className = "modal-side-json";
+    pre.textContent = formatValue(mode === "remove" ? side.key_before : side.key_after);
+    body.appendChild(pre);
+  } else {
+    body.appendChild(permissionListDiff(preview, side, mode));
+  }
+  col.appendChild(body);
+
+  return col;
+}
+
+/**
+ * Chip-list before/after for permission moves. For a single-rule move the
+ * affected rule is highlighted (struck-through on remove side, marked
+ * added on the dest); for a whole-list move every rule is highlighted on
+ * the dest side that wasn't already present.
+ */
+function permissionListDiff(
+  preview: MoveLeafPreview,
+  side: MoveLeafSide,
+  mode: "add" | "remove",
+): HTMLElement {
+  const list = document.createElement("ul");
+  list.className = "modal-diff-list";
+  const kind = permissionKindForPath(preview.path);
+  if (!kind) {
+    const li = document.createElement("li");
+    li.className = "diff-empty";
+    li.textContent = "(unknown permission shape)";
+    list.appendChild(li);
+    return list;
+  }
+  const keyValue = mode === "remove" ? side.key_before : side.key_after;
+  const items = extractPermissionList(keyValue, kind);
+
+  // What's "the moving rule"? For a permission_rule move it's the source's
+  // current value at the leaf path — that's the rule being transferred.
+  // For a permission_list move there's no single rule, so highlight every
+  // rule that's in the source list (those are all moving).
+  const movingRules = movingRuleSet(preview);
+
+  for (const rule of items) {
+    const li = document.createElement("li");
+    const code = document.createElement("code");
+    code.textContent = rule;
+    if (movingRules.has(rule)) {
+      if (mode === "remove") {
+        li.className = "diff-removed";
+      } else if (side.will_write) {
+        // will_write=false means everything was already present on the
+        // dest; render neutrally so it doesn't look like a fresh addition.
+        li.className = "diff-added";
+      }
+    }
+    li.appendChild(code);
+    list.appendChild(li);
+  }
+  if (list.children.length === 0) {
+    const li = document.createElement("li");
+    li.className = "diff-empty";
+    li.textContent = "(empty)";
+    list.appendChild(li);
+  }
+  return list;
+}
+
+function extractPermissionList(
+  keyValue: JsonValue | undefined,
+  kind: PermissionKind,
+): readonly string[] {
+  if (keyValue === undefined || keyValue === null) return [];
+  if (typeof keyValue !== "object" || Array.isArray(keyValue)) return [];
+  const arr = (keyValue as { [k: string]: JsonValue })[kind];
+  if (!Array.isArray(arr)) return [];
+  return arr.filter((v): v is string => typeof v === "string");
+}
+
+function movingRuleSet(preview: MoveLeafPreview): Set<string> {
+  const moving = new Set<string>();
+  if (preview.kind === "permission_rule") {
+    const v = leafValueAtPath(preview.from.key_before, preview.path);
+    if (typeof v === "string") moving.add(v);
+    return moving;
+  }
+  if (preview.kind === "permission_list") {
+    const kind = permissionKindForPath(preview.path);
+    if (!kind) return moving;
+    for (const rule of extractPermissionList(preview.from.key_before, kind)) moving.add(rule);
+  }
+  return moving;
 }
 
 function openConfirmModal(opts: {
@@ -1032,7 +1252,7 @@ function openConfirmModal(opts: {
  * Escape / backdrop-click / Enter behavior, and focus restoration — so
  * callers only supply the body and the action buttons they need.
  *
- * The goal is to keep `confirmMove` / `confirmMoveKey` / `openSettings`
+ * The goal is to keep `confirmMoveLeaf` / `openSettings`
  * from drifting on accessibility details over time. Each caller passes
  * its own activation callbacks that receive a `close` function; the
  * helper never closes on its own except when the caller asks it to.
@@ -1168,57 +1388,6 @@ function openModal(opts: {
   document.body.appendChild(backdrop);
   const initial = actionButtons.find((_, i) => opts.actions[i].focus) ?? actionButtons[0];
   initial?.focus();
-}
-
-function keyDiffSide(side: MoveKeySide, mode: "add" | "remove"): HTMLElement {
-  const col = document.createElement("div");
-  col.className = `modal-side modal-side-${mode}`;
-
-  const head = document.createElement("div");
-  head.className = "modal-side-head";
-  const label = document.createElement("h3");
-  label.textContent = SCOPE_LABELS[side.scope];
-  head.appendChild(label);
-
-  const path = document.createElement("div");
-  path.className = "modal-side-path";
-  path.textContent = side.path;
-  head.appendChild(path);
-
-  const verdict = document.createElement("div");
-  verdict.className = "modal-side-verdict";
-  if (!side.will_write) {
-    verdict.textContent = "(no change)";
-    verdict.classList.add("muted");
-  } else if (mode === "remove") {
-    verdict.textContent = "key removed";
-    verdict.classList.add("removed");
-  } else {
-    // `undefined` means the backend skipped the field because the key was
-    // absent; a present-but-null value arrives as `null` and counts as a
-    // real existing value to merge against.
-    verdict.textContent = side.value_before === undefined ? "key added" : "key merged";
-    verdict.classList.add("added");
-  }
-  head.appendChild(verdict);
-  col.appendChild(head);
-
-  if (side.note) {
-    const note = document.createElement("div");
-    note.className = "modal-side-note";
-    note.textContent = side.note;
-    col.appendChild(note);
-  }
-
-  const body = document.createElement("div");
-  body.className = "modal-side-value";
-  const pre = document.createElement("pre");
-  pre.className = "modal-side-json";
-  pre.textContent = formatValue(mode === "remove" ? side.value_before : side.value_after);
-  body.appendChild(pre);
-  col.appendChild(body);
-
-  return col;
 }
 
 function formatValue(v: JsonValue | undefined): string {
@@ -1364,80 +1533,4 @@ function settingsColumnsSection(props: SettingsProps): HTMLElement {
   }
   section.appendChild(list);
   return section;
-}
-
-function diffSide(side: MoveSide, mode: "add" | "remove", movingRule: string): HTMLElement {
-  const col = document.createElement("div");
-  col.className = `modal-side modal-side-${mode}`;
-
-  const head = document.createElement("div");
-  head.className = "modal-side-head";
-  const label = document.createElement("h3");
-  label.textContent = SCOPE_LABELS[side.scope];
-  head.appendChild(label);
-
-  const path = document.createElement("div");
-  path.className = "modal-side-path";
-  path.textContent = side.path;
-  head.appendChild(path);
-
-  // Derive the verdict from the actual list lengths so duplicates (the
-  // backend removes *every* occurrence) and any future changes to the move
-  // semantics stay in sync with what the modal claims will happen.
-  const delta = side.rules_after.length - side.rules_before.length;
-  const verdict = document.createElement("div");
-  verdict.className = "modal-side-verdict";
-  if (delta === 0) {
-    verdict.textContent = "(no change)";
-    verdict.classList.add("muted");
-  } else if (delta > 0) {
-    verdict.textContent = `+${delta} rule${delta === 1 ? "" : "s"}`;
-    verdict.classList.add("added");
-  } else {
-    const n = -delta;
-    verdict.textContent = `−${n} rule${n === 1 ? "" : "s"}`;
-    verdict.classList.add("removed");
-  }
-  head.appendChild(verdict);
-  col.appendChild(head);
-
-  if (side.note) {
-    const note = document.createElement("div");
-    note.className = "modal-side-note";
-    note.textContent = side.note;
-    col.appendChild(note);
-  }
-
-  // Remove side shows the pre-move list with the moved rule struck through
-  // (diff context, not the post-write contents — apply_move will actually
-  // persist rules_after there). Add side shows the backend's rules_after so
-  // the dest column mirrors exactly what will be written.
-  const rules = mode === "remove" ? side.rules_before : side.rules_after;
-  const list = document.createElement("ul");
-  list.className = "modal-diff-list";
-  for (const rule of rules) {
-    const li = document.createElement("li");
-    const code = document.createElement("code");
-    code.textContent = rule;
-    if (rule === movingRule) {
-      if (mode === "remove") {
-        li.className = "diff-removed";
-      } else if (side.will_write) {
-        // will_write=false means the rule was already present on the dest;
-        // render it neutrally so it doesn't look like a fresh addition.
-        li.className = "diff-added";
-      }
-    }
-    li.appendChild(code);
-    list.appendChild(li);
-  }
-  if (list.children.length === 0) {
-    const li = document.createElement("li");
-    li.className = "diff-empty";
-    li.textContent = "(empty)";
-    list.appendChild(li);
-  }
-  col.appendChild(list);
-
-  return col;
 }

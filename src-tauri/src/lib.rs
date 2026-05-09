@@ -31,10 +31,6 @@ pub fn run() {
         .manage(overrides)
         .invoke_handler(tauri::generate_handler![
             commands::load_scopes,
-            commands::diff_move,
-            commands::apply_move,
-            commands::diff_move_key,
-            commands::apply_move_key,
             commands::diff_move_leaf,
             commands::apply_move_leaf,
             commands::load_preferences,
