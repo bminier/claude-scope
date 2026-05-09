@@ -65,11 +65,31 @@ export interface LoadedScopes {
  * `MoveKeyRequest` shapes with a single primitive: any movable JSON path
  * (whole top-level key, whole `permissions.<kind>` array, or a single rule
  * under `permissions.<kind>`) plus source / destination scopes.
+ *
+ * `to_kind` (#8) reclassifies a permission rule into a different kind on
+ * the destination side. Only valid when the path is a single permission
+ * rule. With `from === to` it produces an in-place allow ↔ deny ↔ ask
+ * change; with `from !== to` it crosses scopes and changes kind in one
+ * gesture.
  */
 export interface MoveLeafRequest {
   path: PathSeg[];
   from: Scope;
   to: Scope;
+  to_kind?: PermissionKind;
+}
+
+/** Path-based delete request (#8). */
+export interface DeleteLeafRequest {
+  path: PathSeg[];
+  from: Scope;
+}
+
+/** Path-based add request (#8). Powers paste. */
+export interface AddLeafRequest {
+  path: PathSeg[];
+  to: Scope;
+  value: JsonValue;
 }
 
 /**
@@ -109,6 +129,24 @@ export interface MoveLeafPreview {
   path: PathSeg[];
   kind: MoveLeafKind;
   from: MoveLeafSide;
+  to: MoveLeafSide;
+  /** Echo of the request's `to_kind` (#8). The frontend uses this to label
+   *  the diff modal "Reclassify rule" instead of "Move rule" and to collapse
+   *  the bilateral display when `from.scope === to.scope`. */
+  to_kind?: PermissionKind;
+}
+
+/** One-sided diff preview returned by `diff_delete_leaf` (#8). */
+export interface DeleteLeafPreview {
+  path: PathSeg[];
+  kind: MoveLeafKind;
+  from: MoveLeafSide;
+}
+
+/** One-sided diff preview returned by `diff_add_leaf` (#8). */
+export interface AddLeafPreview {
+  path: PathSeg[];
+  kind: MoveLeafKind;
   to: MoveLeafSide;
 }
 

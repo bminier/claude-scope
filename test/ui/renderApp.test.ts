@@ -44,6 +44,9 @@ function makeProps(overrides: PropsOverrides = {}) {
     onPickProject: vi.fn(),
     onReload: vi.fn(),
     onMoveLeaf: overrides.onMoveLeaf ?? vi.fn(),
+    onChangeKind: vi.fn(),
+    onDeleteLeaf: vi.fn(),
+    onAddLeaf: vi.fn(),
     onOpenSettings: vi.fn(),
     onQueryChange: vi.fn(),
   };
@@ -178,6 +181,167 @@ describe("renderApp", () => {
     );
     const headings = Array.from(root.querySelectorAll(".col h3")).map((el) => el.textContent);
     expect(headings).toEqual(["Project"]);
+  });
+});
+
+describe("context menu (#8)", () => {
+  let root: HTMLElement;
+
+  beforeEach(() => {
+    root = makeRoot();
+  });
+
+  afterEach(() => {
+    // Sweep any open context menu the test left behind so the next test
+    // starts clean. The menu lives at document.body level outside `root`
+    // and survives `clearBody`'s wipe only if a global listener kept it.
+    for (const m of Array.from(document.querySelectorAll(".context-menu"))) m.remove();
+    clearBody();
+  });
+
+  function rightClick(el: HTMLElement): void {
+    el.dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 50, clientY: 50 }),
+    );
+  }
+
+  function findMenuItem(label: string): HTMLButtonElement | null {
+    for (const btn of document.querySelectorAll<HTMLButtonElement>(".context-menu-item")) {
+      // Trim because the submenu arrow span adds whitespace via its
+      // textContent — `Move to ▸` would otherwise need an exact match
+      // including the unicode arrow.
+      if (btn.textContent?.replace(/\s+/g, " ").trim().startsWith(label)) return btn;
+    }
+    return null;
+  }
+
+  it("opens a context menu with Copy / Delete / Change kind / Move to on a rule leaf", () => {
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const ruleRow = root.querySelector<HTMLElement>(".rule.rule-allow");
+    expect(ruleRow).not.toBeNull();
+    if (!ruleRow) return;
+    rightClick(ruleRow);
+    const labels = Array.from(document.querySelectorAll<HTMLButtonElement>(".context-menu-item"))
+      .map((b) => b.textContent?.replace(/\s+/g, " ").trim() ?? "")
+      // Strip the trailing submenu arrow so the assertion isn't tied to its glyph.
+      .map((l) => l.replace(/\s*▸$/, "").trim());
+    expect(labels).toEqual(["Copy", "Delete", "Change kind", "Move to"]);
+  });
+
+  it("calls onDeleteLeaf with the leaf's path when Delete is activated", () => {
+    const onDeleteLeaf = vi.fn();
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
+    });
+    const props = { ...makeProps({ scopes }), onDeleteLeaf };
+    renderApp(root, props);
+    const ruleRow = root.querySelector<HTMLElement>(".rule.rule-allow");
+    if (!ruleRow) throw new Error("expected rule row");
+    rightClick(ruleRow);
+    findMenuItem("Delete")?.click();
+    expect(onDeleteLeaf).toHaveBeenCalledTimes(1);
+    expect(onDeleteLeaf.mock.calls[0][0]).toEqual({
+      path: ["permissions", "allow", 0],
+      from: "project",
+    });
+  });
+
+  it("disables the current kind in the Change-kind submenu", () => {
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const ruleRow = root.querySelector<HTMLElement>(".rule.rule-allow");
+    if (!ruleRow) throw new Error("expected rule row");
+    rightClick(ruleRow);
+    findMenuItem("Change kind")?.click();
+    // Two menus open now: root + submenu. Find the kind buttons in the second.
+    const menus = document.querySelectorAll<HTMLElement>(".context-menu");
+    expect(menus.length).toBe(2);
+    const kindButtons = Array.from(
+      menus[1].querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    );
+    const allow = kindButtons.find((b) => b.textContent === "Allow");
+    const deny = kindButtons.find((b) => b.textContent === "Deny");
+    expect(allow?.disabled).toBe(true);
+    expect(deny?.disabled).toBe(false);
+  });
+
+  it("calls onChangeKind with the new kind when a Change-kind option is activated", () => {
+    const onChangeKind = vi.fn();
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
+    });
+    const props = { ...makeProps({ scopes }), onChangeKind };
+    renderApp(root, props);
+    const ruleRow = root.querySelector<HTMLElement>(".rule.rule-allow");
+    if (!ruleRow) throw new Error("expected rule row");
+    rightClick(ruleRow);
+    findMenuItem("Change kind")?.click();
+    const kindButtons = Array.from(
+      document
+        .querySelectorAll<HTMLButtonElement>(".context-menu")[1]
+        .querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    );
+    kindButtons.find((b) => b.textContent === "Deny")?.click();
+    expect(onChangeKind).toHaveBeenCalledTimes(1);
+    const [path, scope, newKind] = onChangeKind.mock.calls[0];
+    expect(path).toEqual(["permissions", "allow", 0]);
+    expect(scope).toBe("project");
+    expect(newKind).toBe("deny");
+  });
+
+  it("nests visible scopes under the current project in the Move-to submenu", () => {
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
+      project_dir: "/tmp/myproject",
+    });
+    renderApp(root, makeProps({ scopes }));
+    const ruleRow = root.querySelector<HTMLElement>(".rule.rule-allow");
+    if (!ruleRow) throw new Error("expected rule row");
+    rightClick(ruleRow);
+    findMenuItem("Move to")?.click();
+    const menus = document.querySelectorAll<HTMLElement>(".context-menu");
+    expect(menus.length).toBe(2);
+    const moveItems = Array.from(
+      menus[1].querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    ).map((b) => b.textContent?.replace(/\s*▸$/, "").trim() ?? "");
+    // User and User-Local are global; "myproject" is the basename of project_dir
+    // and hosts a Local/Project submenu — Project is filtered out because the
+    // source rule already lives in Project.
+    expect(moveItems).toContain("User");
+    expect(moveItems).toContain("User-Local");
+    expect(moveItems).toContain("myproject");
+  });
+
+  it("closes the context menu on Escape", () => {
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const ruleRow = root.querySelector<HTMLElement>(".rule.rule-allow");
+    if (!ruleRow) throw new Error("expected rule row");
+    rightClick(ruleRow);
+    expect(document.querySelector(".context-menu")).not.toBeNull();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(document.querySelector(".context-menu")).toBeNull();
+  });
+
+  it("attaches a Paste-as menu to the scope column chrome", () => {
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const col = root.querySelector<HTMLElement>(".col");
+    if (!col) throw new Error("expected column");
+    rightClick(col);
+    const labels = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    ).map((b) => b.textContent?.replace(/\s*▸$/, "").trim() ?? "");
+    expect(labels).toContain("Paste as");
   });
 });
 

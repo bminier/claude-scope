@@ -71,6 +71,38 @@ pub struct MoveLeafRequest {
     pub path: Vec<PathSeg>,
     pub from: Scope,
     pub to: Scope,
+    /// Change-kind variant (#8): when set, the rule at `path` (which must
+    /// classify as `MovablePath::PermissionRule`) is added to
+    /// `permissions.<to_kind>` on the destination side instead of the same
+    /// kind. Enables in-place allow ↔ deny ↔ ask reclassification
+    /// (`from == to`) and cross-scope reclassification (`from != to`) through
+    /// the same primitive. Absent on the wire ⇒ behaves identically to a
+    /// pre-#8 move request, so the field is backwards-compatible.
+    #[serde(default)]
+    pub to_kind: Option<PermissionKind>,
+}
+
+/// Path-based delete request (#8). Removes the leaf at `path` from `scope`
+/// using the same atomic-write + `.bak` plumbing as a move. The path is
+/// validated through `validate_movable_path`, so only the three movable
+/// shapes (top-level key, whole permission list, single permission rule) are
+/// acceptable — same surface as the move primitive.
+#[derive(Debug, Deserialize)]
+pub struct DeleteLeafRequest {
+    pub path: Vec<PathSeg>,
+    pub from: Scope,
+}
+
+/// Path-based add request (#8). Inserts `value` at `path` in `scope` using
+/// the existing `merge_at_path` semantics (array-union for permission rules,
+/// per-key policy for top-level keys). Powers paste; v1 only exposes the
+/// permission-rule shape on the frontend, but the backend accepts any
+/// movable shape so future paste/import flows can reuse the primitive.
+#[derive(Debug, Deserialize)]
+pub struct AddLeafRequest {
+    pub path: Vec<PathSeg>,
+    pub to: Scope,
+    pub value: serde_json::Value,
 }
 
 /// What kind of movable path a `MoveLeafPreview` describes. Surfaced on the
@@ -100,6 +132,30 @@ pub struct MoveLeafPreview {
     pub path: Vec<PathSeg>,
     pub kind: MoveLeafKind,
     pub from: MoveLeafSide,
+    pub to: MoveLeafSide,
+    /// Set when `to_kind` was supplied (#8 change-kind). The frontend uses
+    /// this to label the diff modal "Change kind" instead of "Move", and to
+    /// collapse the bilateral display into a single side when `from == to`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_kind: Option<PermissionKind>,
+}
+
+/// Diff preview for a delete-leaf request. Shape mirrors `MoveLeafPreview`'s
+/// `from` side — there is no destination, so the wire format omits one
+/// instead of carrying a duplicated null.
+#[derive(Debug, Serialize)]
+pub struct DeleteLeafPreview {
+    pub path: Vec<PathSeg>,
+    pub kind: MoveLeafKind,
+    pub from: MoveLeafSide,
+}
+
+/// Diff preview for an add-leaf request. Shape mirrors `MoveLeafPreview`'s
+/// `to` side — there is no source.
+#[derive(Debug, Serialize)]
+pub struct AddLeafPreview {
+    pub path: Vec<PathSeg>,
+    pub kind: MoveLeafKind,
     pub to: MoveLeafSide,
 }
 
@@ -184,6 +240,52 @@ pub fn apply_move_leaf(
     let paths =
         resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
     apply_move_leaf_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn diff_delete_leaf(
+    req: DeleteLeafRequest,
+    project_dir: Option<String>,
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<DeleteLeafPreview, String> {
+    let paths =
+        resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
+    diff_delete_leaf_impl(&paths, &req).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn apply_delete_leaf(
+    req: DeleteLeafRequest,
+    project_dir: Option<String>,
+    watch: State<'_, WatchState>,
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<(), String> {
+    let paths =
+        resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
+    apply_delete_leaf_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn diff_add_leaf(
+    req: AddLeafRequest,
+    project_dir: Option<String>,
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<AddLeafPreview, String> {
+    let paths =
+        resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
+    diff_add_leaf_impl(&paths, &req).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn apply_add_leaf(
+    req: AddLeafRequest,
+    project_dir: Option<String>,
+    watch: State<'_, WatchState>,
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<(), String> {
+    let paths =
+        resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
+    apply_add_leaf_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
 }
 
 /// Snapshot of the launch-time overrides — the front-end uses this to
@@ -425,17 +527,78 @@ fn find_rule_index(doc: &SettingsDoc, kind: PermissionKind, rule: &str) -> Optio
         .position(|v| v.as_str() == Some(rule))
 }
 
+/// Compute the destination path for a move-leaf request. Identical to the
+/// source path unless `to_kind` is set (#8 change-kind), in which case the
+/// permission-kind segment is swapped so the merge step lands the rule under
+/// `permissions.<to_kind>` instead of `permissions.<from_kind>`. The index
+/// segment is preserved because `merge_at_path` ignores it for
+/// `PermissionRule` (the destination array order is independent), and
+/// preserving it keeps the path classifying as `PermissionRule` in
+/// `validate_movable_path`.
+fn dest_path_for(req: &MoveLeafRequest) -> Vec<PathSeg> {
+    match req.to_kind {
+        None => req.path.clone(),
+        Some(new_kind) => {
+            let mut p = req.path.clone();
+            if let Some(seg) = p.get_mut(1) {
+                *seg = PathSeg::Key(new_kind.key().to_string());
+            }
+            p
+        }
+    }
+}
+
+/// Validate a move-leaf request before any disk work. Centralizes the
+/// scope-equality and to_kind compatibility rules so the diff and apply
+/// paths can't drift. `to_kind` is only valid on permission-rule paths;
+/// scope equality is only allowed when `to_kind` is set and changes the
+/// effective kind.
+fn validate_move_request(
+    req: &MoveLeafRequest,
+    movable: &MovablePath<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match (req.to_kind, movable) {
+        (Some(new_kind), MovablePath::PermissionRule(current_kind, _)) => {
+            if req.from == req.to && *current_kind == new_kind {
+                return Err(format!(
+                    "rule already in `permissions.{}` of {}; nothing to change",
+                    new_kind.key(),
+                    req.from.label()
+                )
+                .into());
+            }
+            Ok(())
+        }
+        (Some(_), _) => Err(
+            "to_kind only applies to a single permission rule path (permissions.<kind>[i])".into(),
+        ),
+        (None, _) => {
+            if req.from == req.to {
+                return Err("source and destination scopes must differ".into());
+            }
+            Ok(())
+        }
+    }
+}
+
 fn diff_move_leaf_impl(
     paths: &ScopePaths,
     req: &MoveLeafRequest,
 ) -> Result<MoveLeafPreview, Box<dyn std::error::Error>> {
-    if req.from == req.to {
-        return Err("source and destination scopes must differ".into());
-    }
     let movable = validate_movable_path(&req.path)?;
+    validate_move_request(req, &movable)?;
+
+    if req.from == req.to {
+        // Same-scope change-kind: load the file once, simulate add+remove on
+        // a single in-memory doc so the diff reflects what the apply path
+        // will write in one shot.
+        return diff_change_kind_same_scope(paths, req, &movable);
+    }
+
     let from_path = require_path(paths, req.from)?;
     let to_path = require_path(paths, req.to)?;
     let affected_key = path_top_level_key(&req.path);
+    let dest_path = dest_path_for(req);
 
     let from_doc = match io_atomic::load(from_path)? {
         Some(d) => d,
@@ -489,7 +652,7 @@ fn diff_move_leaf_impl(
     let to_doc_before = to_doc_loaded.unwrap_or_else(SettingsDoc::empty);
     let to_key_before = to_doc_before.get_top_level(affected_key).cloned();
     let mut to_doc = to_doc_before.clone();
-    to_doc.merge_at_path(&req.path, src_value.clone())?;
+    to_doc.merge_at_path(&dest_path, src_value.clone())?;
     let to_key_after = to_doc.get_top_level(affected_key).cloned();
 
     let dest_unchanged = to_key_before == to_key_after;
@@ -522,6 +685,85 @@ fn diff_move_leaf_impl(
             will_write: !dest_unchanged,
             note: to_note,
         },
+        to_kind: req.to_kind,
+    })
+}
+
+/// Diff a same-scope change-kind move (#8): the rule is reclassified within
+/// one settings file. Both `from` and `to` sides reference the same file
+/// with the same key_before / key_after — the frontend collapses the
+/// bilateral display to a single side. Only `from.will_write` is true since
+/// the apply path issues a single write.
+fn diff_change_kind_same_scope(
+    paths: &ScopePaths,
+    req: &MoveLeafRequest,
+    movable: &MovablePath<'_>,
+) -> Result<MoveLeafPreview, Box<dyn std::error::Error>> {
+    let path = require_path(paths, req.from)?;
+    let affected_key = path_top_level_key(&req.path);
+    let dest_path = dest_path_for(req);
+
+    let doc = match io_atomic::load(path)? {
+        Some(d) => d,
+        None => return Err(format!("source file {} does not exist", path.display()).into()),
+    };
+    let src_value =
+        doc.get_at_path(&req.path)
+            .cloned()
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                format!(
+                    "path `{}` not found in {} {}",
+                    describe_path(&req.path),
+                    req.from.label(),
+                    path.display()
+                )
+                .into()
+            })?;
+
+    let key_before = doc.get_top_level(affected_key).cloned();
+    let mut after_doc = doc.clone();
+    // Add to destination kind first, then remove from source kind. Order
+    // matters because `remove_movable_source` for a `PermissionRule` strips
+    // every occurrence of the rule string from the source kind's array;
+    // adding first leaves no race on the destination kind's array.
+    after_doc.merge_at_path(&dest_path, src_value.clone())?;
+    if !remove_movable_source(&mut after_doc, movable, &src_value, &req.path) {
+        return Err(format!(
+            "internal error: path `{}` resolved on read but failed to remove",
+            describe_path(&req.path)
+        )
+        .into());
+    }
+    let key_after = after_doc.get_top_level(affected_key).cloned();
+
+    let file_path = path.display().to_string();
+    let file_path_exists = path.exists();
+    let note = Some(format!(
+        "Reclassified within {} — written in place.",
+        req.from.label()
+    ));
+    Ok(MoveLeafPreview {
+        path: req.path.clone(),
+        kind: MoveLeafKind::from_movable(movable),
+        from: MoveLeafSide {
+            scope: req.from,
+            file_path: file_path.clone(),
+            file_path_exists,
+            key_before: key_before.clone(),
+            key_after: key_after.clone(),
+            will_write: true,
+            note: note.clone(),
+        },
+        to: MoveLeafSide {
+            scope: req.to,
+            file_path,
+            file_path_exists,
+            key_before,
+            key_after,
+            will_write: false,
+            note,
+        },
+        to_kind: req.to_kind,
     })
 }
 
@@ -531,13 +773,20 @@ fn apply_move_leaf_impl(
     backups: &BackupTracker,
     watch: &WatchState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if req.from == req.to {
-        return Err("source and destination scopes must differ".into());
-    }
     let movable = validate_movable_path(&req.path)?;
+    validate_move_request(req, &movable)?;
+
+    if req.from == req.to {
+        // Same-scope change-kind: one file, one write. Apply add+remove to
+        // a single in-memory doc so the destination kind is updated and the
+        // source kind cleaned up in a single atomic save.
+        return apply_change_kind_same_scope(paths, req, &movable, backups, watch);
+    }
+
     let from_path = require_path(paths, req.from)?.to_path_buf();
     let to_path = require_path(paths, req.to)?.to_path_buf();
     let affected_key = path_top_level_key(&req.path);
+    let dest_path = dest_path_for(req);
 
     let (from_doc_loaded, from_stamp) = io_atomic::load_with_stamp(&from_path)?;
     let mut from_doc = match from_doc_loaded {
@@ -569,7 +818,7 @@ fn apply_move_leaf_impl(
     let to_doc_before = to_doc_loaded.unwrap_or_else(SettingsDoc::empty);
     let to_key_before = to_doc_before.get_top_level(affected_key).cloned();
     let mut to_doc = to_doc_before.clone();
-    to_doc.merge_at_path(&req.path, src_value.clone())?;
+    to_doc.merge_at_path(&dest_path, src_value.clone())?;
     let to_key_after = to_doc.get_top_level(affected_key).cloned();
     let dest_mutated = to_key_before != to_key_after;
 
@@ -620,6 +869,228 @@ fn apply_move_leaf_impl(
         );
     }
     watch.note_self_write(&from_path);
+    Ok(())
+}
+
+/// Apply a same-scope change-kind move (#8): one file, one save. Avoids the
+/// cross-scope rollback dance entirely — both add and remove apply to the
+/// same in-memory doc before we hit disk.
+fn apply_change_kind_same_scope(
+    paths: &ScopePaths,
+    req: &MoveLeafRequest,
+    movable: &MovablePath<'_>,
+    backups: &BackupTracker,
+    watch: &WatchState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = require_path(paths, req.from)?.to_path_buf();
+    let dest_path = dest_path_for(req);
+
+    let (loaded, stamp) = io_atomic::load_with_stamp(&path)?;
+    let mut doc = match loaded {
+        Some(d) => d,
+        None => return Err(format!("source file {} does not exist", path.display()).into()),
+    };
+    let src_value =
+        doc.get_at_path(&req.path)
+            .cloned()
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                format!(
+                    "path `{}` not found in {} {}",
+                    describe_path(&req.path),
+                    req.from.label(),
+                    path.display()
+                )
+                .into()
+            })?;
+
+    // Add to destination kind first, then strip every occurrence of the
+    // rule string from the source kind. Order matters: adding first means
+    // the destination kind's array always grows by exactly one (or zero, if
+    // the rule was already there), regardless of how many copies of the
+    // string lived in the source kind's array.
+    doc.merge_at_path(&dest_path, src_value.clone())?;
+    if !remove_movable_source(&mut doc, movable, &src_value, &req.path) {
+        return Err(format!(
+            "internal error: path `{}` resolved on read but failed to remove",
+            describe_path(&req.path)
+        )
+        .into());
+    }
+
+    io_atomic::save(&path, &doc, backups, Some(&stamp))?;
+    watch.note_self_write(&path);
+    Ok(())
+}
+
+fn diff_delete_leaf_impl(
+    paths: &ScopePaths,
+    req: &DeleteLeafRequest,
+) -> Result<DeleteLeafPreview, Box<dyn std::error::Error>> {
+    let movable = validate_movable_path(&req.path)?;
+    let path = require_path(paths, req.from)?;
+    let affected_key = path_top_level_key(&req.path);
+
+    let doc = match io_atomic::load(path)? {
+        Some(d) => d,
+        None => return Err(format!("file {} does not exist", path.display()).into()),
+    };
+    let src_value =
+        doc.get_at_path(&req.path)
+            .cloned()
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                format!(
+                    "path `{}` not found in {} {}",
+                    describe_path(&req.path),
+                    req.from.label(),
+                    path.display()
+                )
+                .into()
+            })?;
+
+    let key_before = doc.get_top_level(affected_key).cloned();
+    let mut after_doc = doc.clone();
+    if !remove_movable_source(&mut after_doc, &movable, &src_value, &req.path) {
+        return Err(format!(
+            "internal error: path `{}` resolved on read but failed to remove",
+            describe_path(&req.path)
+        )
+        .into());
+    }
+    let key_after = after_doc.get_top_level(affected_key).cloned();
+
+    let note = Some(match movable {
+        MovablePath::PermissionRule(_, _) => format!(
+            "Permission rule will be removed from {}. The original is saved to a .bak alongside the file.",
+            req.from.label()
+        ),
+        MovablePath::PermissionList(kind) => format!(
+            "Entire `permissions.{}` list will be removed from {}. The original is saved to a .bak alongside the file.",
+            kind.key(),
+            req.from.label()
+        ),
+        MovablePath::TopLevelKey(k) => format!(
+            "Top-level key `{}` will be removed from {}. The original is saved to a .bak alongside the file.",
+            k,
+            req.from.label()
+        ),
+    });
+
+    Ok(DeleteLeafPreview {
+        path: req.path.clone(),
+        kind: MoveLeafKind::from_movable(&movable),
+        from: MoveLeafSide {
+            scope: req.from,
+            file_path: path.display().to_string(),
+            file_path_exists: path.exists(),
+            key_before,
+            key_after,
+            will_write: true,
+            note,
+        },
+    })
+}
+
+fn apply_delete_leaf_impl(
+    paths: &ScopePaths,
+    req: &DeleteLeafRequest,
+    backups: &BackupTracker,
+    watch: &WatchState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let movable = validate_movable_path(&req.path)?;
+    let path = require_path(paths, req.from)?.to_path_buf();
+
+    let (loaded, stamp) = io_atomic::load_with_stamp(&path)?;
+    let mut doc = match loaded {
+        Some(d) => d,
+        None => return Err(format!("file {} does not exist", path.display()).into()),
+    };
+    let src_value =
+        doc.get_at_path(&req.path)
+            .cloned()
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                format!(
+                    "path `{}` not found in {} {}",
+                    describe_path(&req.path),
+                    req.from.label(),
+                    path.display()
+                )
+                .into()
+            })?;
+    if !remove_movable_source(&mut doc, &movable, &src_value, &req.path) {
+        return Err(format!(
+            "internal error: path `{}` resolved on read but failed to remove",
+            describe_path(&req.path)
+        )
+        .into());
+    }
+    io_atomic::save(&path, &doc, backups, Some(&stamp))?;
+    watch.note_self_write(&path);
+    Ok(())
+}
+
+fn diff_add_leaf_impl(
+    paths: &ScopePaths,
+    req: &AddLeafRequest,
+) -> Result<AddLeafPreview, Box<dyn std::error::Error>> {
+    let movable = validate_movable_path(&req.path)?;
+    let path = require_path(paths, req.to)?;
+    let affected_key = path_top_level_key(&req.path);
+
+    let to_doc_loaded = io_atomic::load(path)?;
+    let to_path_exists = to_doc_loaded.is_some();
+    let to_doc_before = to_doc_loaded.unwrap_or_else(SettingsDoc::empty);
+    let key_before = to_doc_before.get_top_level(affected_key).cloned();
+    let mut to_doc = to_doc_before.clone();
+    to_doc.merge_at_path(&req.path, req.value.clone())?;
+    let key_after = to_doc.get_top_level(affected_key).cloned();
+
+    let dest_unchanged = key_before == key_after;
+    let note = leaf_preview_note(
+        &movable,
+        dest_unchanged,
+        to_path_exists,
+        key_before.as_ref(),
+        &req.value,
+    );
+
+    Ok(AddLeafPreview {
+        path: req.path.clone(),
+        kind: MoveLeafKind::from_movable(&movable),
+        to: MoveLeafSide {
+            scope: req.to,
+            file_path: path.display().to_string(),
+            file_path_exists: to_path_exists,
+            key_before,
+            key_after,
+            will_write: !dest_unchanged,
+            note,
+        },
+    })
+}
+
+fn apply_add_leaf_impl(
+    paths: &ScopePaths,
+    req: &AddLeafRequest,
+    backups: &BackupTracker,
+    watch: &WatchState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _movable = validate_movable_path(&req.path)?;
+    let path = require_path(paths, req.to)?.to_path_buf();
+    let affected_key = path_top_level_key(&req.path);
+
+    let (loaded, stamp) = io_atomic::load_with_stamp(&path)?;
+    let to_doc_before = loaded.unwrap_or_else(SettingsDoc::empty);
+    let key_before = to_doc_before.get_top_level(affected_key).cloned();
+    let mut doc = to_doc_before;
+    doc.merge_at_path(&req.path, req.value.clone())?;
+    let key_after = doc.get_top_level(affected_key).cloned();
+    if key_before == key_after {
+        // Idempotent add — no write needed. Surface success quietly so the
+        // frontend's load() runs without the watcher seeing a stale event.
+        return Ok(());
+    }
+    io_atomic::save(&path, &doc, backups, Some(&stamp))?;
+    watch.note_self_write(&path);
     Ok(())
 }
 
@@ -1012,6 +1483,7 @@ mod tests {
                 path: vec![key("permissions"), key("allow"), idx(0)],
                 from: Scope::Project,
                 to: Scope::User,
+                to_kind: None,
             },
             &BackupTracker::new(),
             &WatchState::default(),
@@ -1057,6 +1529,7 @@ mod tests {
                 path: vec![key("permissions"), key("allow"), idx(0)],
                 from: Scope::Project,
                 to: Scope::User,
+                to_kind: None,
             },
             &BackupTracker::new(),
             &WatchState::default(),
@@ -1099,6 +1572,7 @@ mod tests {
                 path: vec![key("permissions"), key("allow"), idx(0)],
                 from: Scope::Project,
                 to: Scope::User,
+                to_kind: None,
             },
             &BackupTracker::new(),
             &WatchState::default(),
@@ -1144,6 +1618,7 @@ mod tests {
                 path: vec![key("env")],
                 from: Scope::Project,
                 to: Scope::User,
+                to_kind: None,
             },
             &BackupTracker::new(),
             &WatchState::default(),
@@ -1192,6 +1667,7 @@ mod tests {
                 path: vec![key("permissions"), key("allow")],
                 from: Scope::Project,
                 to: Scope::User,
+                to_kind: None,
             },
             &BackupTracker::new(),
             &WatchState::default(),
@@ -1230,6 +1706,7 @@ mod tests {
                 path: vec![key("permissions"), key("allow"), idx(0)],
                 from: Scope::Project,
                 to: Scope::User,
+                to_kind: None,
             },
         )
         .unwrap();
@@ -1271,6 +1748,7 @@ mod tests {
                 path: vec![key("permissions")],
                 from: Scope::Project,
                 to: Scope::User,
+                to_kind: None,
             },
             &BackupTracker::new(),
             &WatchState::default(),
@@ -1290,6 +1768,7 @@ mod tests {
                 path: vec![key("theme")],
                 from: Scope::Project,
                 to: Scope::Project,
+                to_kind: None,
             },
             &BackupTracker::new(),
             &WatchState::default(),
@@ -1309,11 +1788,504 @@ mod tests {
                 path: vec![key("permissions"), key("allow"), idx(0)],
                 from: Scope::Project,
                 to: Scope::User,
+                to_kind: None,
             },
             &BackupTracker::new(),
             &WatchState::default(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    // -- change-kind tests (#8) --------------------------------------------
+
+    #[test]
+    fn change_kind_same_scope_moves_rule_between_kinds_in_one_file() {
+        // The headline same-scope flow: a rule under `permissions.allow` is
+        // reclassified to `permissions.deny` within the same settings file.
+        // Single load, single write — the cross-scope rollback path doesn't
+        // need to be involved.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(git status)","Read(**)"]}}"#,
+        );
+
+        apply_move_leaf_impl(
+            &paths,
+            &MoveLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Project,
+                to: Scope::Project,
+                to_kind: Some(PermissionKind::Deny),
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        let doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *doc.get_top_level("permissions").unwrap(),
+            serde_json::json!({"allow": ["Read(**)"], "deny": ["Bash(git status)"]})
+        );
+    }
+
+    #[test]
+    fn change_kind_same_scope_strips_all_duplicates_of_rule_string() {
+        // Mirrors `move_leaf_permission_rule_strips_all_copies_of_duplicated_string`
+        // but for the same-scope change-kind path. Hand-edited duplicates in
+        // the source kind must all disappear; the destination kind ends up
+        // with a single copy thanks to the merge step's idempotency.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(rm)","Bash(rm)","Read(**)"]}}"#,
+        );
+
+        apply_move_leaf_impl(
+            &paths,
+            &MoveLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Project,
+                to: Scope::Project,
+                to_kind: Some(PermissionKind::Deny),
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        let doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *doc.get_top_level("permissions").unwrap(),
+            serde_json::json!({"allow": ["Read(**)"], "deny": ["Bash(rm)"]})
+        );
+    }
+
+    #[test]
+    fn change_kind_cross_scope_lands_under_new_kind_at_destination() {
+        // Cross-scope change-kind: rule moves out of Project's allow list
+        // and into User's deny list in one shot. Source must lose the rule;
+        // destination must receive it under the new kind, not the old one.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(rm)"]}}"#,
+        );
+
+        apply_move_leaf_impl(
+            &paths,
+            &MoveLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Project,
+                to: Scope::User,
+                to_kind: Some(PermissionKind::Deny),
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        let project_doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(project_doc.permissions().allow.is_empty());
+        let user_doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(user_doc.permissions().allow.is_empty());
+        assert_eq!(user_doc.permissions().deny, vec!["Bash(rm)".to_string()]);
+    }
+
+    #[test]
+    fn change_kind_same_scope_same_kind_errors_with_nothing_to_change() {
+        // A request that asks to change a rule to the kind it already has
+        // is a no-op the user almost certainly didn't mean — error rather
+        // than silently succeed so the UI can surface "this rule is already
+        // an Allow rule" instead of pretending work happened.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(rm)"]}}"#,
+        );
+        let err = apply_move_leaf_impl(
+            &paths,
+            &MoveLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Project,
+                to: Scope::Project,
+                to_kind: Some(PermissionKind::Allow),
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("nothing to change"));
+    }
+
+    #[test]
+    fn change_kind_rejected_on_non_rule_paths() {
+        // to_kind only makes sense for a single permission rule. Whole-list
+        // and top-level-key paths must reject the request rather than
+        // silently misbehave.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"theme":"dark","permissions":{"allow":["Bash(rm)"]}}"#,
+        );
+        let err_list = apply_move_leaf_impl(
+            &paths,
+            &MoveLeafRequest {
+                path: vec![key("permissions"), key("allow")],
+                from: Scope::Project,
+                to: Scope::User,
+                to_kind: Some(PermissionKind::Deny),
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap_err();
+        assert!(err_list.to_string().contains("to_kind only applies"));
+
+        let err_key = apply_move_leaf_impl(
+            &paths,
+            &MoveLeafRequest {
+                path: vec![key("theme")],
+                from: Scope::Project,
+                to: Scope::User,
+                to_kind: Some(PermissionKind::Allow),
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap_err();
+        assert!(err_key.to_string().contains("to_kind only applies"));
+    }
+
+    #[test]
+    fn diff_change_kind_same_scope_collapses_to_one_file() {
+        // The preview for a same-scope change-kind request must reference the
+        // same file on both sides with identical key_before / key_after, and
+        // only the from side carries `will_write = true` (the apply path
+        // issues exactly one save). The frontend uses these signals to
+        // collapse the bilateral diff into a single side.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(rm)"]}}"#,
+        );
+
+        let preview = diff_move_leaf_impl(
+            &paths,
+            &MoveLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Project,
+                to: Scope::Project,
+                to_kind: Some(PermissionKind::Deny),
+            },
+        )
+        .unwrap();
+        assert_eq!(preview.from.file_path, preview.to.file_path);
+        assert_eq!(preview.from.key_before, preview.to.key_before);
+        assert_eq!(preview.from.key_after, preview.to.key_after);
+        assert!(preview.from.will_write);
+        assert!(!preview.to.will_write);
+        assert_eq!(preview.to_kind, Some(PermissionKind::Deny));
+        assert_eq!(
+            preview.from.key_after.unwrap(),
+            serde_json::json!({"allow": [], "deny": ["Bash(rm)"]})
+        );
+    }
+
+    // -- delete-leaf tests (#8) --------------------------------------------
+
+    #[test]
+    fn delete_leaf_removes_permission_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(rm)","Read(**)"]}}"#,
+        );
+
+        apply_delete_leaf_impl(
+            &paths,
+            &DeleteLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Project,
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        let doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.permissions().allow, vec!["Read(**)".to_string()]);
+    }
+
+    #[test]
+    fn delete_leaf_strips_all_duplicates_of_rule_string() {
+        // Same legacy-parity contract as the move flow: a delete from a
+        // hand-edited array with duplicate rule strings must strip every
+        // copy, not just the indexed one.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(rm)","Bash(rm)","Read(**)"]}}"#,
+        );
+
+        apply_delete_leaf_impl(
+            &paths,
+            &DeleteLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Project,
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        let doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.permissions().allow, vec!["Read(**)".to_string()]);
+    }
+
+    #[test]
+    fn delete_leaf_removes_top_level_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"theme":"dark","env":{"PATH":"/x"}}"#,
+        );
+
+        apply_delete_leaf_impl(
+            &paths,
+            &DeleteLeafRequest {
+                path: vec![key("theme")],
+                from: Scope::Project,
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        let doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(doc.get_top_level("theme").is_none());
+        assert!(doc.get_top_level("env").is_some());
+    }
+
+    #[test]
+    fn delete_leaf_errors_when_path_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(paths.project.as_ref().unwrap(), r#"{"permissions":{}}"#);
+        let err = apply_delete_leaf_impl(
+            &paths,
+            &DeleteLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Project,
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn diff_delete_leaf_returns_before_after_and_destructive_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(rm)","Read(**)"]}}"#,
+        );
+
+        let preview = diff_delete_leaf_impl(
+            &paths,
+            &DeleteLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Project,
+            },
+        )
+        .unwrap();
+        assert!(matches!(preview.kind, MoveLeafKind::PermissionRule));
+        assert_eq!(
+            preview.from.key_before.unwrap(),
+            serde_json::json!({"allow": ["Bash(rm)", "Read(**)"]})
+        );
+        assert_eq!(
+            preview.from.key_after.unwrap(),
+            serde_json::json!({"allow": ["Read(**)"]})
+        );
+        assert!(preview.from.will_write);
+        let note = preview.from.note.unwrap();
+        assert!(note.contains("removed"));
+        assert!(note.contains(".bak"));
+    }
+
+    // -- add-leaf tests (#8) -----------------------------------------------
+
+    #[test]
+    fn add_leaf_pushes_permission_rule_into_destination_array() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.user.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Read(**)"]}}"#,
+        );
+
+        apply_add_leaf_impl(
+            &paths,
+            &AddLeafRequest {
+                path: vec![key("permissions"), key("deny"), idx(0)],
+                to: Scope::User,
+                value: serde_json::json!("WebFetch(domain:evil.example)"),
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        let doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *doc.get_top_level("permissions").unwrap(),
+            serde_json::json!({
+                "allow": ["Read(**)"],
+                "deny": ["WebFetch(domain:evil.example)"]
+            })
+        );
+    }
+
+    #[test]
+    fn add_leaf_creates_destination_file_when_missing() {
+        // Pasting into a scope that has no settings file yet must create
+        // the file via the same `merge_at_path` + atomic-write path the
+        // move flow uses for first-write destinations.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+
+        apply_add_leaf_impl(
+            &paths,
+            &AddLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                to: Scope::User,
+                value: serde_json::json!("Bash(ls)"),
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        let doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.permissions().allow, vec!["Bash(ls)".to_string()]);
+    }
+
+    #[test]
+    fn add_leaf_idempotent_when_rule_already_present() {
+        // Pasting a rule that's already in the destination is a no-op write
+        // — the apply path returns Ok without touching the file. The check
+        // is the destination's file size (or, here, that the load round-trip
+        // returns the same shape). No error is raised because paste UX
+        // shouldn't punish the user for a harmless duplicate.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.user.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(ls)"]}}"#,
+        );
+
+        apply_add_leaf_impl(
+            &paths,
+            &AddLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                to: Scope::User,
+                value: serde_json::json!("Bash(ls)"),
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        let doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.permissions().allow, vec!["Bash(ls)".to_string()]);
+    }
+
+    #[test]
+    fn diff_add_leaf_returns_before_after_and_will_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.user.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Read(**)"]}}"#,
+        );
+
+        let preview = diff_add_leaf_impl(
+            &paths,
+            &AddLeafRequest {
+                path: vec![key("permissions"), key("deny"), idx(0)],
+                to: Scope::User,
+                value: serde_json::json!("WebFetch(domain:evil.example)"),
+            },
+        )
+        .unwrap();
+        assert!(matches!(preview.kind, MoveLeafKind::PermissionRule));
+        assert_eq!(
+            preview.to.key_before.unwrap(),
+            serde_json::json!({"allow": ["Read(**)"]})
+        );
+        assert_eq!(
+            preview.to.key_after.unwrap(),
+            serde_json::json!({
+                "allow": ["Read(**)"],
+                "deny": ["WebFetch(domain:evil.example)"]
+            })
+        );
+        assert!(preview.to.will_write);
+    }
+
+    #[test]
+    fn diff_add_leaf_marks_idempotent_paste_as_no_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.user.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(ls)"]}}"#,
+        );
+
+        let preview = diff_add_leaf_impl(
+            &paths,
+            &AddLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                to: Scope::User,
+                value: serde_json::json!("Bash(ls)"),
+            },
+        )
+        .unwrap();
+        assert!(!preview.to.will_write);
     }
 }

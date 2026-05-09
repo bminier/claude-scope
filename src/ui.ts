@@ -1,5 +1,9 @@
 import { lintRule } from "./lint.ts";
 import type {
+  AddLeafPreview,
+  AddLeafRequest,
+  DeleteLeafPreview,
+  DeleteLeafRequest,
   JsonValue,
   LoadedScopes,
   MoveLeafKind,
@@ -27,8 +31,36 @@ interface AppProps {
   onPickProject: () => void;
   onReload: () => void;
   onMoveLeaf: (req: MoveLeafRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
+  /** Reclassify a permission rule between allow / deny / ask within the
+   *  same scope (#8). Routes through the move-leaf primitive on the
+   *  backend with `from === to` and `to_kind` set. */
+  onChangeKind: (
+    path: PathSeg[],
+    scope: Scope,
+    newKind: PermissionKind,
+    trigger?: HTMLElement,
+  ) => void;
+  onDeleteLeaf: (req: DeleteLeafRequest, trigger?: HTMLElement) => void;
+  onAddLeaf: (req: AddLeafRequest, trigger?: HTMLElement) => void;
   onOpenSettings: (trigger?: HTMLElement) => void;
   onQueryChange: (next: string) => void;
+}
+
+/**
+ * Stub for #106 (project discovery). Returns the list of known Claude
+ * projects to populate the Move-to submenu — for v1, just the currently
+ * loaded project. Replaced when #106 lands; keeping the indirection means
+ * the menu rendering doesn't need to change at that point.
+ */
+function getKnownProjects(props: AppProps): { name: string; root: string }[] {
+  if (!props.projectDir) return [];
+  // Use the directory's basename (final path segment) as the display name.
+  // Handles both Windows back-slashes and POSIX forward-slashes so the
+  // label looks right regardless of the OS the loaded project lives on.
+  const root = props.projectDir;
+  const sepIdx = Math.max(root.lastIndexOf("/"), root.lastIndexOf("\\"));
+  const name = sepIdx >= 0 ? root.slice(sepIdx + 1) || root : root;
+  return [{ name, root }];
 }
 
 const PERMISSION_KINDS: ReadonlyArray<PermissionKind> = ["allow", "deny", "ask"];
@@ -172,7 +204,7 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   // Lowercase the query once per render instead of per rule; scopeGrid/
   // combinedPanel push this down into every filter call.
   const lowerQuery = props.query.toLowerCase();
-  root.appendChild(combinedPanel(props.scopes, props.query, lowerQuery));
+  root.appendChild(combinedPanel(props.scopes, props, lowerQuery));
   root.appendChild(scopeGrid(props, lowerQuery));
   restoreSearchFocus(preserveSearchFocus, caret);
 }
@@ -310,7 +342,8 @@ function searchBox(props: AppProps): HTMLElement {
   return wrap;
 }
 
-function combinedPanel(loaded: LoadedScopes, query: string, lowerQuery: string): HTMLElement {
+function combinedPanel(loaded: LoadedScopes, props: AppProps, lowerQuery: string): HTMLElement {
+  const query = props.query;
   const panel = document.createElement("section");
   panel.className = "combined";
   const title = document.createElement("h2");
@@ -373,6 +406,9 @@ function combinedPanel(loaded: LoadedScopes, query: string, lowerQuery: string):
       chipWrap.appendChild(originWrap);
       const badge = lintBadge(rule);
       if (badge) chipWrap.appendChild(badge);
+      attachContextMenu(chipWrap, () =>
+        combinedChipContextMenuItems(rule, allOrigins[i] ?? [], props),
+      );
       group.appendChild(chipWrap);
     }
     groupsWrap.appendChild(group);
@@ -692,6 +728,7 @@ function treeBranch(
   summary.appendChild(peek);
   if (props && offerMoveAffordance) {
     summary.appendChild(leafMoveButtons(scope, path, props));
+    attachContextMenu(summary, () => leafContextMenuItems(scope, path, value, props));
   }
   details.appendChild(summary);
 
@@ -786,6 +823,7 @@ function treeLeaf(
       // reader announces "Move Bash(git status) from …" instead of
       // the meaningless path "permissions.allow[0]".
       row.appendChild(leafMoveButtons(scope, path, props, rule));
+      attachContextMenu(row, () => leafContextMenuItems(scope, path, value, props));
     }
     return row;
   }
@@ -821,6 +859,7 @@ function treeLeaf(
   row.appendChild(val);
   if (props && offerMoveAffordance) {
     row.appendChild(leafMoveButtons(scope, path, props));
+    attachContextMenu(row, () => leafContextMenuItems(scope, path, value, props));
   }
   return row;
 }
@@ -960,6 +999,11 @@ function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
 function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTMLElement {
   const col = document.createElement("div");
   col.className = "col";
+  // Column-level context menu (#8 paste). Leaf and chip handlers
+  // stopPropagation on contextmenu, so this only fires when the user
+  // right-clicks on the column chrome itself (header, status row, empty
+  // area below the tree).
+  attachContextMenu(col, () => scopeColumnContextMenuItems(view.scope, props));
 
   // Drop target wiring. Only highlight + accept when the active drag came
   // from a different scope — same-scope drops are intra-scope reorders,
@@ -1122,21 +1166,46 @@ export function confirmMoveLeaf(
   preview: MoveLeafPreview,
   trigger?: HTMLElement | null,
 ): Promise<boolean> {
+  const isSameScopeChangeKind =
+    preview.to_kind !== undefined && preview.from.scope === preview.to.scope;
+
   const subtitle = document.createDocumentFragment();
   const target = document.createElement("code");
   target.className = "chip";
   target.textContent = leafSubtitleLabel(preview);
   subtitle.appendChild(target);
-  subtitle.appendChild(
-    document.createTextNode(
-      ` from ${SCOPE_LABELS[preview.from.scope]} to ${SCOPE_LABELS[preview.to.scope]}`,
-    ),
-  );
+  if (isSameScopeChangeKind && preview.to_kind !== undefined) {
+    const fromKind = permissionKindForPath(preview.path);
+    subtitle.appendChild(
+      document.createTextNode(
+        ` — ${fromKind ? KIND_LABELS[fromKind] : ""} → ${KIND_LABELS[preview.to_kind]} in ${SCOPE_LABELS[preview.from.scope]}`,
+      ),
+    );
+  } else {
+    subtitle.appendChild(
+      document.createTextNode(
+        ` from ${SCOPE_LABELS[preview.from.scope]} to ${SCOPE_LABELS[preview.to.scope]}`,
+      ),
+    );
+    if (preview.to_kind !== undefined) {
+      subtitle.appendChild(
+        document.createTextNode(` (reclassified as ${KIND_LABELS[preview.to_kind]})`),
+      );
+    }
+  }
 
   const diff = document.createElement("div");
-  diff.className = "modal-diff";
-  diff.appendChild(leafDiffSide(preview, "remove"));
-  diff.appendChild(leafDiffSide(preview, "add"));
+  diff.className = isSameScopeChangeKind ? "modal-diff modal-diff-single" : "modal-diff";
+  if (isSameScopeChangeKind) {
+    // Same-scope change-kind writes one file in one shot — render only the
+    // source side so the user isn't presented with two visually identical
+    // panes. The single side's `key_before` / `key_after` already reflect
+    // both the remove (from old kind) and the add (to new kind).
+    diff.appendChild(leafDiffSide(preview, "remove"));
+  } else {
+    diff.appendChild(leafDiffSide(preview, "remove"));
+    diff.appendChild(leafDiffSide(preview, "add"));
+  }
 
   return openConfirmModal({
     titleText: leafModalTitle(preview),
@@ -1147,6 +1216,11 @@ export function confirmMoveLeaf(
 }
 
 function leafModalTitle(preview: MoveLeafPreview): string {
+  if (preview.to_kind !== undefined) {
+    return preview.from.scope === preview.to.scope
+      ? "Reclassify rule"
+      : "Reclassify rule across scopes";
+  }
   switch (preview.kind) {
     case "permission_rule": {
       const kind = permissionKindForPath(preview.path);
@@ -1574,6 +1648,544 @@ function formatValue(v: JsonValue | undefined): string {
   // JSON `null` should stringify as "null", not collapse to "(absent)".
   if (v === undefined) return "(absent)";
   return JSON.stringify(v, null, 2);
+}
+
+// -- Context menu primitive (#8) ---------------------------------------------
+
+/** One item in a context menu — leaf, separator, or nested submenu. */
+type MenuItem =
+  | { label: string; onClick: () => void; disabled?: boolean }
+  | { label: string; submenu: MenuItem[]; disabled?: boolean }
+  | { separator: true };
+
+let openContextMenuClose: (() => void) | null = null;
+
+function closeOpenContextMenu(): void {
+  openContextMenuClose?.();
+}
+
+/**
+ * Open a cursor-positioned context menu (#8). Supports nested submenus that
+ * fly out to the right (or left when there isn't room), keyboard navigation
+ * (arrows, Enter, Esc), and dismiss on click-outside or a second
+ * `contextmenu` event elsewhere. Focus restores to `trigger` when the menu
+ * closes.
+ *
+ * Coexistence with the lint popover: opens close any pinned popover so the
+ * two transient surfaces don't compete for outside-click handlers.
+ */
+function openContextMenu(items: MenuItem[], x: number, y: number, trigger?: HTMLElement): void {
+  closeOpenContextMenu();
+  closeLintPopover();
+
+  let closed = false;
+  const stack: HTMLElement[] = [];
+
+  function close(): void {
+    if (closed) return;
+    closed = true;
+    for (const el of stack) el.remove();
+    stack.length = 0;
+    document.removeEventListener("keydown", onKey, true);
+    document.removeEventListener("mousedown", onOutsideMouse, true);
+    document.removeEventListener("contextmenu", onOutsideContext, true);
+    openContextMenuClose = null;
+    if (trigger && document.body.contains(trigger)) trigger.focus();
+  }
+  openContextMenuClose = close;
+
+  function buttonsIn(menu: HTMLElement): HTMLButtonElement[] {
+    return Array.from(
+      menu.querySelectorAll<HTMLButtonElement>("button.context-menu-item:not(:disabled)"),
+    );
+  }
+
+  function closeSubmenusBelow(depth: number): void {
+    while (stack.length > depth + 1) {
+      const el = stack.pop();
+      el?.remove();
+    }
+  }
+
+  function buildMenu(items: MenuItem[], anchor: DOMRect | null, depth: number): HTMLElement {
+    const menu = document.createElement("div");
+    menu.className = "context-menu";
+    menu.setAttribute("role", "menu");
+    for (const item of items) {
+      if ("separator" in item) {
+        const sep = document.createElement("div");
+        sep.className = "context-menu-sep";
+        sep.setAttribute("role", "separator");
+        menu.appendChild(sep);
+        continue;
+      }
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "context-menu-item";
+      btn.setAttribute("role", "menuitem");
+      btn.textContent = item.label;
+      if ("submenu" in item) {
+        btn.classList.add("context-menu-submenu-trigger");
+        const arrow = document.createElement("span");
+        arrow.className = "context-menu-arrow";
+        arrow.textContent = "▸";
+        btn.appendChild(arrow);
+        if (item.disabled) {
+          btn.disabled = true;
+        } else {
+          btn.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            openSubmenu(item.submenu, btn, depth);
+          });
+          btn.addEventListener("mouseenter", () => {
+            openSubmenu(item.submenu, btn, depth);
+          });
+        }
+      } else {
+        if (item.disabled) {
+          btn.disabled = true;
+        } else {
+          btn.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            item.onClick();
+            close();
+          });
+          btn.addEventListener("mouseenter", () => closeSubmenusBelow(depth));
+        }
+      }
+      menu.appendChild(btn);
+    }
+
+    document.body.appendChild(menu);
+    const rect = menu.getBoundingClientRect();
+    let left: number;
+    let top: number;
+    if (anchor) {
+      left = anchor.right;
+      top = anchor.top;
+      if (left + rect.width > window.innerWidth) {
+        left = Math.max(0, anchor.left - rect.width);
+      }
+    } else {
+      left = x;
+      top = y;
+      if (left + rect.width > window.innerWidth) {
+        left = Math.max(0, window.innerWidth - rect.width);
+      }
+    }
+    if (top + rect.height > window.innerHeight) {
+      top = Math.max(0, window.innerHeight - rect.height);
+    }
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+    buttonsIn(menu)[0]?.focus();
+    return menu;
+  }
+
+  function openSubmenu(items: MenuItem[], anchor: HTMLElement, depth: number): void {
+    closeSubmenusBelow(depth);
+    const sub = buildMenu(items, anchor.getBoundingClientRect(), depth + 1);
+    stack.push(sub);
+  }
+
+  const root = buildMenu(items, null, 0);
+  stack.push(root);
+
+  function focusedDepth(): number {
+    const active = document.activeElement as Element | null;
+    if (!active) return -1;
+    return stack.findIndex((m) => m.contains(active));
+  }
+
+  function onKey(e: KeyboardEvent): void {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (stack.length > 1) {
+        const top = stack.pop();
+        top?.remove();
+        const parent = stack[stack.length - 1];
+        const t = parent.querySelector<HTMLButtonElement>(
+          "button.context-menu-item.context-menu-submenu-trigger",
+        );
+        t?.focus();
+      } else {
+        close();
+      }
+      return;
+    }
+    const depth = focusedDepth();
+    if (depth < 0) return;
+    const menu = stack[depth];
+    const btns = buttonsIn(menu);
+    const active = document.activeElement as HTMLButtonElement | null;
+    const idx = active ? btns.indexOf(active) : -1;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      btns[(idx + 1 + btns.length) % btns.length]?.focus();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      btns[(idx - 1 + btns.length) % btns.length]?.focus();
+    } else if (e.key === "ArrowRight") {
+      if (active?.classList.contains("context-menu-submenu-trigger")) {
+        e.preventDefault();
+        active.click();
+      }
+    } else if (e.key === "ArrowLeft") {
+      if (stack.length > 1) {
+        e.preventDefault();
+        const top = stack.pop();
+        top?.remove();
+        const parent = stack[stack.length - 1];
+        const t = parent.querySelector<HTMLButtonElement>(
+          "button.context-menu-item.context-menu-submenu-trigger",
+        );
+        t?.focus();
+      }
+    }
+  }
+
+  function onOutsideMouse(e: MouseEvent): void {
+    const target = e.target as Node;
+    if (stack.some((m) => m.contains(target))) return;
+    close();
+  }
+  function onOutsideContext(e: MouseEvent): void {
+    const target = e.target as Node;
+    if (stack.some((m) => m.contains(target))) return;
+    close();
+  }
+
+  document.addEventListener("keydown", onKey, true);
+  document.addEventListener("mousedown", onOutsideMouse, true);
+  document.addEventListener("contextmenu", onOutsideContext, true);
+}
+
+/**
+ * Wire `contextmenu` and Shift+F10 / Menu-key keyboard activation on `el`
+ * to open a context menu built lazily by `build`. The build function is
+ * called on each activation so menu state (clipboard contents, current
+ * scope visibility, etc.) is fresh.
+ */
+function attachContextMenu(el: HTMLElement, build: () => MenuItem[]): void {
+  el.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const items = build();
+    if (items.length === 0) return;
+    openContextMenu(items, e.clientX, e.clientY, el);
+  });
+  el.addEventListener("keydown", (e) => {
+    if ((e.key === "F10" && e.shiftKey) || e.key === "ContextMenu") {
+      e.preventDefault();
+      e.stopPropagation();
+      const items = build();
+      if (items.length === 0) return;
+      const rect = el.getBoundingClientRect();
+      openContextMenu(items, rect.left, rect.bottom, el);
+    }
+  });
+}
+
+/**
+ * Build the Move-to submenu structure (#8): User / User-Local at top,
+ * then a separator, then each known project as a nested submenu of its
+ * Local / Project scopes. `from` (and optional `fromProject`) drive the
+ * "skip the source" filter; `isScopeVisible` hides columns the user
+ * collapsed.
+ *
+ * `fromProject` is the project root the source belongs to when known —
+ * for v1 there's only the current project so this is just `props.projectDir`,
+ * but #106 will give us the choice of multiple projects and the source-
+ * skip will need the project identity to disambiguate Local-of-A from
+ * Local-of-B.
+ */
+function buildMoveToSubmenu(
+  props: AppProps,
+  from: Scope,
+  onPick: (target: Scope) => void,
+): MenuItem[] {
+  const items: MenuItem[] = [];
+  // Machine-global scopes first.
+  for (const target of ["user", "user_local"] as Scope[]) {
+    if (target === from) continue;
+    if (!isScopeVisible(target)) continue;
+    items.push({ label: SCOPE_LABELS[target], onClick: () => onPick(target) });
+  }
+  const projects = getKnownProjects(props);
+  if (projects.length > 0 && items.length > 0) {
+    items.push({ separator: true });
+  }
+  for (const project of projects) {
+    const inner: MenuItem[] = [];
+    for (const target of ["local", "project"] as Scope[]) {
+      if (target === from) continue;
+      if (!isScopeVisible(target)) continue;
+      inner.push({ label: SCOPE_LABELS[target], onClick: () => onPick(target) });
+    }
+    if (inner.length === 0) continue;
+    items.push({ label: project.name, submenu: inner });
+  }
+  return items;
+}
+
+/** Copy text to the clipboard, fall back gracefully if the API is missing. */
+function copyToClipboard(text: string): void {
+  if (navigator.clipboard?.writeText) {
+    void navigator.clipboard.writeText(text).catch((err) => {
+      console.warn("clipboard write failed:", err);
+    });
+  }
+}
+
+/**
+ * Confirm modal for a delete-leaf action (#8). Mirrors `confirmMoveLeaf`'s
+ * shape but renders only the source side, since there's no destination.
+ */
+export function confirmDeleteLeaf(
+  preview: DeleteLeafPreview,
+  trigger?: HTMLElement | null,
+): Promise<boolean> {
+  const subtitle = document.createDocumentFragment();
+  const target = document.createElement("code");
+  target.className = "chip";
+  if (preview.kind === "permission_rule") {
+    const rule = leafValueAtPath(preview.from.key_before, preview.path);
+    target.textContent = typeof rule === "string" ? rule : describePath(preview.path);
+  } else {
+    target.textContent = describePath(preview.path);
+  }
+  subtitle.appendChild(target);
+  subtitle.appendChild(document.createTextNode(` from ${SCOPE_LABELS[preview.from.scope]}`));
+
+  const diff = document.createElement("div");
+  diff.className = "modal-diff modal-diff-single";
+  // Reuse leafDiffSide by handing it a synthesized two-sided preview where
+  // only the `remove` side is read. The `to` field has to be present for
+  // the type, but `leafDiffSide` never touches it when mode === "remove".
+  const synthetic: MoveLeafPreview = {
+    path: preview.path,
+    kind: preview.kind,
+    from: preview.from,
+    to: preview.from,
+  };
+  diff.appendChild(leafDiffSide(synthetic, "remove"));
+
+  return openConfirmModal({
+    titleText: deleteModalTitle(preview.kind),
+    subtitle,
+    body: diff,
+    trigger,
+  });
+}
+
+/** Confirm modal for an add-leaf action (#8) — paste destination side only. */
+export function confirmAddLeaf(
+  preview: AddLeafPreview,
+  trigger?: HTMLElement | null,
+): Promise<boolean> {
+  const subtitle = document.createDocumentFragment();
+  const target = document.createElement("code");
+  target.className = "chip";
+  if (preview.kind === "permission_rule") {
+    const rule = leafValueAtPath(preview.to.key_after, preview.path);
+    target.textContent = typeof rule === "string" ? rule : describePath(preview.path);
+  } else {
+    target.textContent = describePath(preview.path);
+  }
+  subtitle.appendChild(target);
+  subtitle.appendChild(document.createTextNode(` into ${SCOPE_LABELS[preview.to.scope]}`));
+
+  const diff = document.createElement("div");
+  diff.className = "modal-diff modal-diff-single";
+  const synthetic: MoveLeafPreview = {
+    path: preview.path,
+    kind: preview.kind,
+    from: preview.to,
+    to: preview.to,
+  };
+  diff.appendChild(leafDiffSide(synthetic, "add"));
+
+  return openConfirmModal({
+    titleText: addModalTitle(preview.kind),
+    subtitle,
+    body: diff,
+    trigger,
+  });
+}
+
+/**
+ * Build the menu items for a permission rule leaf, top-level key leaf, or
+ * movable branch (#8). Includes Copy, Delete, Change-kind (rules only),
+ * and Move-to. Disabled actions still render so users see why something
+ * isn't available.
+ */
+function leafContextMenuItems(
+  scope: Scope,
+  path: PathSeg[],
+  value: JsonValue,
+  props: AppProps,
+): MenuItem[] {
+  const items: MenuItem[] = [];
+  const permKind = permissionKindForPath(path);
+  const isRule = permKind !== null && path.length === 3 && typeof value === "string";
+
+  items.push({
+    label: "Copy",
+    onClick: () => {
+      // Rule strings copy as plain text; everything else copies as
+      // pretty-printed JSON so it round-trips through paste in another
+      // editor.
+      copyToClipboard(isRule ? (value as string) : JSON.stringify(value, null, 2));
+    },
+  });
+
+  items.push({
+    label: "Delete",
+    onClick: () => props.onDeleteLeaf({ path, from: scope }),
+    disabled: props.busy,
+  });
+
+  if (isRule && permKind) {
+    const sub: MenuItem[] = [];
+    for (const kind of PERMISSION_KINDS) {
+      sub.push({
+        label: capitalize(KIND_LABELS[kind]),
+        onClick: () => props.onChangeKind(path, scope, kind),
+        disabled: props.busy || kind === permKind,
+      });
+    }
+    items.push({ label: "Change kind", submenu: sub });
+  }
+
+  const moveItems = buildMoveToSubmenu(props, scope, (target) => {
+    props.onMoveLeaf({ path, from: scope, to: target });
+  });
+  items.push({
+    label: "Move to",
+    submenu:
+      moveItems.length > 0
+        ? moveItems
+        : [{ label: "(no other scopes)", onClick: () => {}, disabled: true }],
+    disabled: props.busy,
+  });
+
+  return items;
+}
+
+/** Menu items for a chip in the combined-permissions panel (#8). */
+function combinedChipContextMenuItems(
+  rule: string,
+  originScopes: Scope[],
+  props: AppProps,
+): MenuItem[] {
+  const items: MenuItem[] = [{ label: "Copy", onClick: () => copyToClipboard(rule) }];
+  // Highest-precedence origin acts as the implicit source for a Move-to
+  // from the combined panel — that's the chip the user actually sees in
+  // the effective view, and the one that would shadow the others if they
+  // disagreed.
+  const sourceScope = originScopes[0];
+  if (sourceScope) {
+    const sourcePath = findPermissionPath(props, rule, sourceScope);
+    if (sourcePath) {
+      const moveItems = buildMoveToSubmenu(props, sourceScope, (target) => {
+        props.onMoveLeaf({ path: sourcePath, from: sourceScope, to: target });
+      });
+      items.push({
+        label: `Move to (from ${SCOPE_LABELS[sourceScope]})`,
+        submenu:
+          moveItems.length > 0
+            ? moveItems
+            : [{ label: "(no other scopes)", onClick: () => {}, disabled: true }],
+        disabled: props.busy,
+      });
+    }
+  }
+  return items;
+}
+
+/**
+ * Resolve a rule string back to its `permissions.<kind>[i]` path in a
+ * specific scope. Used by the combined-panel context menu to construct
+ * the concrete source path for a Move-to driven by an aggregated chip.
+ */
+function findPermissionPath(props: AppProps, rule: string, scope: Scope): PathSeg[] | null {
+  const view = props.scopes?.scopes.find((s) => s.scope === scope);
+  if (!view) return null;
+  const perms = view.values.permissions;
+  if (!perms || typeof perms !== "object" || Array.isArray(perms)) return null;
+  for (const kind of PERMISSION_KINDS) {
+    const list = (perms as { [k: string]: JsonValue })[kind];
+    if (!Array.isArray(list)) continue;
+    const idx = list.indexOf(rule);
+    if (idx >= 0) return ["permissions", kind, idx];
+  }
+  return null;
+}
+
+/** Menu items for a scope column's empty area (#8 paste). */
+function scopeColumnContextMenuItems(scope: Scope, props: AppProps): MenuItem[] {
+  const sub: MenuItem[] = [];
+  for (const kind of PERMISSION_KINDS) {
+    sub.push({
+      label: capitalize(KIND_LABELS[kind]),
+      onClick: () => {
+        // Read the clipboard on activation rather than ahead of time —
+        // there's no synchronous way to inspect it during `contextmenu`.
+        // The promise resolves before the next tick on success; on failure
+        // (denied permission, no clipboard API) we surface the error.
+        void (async () => {
+          let text = "";
+          try {
+            text = (await navigator.clipboard?.readText()) ?? "";
+          } catch (err) {
+            alert(`Couldn't read clipboard: ${err}`);
+            return;
+          }
+          const trimmed = text.trim();
+          if (trimmed === "") {
+            alert("Clipboard is empty — nothing to paste.");
+            return;
+          }
+          props.onAddLeaf({
+            path: ["permissions", kind, 0],
+            to: scope,
+            value: trimmed,
+          });
+        })();
+      },
+      disabled: props.busy,
+    });
+  }
+  return [{ label: "Paste as", submenu: sub, disabled: props.busy }];
+}
+
+function capitalize(s: string): string {
+  return s.length === 0 ? s : s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function deleteModalTitle(kind: MoveLeafKind): string {
+  switch (kind) {
+    case "permission_rule":
+      return "Delete rule";
+    case "permission_list":
+      return "Delete rule list";
+    case "top_level_key":
+      return "Delete settings key";
+  }
+}
+
+function addModalTitle(kind: MoveLeafKind): string {
+  switch (kind) {
+    case "permission_rule":
+      return "Paste rule";
+    case "permission_list":
+      return "Paste rule list";
+    case "top_level_key":
+      return "Paste settings key";
+  }
 }
 
 interface SettingsProps {
