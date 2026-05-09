@@ -18,6 +18,9 @@ dist-ssr/
 .vscode/*
 !.vscode/extensions.json
 .idea/
+# Claude Code local state (per-project agent settings, transcripts).
+# Local-only; never committed.
+.claude/
 .DS_Store
 *.suo
 *.ntvs*
