@@ -16,18 +16,23 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
+/**
+ * One segment of a JSON path. Mirrors Rust's `PathSeg` (untagged
+ * `String`/`usize`): object keys ride as strings, array indices ride as
+ * numbers. The unified `move_leaf` IPC carries paths in this shape.
+ */
+export type PathSeg = string | number;
+
 export interface ScopeView {
   scope: Scope;
   path: string | null;
   exists: boolean;
-  permissions: PermissionRules;
-  // Non-permission top-level keys with their raw JSON values. Rust preserves
-  // on-disk key order via serde_json's `preserve_order` feature; JS preserves
-  // insertion order too for string keys, *except* it shuffles integer-like
-  // keys ("0", "1", …) to the front. For Claude Code's settings shape
-  // (env var names, hook event names, theme scalar) that's a non-issue —
-  // none of the realistic top-level or nested keys are integer-like.
-  other_values: { [key: string]: JsonValue };
+  // Every top-level key on disk in source order, including `permissions`.
+  // Rust preserves on-disk key order via serde_json's `preserve_order`
+  // feature; JS preserves insertion order too for string keys, *except* it
+  // shuffles integer-like keys ("0", "1", …) to the front. Realistic Claude
+  // Code settings keys are non-integer-like, so this is a non-issue.
+  values: { [key: string]: JsonValue };
   parse_error: string | null;
 }
 
@@ -55,66 +60,56 @@ export interface LoadedScopes {
   combined_origins: PermissionRuleOrigins;
 }
 
-export interface MoveRequest {
-  rule: string;
-  kind: PermissionKind;
+/**
+ * Path-based move request. Replaces the per-rule `MoveRequest` and per-key
+ * `MoveKeyRequest` shapes with a single primitive: any movable JSON path
+ * (whole top-level key, whole `permissions.<kind>` array, or a single rule
+ * under `permissions.<kind>`) plus source / destination scopes.
+ */
+export interface MoveLeafRequest {
+  path: PathSeg[];
   from: Scope;
   to: Scope;
 }
 
 /**
- * Caller hints for `onMove` / `onMoveKey`. Drop handlers pass
- * `skipConfirm: true` because dragging onto a target column already
- * expresses intent — the diff/confirm modal is friction at that point.
- * Click-to-move keeps the modal as the safer default for less explicit
- * gestures. Recovery on accidental drops still falls back to the
- * per-write `.bak` files until an audit log / undo lands (#19).
+ * Caller hints for `onMoveLeaf`. Drop handlers pass `skipConfirm: true`
+ * because dragging onto a target column already expresses intent — the
+ * diff/confirm modal is friction at that point. Click-to-move keeps the
+ * modal as the safer default for less explicit gestures. Recovery on
+ * accidental drops still falls back to the per-write `.bak` files until an
+ * audit log / undo lands (#19).
  */
 export interface MoveOptions {
   skipConfirm?: boolean;
 }
 
-export interface MoveSide {
+/**
+ * What kind of movable path the preview describes. Mirrors Rust's
+ * `MoveLeafKind` (snake_case on the wire) so the diff modal can branch on a
+ * compact discriminator instead of re-classifying the path itself.
+ */
+export type MoveLeafKind = "top_level_key" | "permission_list" | "permission_rule";
+
+export interface MoveLeafSide {
   scope: Scope;
-  path: string;
-  path_exists: boolean;
-  rules_before: string[];
-  rules_after: string[];
+  file_path: string;
+  file_path_exists: boolean;
+  // The Rust side omits these fields entirely when the affected top-level
+  // key is absent (see `#[serde(skip_serializing_if = "Option::is_none")]`),
+  // so `undefined` means "key absent" while `null` is a real JSON null
+  // value. The diff modal keys off that distinction when rendering.
+  key_before?: JsonValue;
+  key_after?: JsonValue;
   will_write: boolean;
   note: string | null;
 }
 
-export interface MovePreview {
-  rule: string;
-  kind: PermissionKind;
-  from: MoveSide;
-  to: MoveSide;
-}
-
-export interface MoveKeyRequest {
-  key: string;
-  from: Scope;
-  to: Scope;
-}
-
-export interface MoveKeySide {
-  scope: Scope;
-  path: string;
-  path_exists: boolean;
-  // The Rust side omits `value_before` / `value_after` entirely when the key
-  // is absent (see `#[serde(skip_serializing_if = "Option::is_none")]`), so
-  // `undefined` means "absent" while `null` is a real JSON null value. The
-  // UI relies on that distinction when rendering verdicts and values.
-  value_before?: JsonValue;
-  value_after?: JsonValue;
-  will_write: boolean;
-  note: string | null;
-}
-
-export interface MoveKeyPreview {
-  key: string;
-  from: MoveKeySide;
-  to: MoveKeySide;
+export interface MoveLeafPreview {
+  path: PathSeg[];
+  kind: MoveLeafKind;
+  from: MoveLeafSide;
+  to: MoveLeafSide;
 }
 
 /**

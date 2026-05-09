@@ -26,6 +26,7 @@ interface ScopeViewOverrides {
   path?: string | null;
   exists?: boolean;
   permissions?: Partial<PermissionRules>;
+  /** Non-permission top-level keys, merged into the unified `values` map. */
   other_values?: { [key: string]: JsonValue };
   parse_error?: string | null;
 }
@@ -38,6 +39,25 @@ export function emptyOrigins(): PermissionRuleOrigins {
   return { allow: [], deny: [], ask: [] };
 }
 
+/**
+ * Pull the permission rule snapshot out of a ScopeView's unified `values`
+ * map. Mirrors the Rust `SettingsDoc::permissions` accessor (missing /
+ * malformed shapes degrade to empty lists rather than throwing) so the
+ * fixture's combined-panel walk and the renderer agree on what's there.
+ */
+export function permissionsOf(view: ScopeView): PermissionRules {
+  const out = emptyPermissions();
+  const perms = view.values.permissions;
+  if (!perms || typeof perms !== "object" || Array.isArray(perms)) return out;
+  const obj = perms as { [k: string]: JsonValue };
+  for (const kind of ["allow", "deny", "ask"] as const) {
+    const arr = obj[kind];
+    if (!Array.isArray(arr)) continue;
+    out[kind] = arr.filter((v): v is string => typeof v === "string");
+  }
+  return out;
+}
+
 export function buildScopeView(overrides: ScopeViewOverrides): ScopeView {
   const permissions = { ...emptyPermissions(), ...(overrides.permissions ?? {}) };
   // `path` is `string | null` on the wire — the Rust backend serializes
@@ -46,12 +66,27 @@ export function buildScopeView(overrides: ScopeViewOverrides): ScopeView {
   // tests, so check for `undefined` explicitly.
   const path =
     overrides.path !== undefined ? overrides.path : `/fake/${overrides.scope}/settings.json`;
+  // Compose `values` so `permissions` rides at the top of the on-disk key
+  // order when the override supplies any rules — matches what the backend
+  // emits for a real settings.json with `{"permissions": {...}, ...}`.
+  const values: { [key: string]: JsonValue } = {};
+  const hasPermissions =
+    permissions.allow.length > 0 || permissions.deny.length > 0 || permissions.ask.length > 0;
+  if (hasPermissions) {
+    values.permissions = {
+      allow: permissions.allow,
+      deny: permissions.deny,
+      ask: permissions.ask,
+    };
+  }
+  if (overrides.other_values) {
+    for (const [k, v] of Object.entries(overrides.other_values)) values[k] = v;
+  }
   return {
     scope: overrides.scope,
     path,
     exists: overrides.exists ?? true,
-    permissions,
-    other_values: overrides.other_values ?? {},
+    values,
     parse_error: overrides.parse_error ?? null,
   };
 }
@@ -90,7 +125,7 @@ export function buildLoadedScopes(overrides: LoadedScopesOverrides = {}): Loaded
   const kinds: PermissionKind[] = ["allow", "deny", "ask"];
   for (const kind of kinds) {
     for (const view of precedenceOrder) {
-      for (const rule of view.permissions[kind]) {
+      for (const rule of permissionsOf(view)[kind]) {
         const idx = combined[kind].indexOf(rule);
         if (idx === -1) {
           combined[kind].push(rule);
