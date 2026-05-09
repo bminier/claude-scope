@@ -1018,3 +1018,63 @@ button:disabled {
   cursor: pointer;
   accent-color: var(--accent);
 }
+
+/* ------- Context menu (#8) ------- */
+
+.context-menu {
+  position: fixed;
+  z-index: 2000;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 24px var(--shadow-modal);
+  padding: 4px 0;
+  min-width: 160px;
+  font-size: 13px;
+  user-select: none;
+}
+
+.context-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  background: none;
+  border: none;
+  color: inherit;
+  text-align: left;
+  padding: 6px 14px;
+  cursor: pointer;
+  font: inherit;
+  outline: none;
+}
+
+.context-menu-item:hover:not(:disabled),
+.context-menu-item:focus:not(:disabled) {
+  background: var(--accent);
+  color: var(--accent-fg, #fff);
+}
+
+.context-menu-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.context-menu-arrow {
+  margin-left: auto;
+  padding-left: 16px;
+  font-size: 11px;
+  opacity: 0.65;
+}
+
+.context-menu-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+/* When the diff modal is rendering only one side (delete, paste, same-scope
+   change-kind), drop the two-column grid so the side fills the dialog width
+   instead of leaving an empty column. */
+.modal-diff-single {
+  grid-template-columns: 1fr;
+}

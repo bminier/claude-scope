@@ -4,17 +4,29 @@ import { homeDir } from "@tauri-apps/api/path";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 import type {
+  AddLeafPreview,
+  AddLeafRequest,
+  DeleteLeafPreview,
+  DeleteLeafRequest,
   LoadedScopes,
   MoveLeafPreview,
   MoveLeafRequest,
   MoveOptions,
+  PathSeg,
+  PermissionKind,
   Preferences,
   RuntimeInfo,
   Scope,
   Theme,
 } from "./types.ts";
 import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
-import { confirmMoveLeaf, openSettings, renderApp } from "./ui.ts";
+import {
+  confirmAddLeaf,
+  confirmDeleteLeaf,
+  confirmMoveLeaf,
+  openSettings,
+  renderApp,
+} from "./ui.ts";
 
 // Mirror of the Rust `Preferences::default()` — used until the real payload
 // arrives from the backend so renders before load_preferences() resolves
@@ -162,6 +174,97 @@ async function moveLeaf(
   }
 }
 
+/**
+ * Reclassify a permission rule between allow / deny / ask (#8). Same-scope
+ * change-kind rides on the existing `move_leaf` primitive with `from === to`
+ * and `to_kind` set; cross-scope reclassification (drag a rule into a
+ * different column AND change its kind) goes through the same path. We
+ * route through `moveLeaf` so the busy guard, confirm modal, and reload all
+ * stay in one place.
+ */
+async function changeKind(
+  path: PathSeg[],
+  scope: Scope,
+  newKind: PermissionKind,
+  trigger?: HTMLElement,
+): Promise<void> {
+  await moveLeaf({ path, from: scope, to: scope, to_kind: newKind }, trigger);
+}
+
+async function deleteLeaf(req: DeleteLeafRequest, trigger?: HTMLElement): Promise<void> {
+  if (moveInFlight) return;
+  moveInFlight = true;
+  try {
+    const projectDir = state.projectDir;
+    let preview: DeleteLeafPreview;
+    try {
+      preview = await invoke<DeleteLeafPreview>("diff_delete_leaf", {
+        req,
+        project_dir: projectDir,
+      });
+    } catch (err) {
+      alert(`Delete failed: ${err}`);
+      return;
+    }
+    const apply = await confirmDeleteLeaf(preview, trigger);
+    if (!apply) return;
+
+    state.busy = true;
+    render();
+    try {
+      await invoke("apply_delete_leaf", { req, project_dir: projectDir });
+      await load(projectDir);
+    } catch (err) {
+      alert(`Delete failed: ${err}`);
+      state.busy = false;
+      render();
+    }
+  } finally {
+    moveInFlight = false;
+    if (externalReloadPending && !state.busy) {
+      externalReloadPending = false;
+      void load(state.projectDir);
+    }
+  }
+}
+
+async function addLeaf(req: AddLeafRequest, trigger?: HTMLElement): Promise<void> {
+  if (moveInFlight) return;
+  moveInFlight = true;
+  try {
+    const projectDir = state.projectDir;
+    let preview: AddLeafPreview;
+    try {
+      preview = await invoke<AddLeafPreview>("diff_add_leaf", {
+        req,
+        project_dir: projectDir,
+      });
+    } catch (err) {
+      alert(`Paste failed: ${err}`);
+      return;
+    }
+    const apply = await confirmAddLeaf(preview, trigger);
+    if (!apply) return;
+
+    state.busy = true;
+    render();
+    try {
+      await invoke("apply_add_leaf", { req, project_dir: projectDir });
+      await load(projectDir);
+    } catch (err) {
+      alert(`Paste failed: ${err}`);
+      state.busy = false;
+      render();
+    }
+  } finally {
+    moveInFlight = false;
+    if (externalReloadPending && !state.busy) {
+      externalReloadPending = false;
+      void load(state.projectDir);
+    }
+  }
+}
+
 function setQuery(next: string): void {
   if (state.query === next) return;
   state.query = next;
@@ -283,6 +386,9 @@ function render(): void {
     onPickProject: pickProject,
     onReload: reload,
     onMoveLeaf: moveLeaf,
+    onChangeKind: changeKind,
+    onDeleteLeaf: deleteLeaf,
+    onAddLeaf: addLeaf,
     onOpenSettings,
     onQueryChange: setQuery,
   });
