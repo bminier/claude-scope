@@ -13,6 +13,7 @@ import type {
   Preferences,
   RuntimeInfo,
   Scope,
+  Theme,
 } from "./types.ts";
 import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
 import { confirmMove, confirmMoveKey, openSettings, renderApp } from "./ui.ts";
@@ -23,6 +24,7 @@ import { confirmMove, confirmMoveKey, openSettings, renderApp } from "./ui.ts";
 // a new scope can't leave this list out of sync.
 const DEFAULT_PREFERENCES: Preferences = {
   visible_scopes: [...SCOPES],
+  theme: "auto",
 };
 
 const state: {
@@ -208,6 +210,47 @@ function setQuery(next: string): void {
   render();
 }
 
+// `prefers-color-scheme` listener used while the active theme is "auto".
+// We attach at most one — re-attaching on every render would either leak
+// listeners or require addEventListener-with-a-stable-reference contortions.
+// `null` means "no listener installed right now" (theme is light or dark).
+const prefersDarkMql =
+  typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? window.matchMedia("(prefers-color-scheme: dark)")
+    : null;
+let autoThemeListener: ((evt: MediaQueryListEvent) => void) | null = null;
+
+function resolveTheme(theme: Theme): "light" | "dark" {
+  if (theme === "auto") {
+    return prefersDarkMql?.matches ? "dark" : "light";
+  }
+  return theme;
+}
+
+/**
+ * Apply the chosen theme to the document and (de)attach the OS-tracking
+ * listener. Safe to call repeatedly — the listener bookkeeping ensures we
+ * never end up with two listeners installed.
+ */
+function applyTheme(theme: Theme): void {
+  document.documentElement.setAttribute("data-theme", resolveTheme(theme));
+
+  if (!prefersDarkMql) return;
+  if (theme === "auto") {
+    if (autoThemeListener) return;
+    autoThemeListener = () => {
+      // The user's preference is still "auto" by construction (we only
+      // keep this listener attached while that's true), so re-resolve and
+      // repaint without touching state.preferences.
+      document.documentElement.setAttribute("data-theme", resolveTheme("auto"));
+    };
+    prefersDarkMql.addEventListener("change", autoThemeListener);
+  } else if (autoThemeListener) {
+    prefersDarkMql.removeEventListener("change", autoThemeListener);
+    autoThemeListener = null;
+  }
+}
+
 // Serialize preference saves: at most one in-flight call, with the latest
 // pending state always winning. Without this, rapid toggles could produce
 // overlapping `save_preferences` invokes whose completion order isn't
@@ -220,7 +263,11 @@ async function persistPreferences(next: Preferences): Promise<void> {
   // Update state + render immediately so the UI feels instant; persist in
   // the background. If the save fails, warn the user — stale in-memory
   // state is easier to reason about than a silent mismatch with disk.
+  const prev = state.preferences;
   state.preferences = next;
+  if (prev.theme !== next.theme) {
+    applyTheme(next.theme);
+  }
   render();
   pendingPreferencesSave = next;
   if (preferencesSaveInFlight) return;
@@ -249,11 +296,17 @@ function onToggleScopeVisibility(scope: Scope, visible: boolean): void {
   void persistPreferences({ ...state.preferences, visible_scopes: next });
 }
 
+function onChangeTheme(theme: Theme): void {
+  if (state.preferences.theme === theme) return;
+  void persistPreferences({ ...state.preferences, theme });
+}
+
 function onOpenSettings(trigger?: HTMLElement): void {
   void openSettings(
     {
       preferences: state.preferences,
       onToggleScopeVisibility,
+      onChangeTheme,
     },
     trigger,
   );
@@ -346,6 +399,11 @@ async function bootstrap(): Promise<void> {
   } else {
     console.warn("failed to load preferences, using defaults:", prefsResult.reason);
   }
+  // Apply theme as soon as we know it — before the scope load runs, so the
+  // load-busy spinner paints in the correct palette. The default `:root`
+  // CSS variables are dark, so this is also the moment any cold-start
+  // flash flips to light when the user has light selected.
+  applyTheme(state.preferences.theme);
   if (runtimeResult.status === "fulfilled") {
     state.runtime = runtimeResult.value;
   } else {

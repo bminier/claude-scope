@@ -14,6 +14,7 @@ import type {
   RuntimeInfo,
   Scope,
   ScopeView,
+  Theme,
 } from "./types.ts";
 import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
 
@@ -1230,7 +1231,14 @@ function formatValue(v: JsonValue | undefined): string {
 interface SettingsProps {
   preferences: Preferences;
   onToggleScopeVisibility: (scope: Scope, visible: boolean) => void;
+  onChangeTheme: (theme: Theme) => void;
 }
+
+const THEME_OPTIONS: ReadonlyArray<{ value: Theme; label: string }> = [
+  { value: "auto", label: "Match system" },
+  { value: "light", label: "Light" },
+  { value: "dark", label: "Dark" },
+];
 
 /**
  * Open the settings dialog. Changes persist as the user clicks — there's no
@@ -1245,9 +1253,13 @@ interface SettingsProps {
  * stray keypresses.
  */
 export function openSettings(props: SettingsProps, trigger?: HTMLElement | null): void {
+  const body = document.createElement("div");
+  body.appendChild(settingsThemeSection(props));
+  body.appendChild(settingsColumnsSection(props));
+
   openModal({
     titleText: "Settings",
-    body: settingsColumnsSection(props),
+    body,
     actions: [
       {
         label: "Close",
@@ -1259,6 +1271,51 @@ export function openSettings(props: SettingsProps, trigger?: HTMLElement | null)
     panelClassName: "modal-settings",
     trigger,
   });
+}
+
+function settingsThemeSection(props: SettingsProps): HTMLElement {
+  const section = document.createElement("section");
+  section.className = "settings-section";
+
+  const heading = document.createElement("h3");
+  heading.id = "settings-theme-heading";
+  heading.className = "settings-heading";
+  heading.textContent = "Theme";
+  section.appendChild(heading);
+
+  const hint = document.createElement("p");
+  hint.className = "settings-hint";
+  hint.textContent = "Match the OS or pin a palette. Persists across launches.";
+  section.appendChild(hint);
+
+  // Shared `name` so the radios behave as a single group with arrow-key
+  // navigation. Keep the value local so subsequent re-renders within this
+  // dialog could read it back (today there are none, but the
+  // settings-checklist sibling already follows that pattern).
+  const list = document.createElement("div");
+  list.className = "settings-checklist";
+  list.setAttribute("role", "radiogroup");
+  list.setAttribute("aria-labelledby", "settings-theme-heading");
+  const groupName = "settings-theme";
+  for (const opt of THEME_OPTIONS) {
+    const row = document.createElement("label");
+    row.className = "settings-check";
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = groupName;
+    input.value = opt.value;
+    input.checked = props.preferences.theme === opt.value;
+    input.addEventListener("change", () => {
+      if (input.checked) props.onChangeTheme(opt.value);
+    });
+    row.appendChild(input);
+    const label = document.createElement("span");
+    label.textContent = opt.label;
+    row.appendChild(label);
+    list.appendChild(row);
+  }
+  section.appendChild(list);
+  return section;
 }
 
 function settingsColumnsSection(props: SettingsProps): HTMLElement {
