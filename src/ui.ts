@@ -571,7 +571,11 @@ function seedDefaultOpenPermissions(loaded: LoadedScopes): void {
     openTreeNodes.add(treeKey(view.scope, ["permissions"]));
     const permsObj = perms as { [k: string]: JsonValue };
     for (const kind of PERMISSION_KINDS) {
-      if (Array.isArray(permsObj[kind])) {
+      const arr = permsObj[kind];
+      // Skip empty arrays — opening a branch that has nothing under it
+      // is just visual noise on a fresh project load. The user can still
+      // open it manually if they want to add rules.
+      if (Array.isArray(arr) && arr.length > 0) {
         openTreeNodes.add(treeKey(view.scope, ["permissions", kind]));
       }
     }
@@ -879,11 +883,20 @@ function treeBranchPeek(
       typeof path[1] === "string" &&
       PERMISSION_KINDS.includes(path[1] as PermissionKind)
     ) {
+      // Both the numerator and denominator count only string entries —
+      // matches `countPermissionRules` / `countMatchingRules` /
+      // `extractPermissionList`, which all treat non-string array items
+      // (possible in hand-edited JSON) as non-rules. Mixing the two
+      // would surface an `m/N` where N over-counts items that the rest
+      // of the UI hides.
+      let total = 0;
       let matched = 0;
       for (const item of value) {
-        if (typeof item === "string" && matchesLoweredQuery(item, lowerQuery)) matched++;
+        if (typeof item !== "string") continue;
+        total++;
+        if (matchesLoweredQuery(item, lowerQuery)) matched++;
       }
-      return `[${matched}/${value.length}]`;
+      return `[${matched}/${total}]`;
     }
     return `[${value.length}]`;
   }
