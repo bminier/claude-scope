@@ -348,6 +348,83 @@ fn path_top_level_key(path: &[PathSeg]) -> &str {
         .expect("validate_movable_path guarantees path[0] is a key")
 }
 
+/// Remove the source side of a move, dispatched by `MovablePath` so the
+/// semantics match the legacy IPCs the move-leaf primitive replaced.
+///
+/// For `PermissionRule`, every occurrence of the rule string is removed
+/// from `permissions.<kind>` (not just the indexed entry). The legacy
+/// `apply_move_impl` did this via `SettingsDoc::remove_rule`, and dropping
+/// it would silently leave duplicates behind in hand-edited files: the
+/// destination's array-union dedupes, so the user would see "moved" while
+/// a stray copy survives in the source. For `PermissionList` and
+/// `TopLevelKey`, an index-based `remove_at_path` is correct (whole array
+/// or whole key). Returns true iff the document was mutated; the apply
+/// path treats `false` as an internal-error guard since `get_at_path`
+/// already succeeded just above.
+fn remove_movable_source(
+    doc: &mut SettingsDoc,
+    movable: &MovablePath<'_>,
+    src_value: &serde_json::Value,
+    path: &[PathSeg],
+) -> bool {
+    match movable {
+        MovablePath::PermissionRule(kind, _) => match src_value.as_str() {
+            // `validate_movable_path` only classifies a path as
+            // `PermissionRule` when its index segment is in-range syntactically;
+            // the actual leaf shape is checked here at use time so a
+            // hand-edited array with a non-string at the index still has the
+            // index removed via the slower `remove_at_path` fallback.
+            Some(rule) => remove_all_rule_occurrences(doc, *kind, rule),
+            None => doc.remove_at_path(path),
+        },
+        MovablePath::PermissionList(_) | MovablePath::TopLevelKey(_) => doc.remove_at_path(path),
+    }
+}
+
+/// Remove every occurrence of `rule` from `permissions.<kind>`. Resurrects
+/// the legacy `SettingsDoc::remove_rule` semantics specifically for the
+/// move-leaf source side; see `remove_movable_source` for why a hand-edited
+/// duplicate would otherwise strand. Returns true iff at least one entry
+/// was removed.
+///
+/// Implementation: locate the next matching index, remove it, repeat. The
+/// re-locate per iteration is fine since rule arrays are tiny in practice
+/// (tens of entries, not thousands), and using the existing
+/// `remove_at_path` keeps the mutation API surface on `SettingsDoc`
+/// minimal.
+fn remove_all_rule_occurrences(doc: &mut SettingsDoc, kind: PermissionKind, rule: &str) -> bool {
+    let mut removed = false;
+    while let Some(idx) = find_rule_index(doc, kind, rule) {
+        let did_remove = doc.remove_at_path(&[
+            PathSeg::Key("permissions".into()),
+            PathSeg::Key(kind.key().into()),
+            PathSeg::Index(idx),
+        ]);
+        if !did_remove {
+            // Defensive: `find_rule_index` saw the value at `idx`, so the
+            // remove ought to succeed. Bail out of the loop rather than
+            // spin forever if some future refactor breaks that invariant.
+            break;
+        }
+        removed = true;
+    }
+    removed
+}
+
+/// Locate the first index in `permissions.<kind>` that matches `rule`, or
+/// `None` if no entry matches. Used by `remove_all_rule_occurrences` to
+/// drive its index-by-index removal loop without introducing a second
+/// public mutation API on `SettingsDoc`.
+fn find_rule_index(doc: &SettingsDoc, kind: PermissionKind, rule: &str) -> Option<usize> {
+    let arr = doc.get_at_path(&[
+        PathSeg::Key("permissions".into()),
+        PathSeg::Key(kind.key().into()),
+    ])?;
+    arr.as_array()?
+        .iter()
+        .position(|v| v.as_str() == Some(rule))
+}
+
 fn diff_move_leaf_impl(
     paths: &ScopePaths,
     req: &MoveLeafRequest,
@@ -381,16 +458,37 @@ fn diff_move_leaf_impl(
     // Source `key_before` / `key_after` describe the *top-level key* the move
     // is acting through, not the leaf. The frontend already knows the leaf
     // path from the request and drills in itself, so the wire format avoids
-    // duplicating parent + child copies of the same JSON.
+    // duplicating parent + child copies of the same JSON. Removal goes
+    // through `remove_movable_source` so the preview reflects the same
+    // legacy-parity semantics the apply path uses (notably: every copy of
+    // a duplicated rule string disappears, not just the indexed one).
     let from_key_before = from_doc.get_top_level(affected_key).cloned();
     let mut from_after_doc = from_doc.clone();
-    from_after_doc.remove_at_path(&req.path);
+    if !remove_movable_source(&mut from_after_doc, &movable, &src_value, &req.path) {
+        // get_at_path saw the value but the removal helper didn't take it.
+        // Same invariant the apply path enforces (a few lines below in
+        // `apply_move_leaf_impl`); surfacing the same error here keeps the
+        // diff and apply paths from drifting on what counts as a valid
+        // move request.
+        return Err(format!(
+            "internal error: path `{}` resolved on read but failed to remove",
+            describe_path(&req.path)
+        )
+        .into());
+    }
     let from_key_after = from_after_doc.get_top_level(affected_key).cloned();
 
-    let to_path_exists = to_path.exists();
-    let to_doc_loaded = io_atomic::load(to_path)?.unwrap_or_else(SettingsDoc::empty);
-    let to_key_before = to_doc_loaded.get_top_level(affected_key).cloned();
-    let mut to_doc = to_doc_loaded.clone();
+    // Derive existence from the load result rather than a separate
+    // `to_path.exists()` call to avoid a TOCTOU window where a third party
+    // creates / deletes the destination between the two checks. Mirrors
+    // `apply_move_leaf_impl`'s `to_existed_before` shape so the preview
+    // and apply paths agree on what "destination file will be created"
+    // means.
+    let to_doc_loaded = io_atomic::load(to_path)?;
+    let to_path_exists = to_doc_loaded.is_some();
+    let to_doc_before = to_doc_loaded.unwrap_or_else(SettingsDoc::empty);
+    let to_key_before = to_doc_before.get_top_level(affected_key).cloned();
+    let mut to_doc = to_doc_before.clone();
     to_doc.merge_at_path(&req.path, src_value.clone())?;
     let to_key_after = to_doc.get_top_level(affected_key).cloned();
 
@@ -436,7 +534,7 @@ fn apply_move_leaf_impl(
     if req.from == req.to {
         return Err("source and destination scopes must differ".into());
     }
-    let _movable = validate_movable_path(&req.path)?;
+    let movable = validate_movable_path(&req.path)?;
     let from_path = require_path(paths, req.from)?.to_path_buf();
     let to_path = require_path(paths, req.to)?.to_path_buf();
     let affected_key = path_top_level_key(&req.path);
@@ -475,12 +573,17 @@ fn apply_move_leaf_impl(
     let to_key_after = to_doc.get_top_level(affected_key).cloned();
     let dest_mutated = to_key_before != to_key_after;
 
-    let removed = from_doc.remove_at_path(&req.path);
+    // Source-side removal goes through `remove_movable_source` so a
+    // PermissionRule move drops every copy of the rule string (matching
+    // the legacy `remove_rule` behavior), not just the indexed entry —
+    // otherwise hand-edited duplicates would survive in the source while
+    // the destination's array-union dedupes, leaving a stale copy behind.
+    let removed = remove_movable_source(&mut from_doc, &movable, &src_value, &req.path);
     if !removed {
-        // get_at_path saw the value but remove_at_path didn't — should be
-        // unreachable given the same path on the same `from_doc`, but error
-        // loudly so a future regression in `remove_at_path` can't silently
-        // duplicate the rule across both scopes.
+        // get_at_path saw the value but the helper didn't take it — should
+        // be unreachable for any path that just resolved, but error loudly
+        // so a future regression can't silently duplicate the rule across
+        // both scopes.
         return Err(format!(
             "internal error: path `{}` resolved on read but failed to remove",
             describe_path(&req.path)
@@ -964,6 +1067,52 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(project_doc.permissions().allow.is_empty());
+        let user_doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            user_doc.permissions().allow,
+            vec!["Bash(git status)".to_string()]
+        );
+    }
+
+    #[test]
+    fn move_leaf_permission_rule_strips_all_copies_of_duplicated_string() {
+        // Hand-edited settings.json can list the same rule string twice in
+        // `permissions.allow`. The legacy `apply_move_impl` removed *all*
+        // matching strings from the source (via `arr.retain(...)`); the
+        // path-based primitive now matches that semantics through
+        // `remove_movable_source`. Without this fix, removing index 0
+        // would leave the duplicate at index 1 behind in the source while
+        // the destination's array-union dedupes — the user would think
+        // the rule moved while a stale copy lived on.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(git status)","Bash(git status)","Read(**)"]}}"#,
+        );
+
+        apply_move_leaf_impl(
+            &paths,
+            &MoveLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Project,
+                to: Scope::User,
+            },
+            &BackupTracker::new(),
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        let project_doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            project_doc.permissions().allow,
+            vec!["Read(**)".to_string()],
+            "both Bash(git status) copies must be stripped from the source"
+        );
         let user_doc = io_atomic::load(paths.user.as_ref().unwrap())
             .unwrap()
             .unwrap();

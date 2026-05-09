@@ -49,7 +49,18 @@ function isMovablePath(path: PathSeg[]): boolean {
     if (path.length === 2 && typeof path[1] === "string") {
       return PERMISSION_KINDS.includes(path[1] as PermissionKind);
     }
-    if (path.length === 3 && typeof path[1] === "string" && typeof path[2] === "number") {
+    if (
+      path.length === 3 &&
+      typeof path[1] === "string" &&
+      // Constrain to non-negative integers — the Rust side deserializes
+      // path indices into `usize`, so floats / negatives would be rejected
+      // at the IPC boundary. Today every index we generate comes from
+      // tree-walking so it's already a non-negative integer; this guard
+      // keeps it that way under future refactors.
+      typeof path[2] === "number" &&
+      Number.isInteger(path[2]) &&
+      path[2] >= 0
+    ) {
       return PERMISSION_KINDS.includes(path[1] as PermissionKind);
     }
   }
@@ -713,17 +724,30 @@ function treeLeaf(
     const badge = lintBadge(rule);
     if (badge) row.appendChild(badge);
     if (props) {
-      row.appendChild(leafMoveButtons(scope, path, props));
+      // Pass the rule string as the move-button label so the screen
+      // reader announces "Move Bash(git status) from …" instead of
+      // the meaningless path "permissions.allow[0]".
+      row.appendChild(leafMoveButtons(scope, path, props, rule));
     }
     return row;
   }
+
+  // Permission entries that aren't strings are rare (they only show up in
+  // hand-edited settings.json) but they exist; the backend rejects a move
+  // for them at `merge_at_path`, so suppress the affordances here rather
+  // than offer an action that's guaranteed to fail. The path itself is
+  // still classified as movable by `isMovablePath` — the gate is on the
+  // value's runtime shape, which lives only at this leaf.
+  const isMalformedPermissionEntry =
+    permKind !== null && path.length === 3 && typeof value !== "string";
+  const offerMoveAffordance = !isMalformedPermissionEntry && isMovablePath(path);
 
   const row = document.createElement("div");
   row.className = "tree-node tree-leaf";
   const name = document.createElement("span");
   name.className = "tree-key";
   name.textContent = label;
-  if (props && !props.busy && isMovablePath(path)) {
+  if (props && !props.busy && offerMoveAffordance) {
     setupLeafDragSource(name, scope, path);
   }
   row.appendChild(name);
@@ -731,16 +755,25 @@ function treeLeaf(
   val.className = `tree-value tree-value-${leafType(value)}`;
   val.textContent = formatLeaf(value);
   row.appendChild(val);
-  if (props && isMovablePath(path)) {
+  if (props && offerMoveAffordance) {
     row.appendChild(leafMoveButtons(scope, path, props));
   }
   return row;
 }
 
-function leafMoveButtons(scope: Scope, path: PathSeg[], props: AppProps): HTMLElement {
+function leafMoveButtons(
+  scope: Scope,
+  path: PathSeg[],
+  props: AppProps,
+  // Optional override for the screen-reader label. Permission rule rows
+  // pass the rule string so the button announces something meaningful;
+  // top-level key and rule-list rows fall back to the path's
+  // dotted-bracket form, which is informative at that level.
+  ariaSubject?: string,
+): HTMLElement {
   const moveBtns = document.createElement("div");
   moveBtns.className = "rule-moves tree-key-moves";
-  const describe = describePath(path);
+  const subject = ariaSubject ?? describePath(path);
   for (const target of SCOPES) {
     if (target === scope) continue;
     // Mirror scopeGrid: don't offer moves into columns the user hid — the
@@ -752,7 +785,7 @@ function leafMoveButtons(scope: Scope, path: PathSeg[], props: AppProps): HTMLEl
     btn.textContent = `→ ${SCOPE_LABELS[target]}`;
     btn.setAttribute(
       "aria-label",
-      `Move ${describe} from ${SCOPE_LABELS[scope]} to ${SCOPE_LABELS[target]}`,
+      `Move ${subject} from ${SCOPE_LABELS[scope]} to ${SCOPE_LABELS[target]}`,
     );
     btn.disabled = props.busy;
     btn.addEventListener("click", (e) => {
@@ -1148,12 +1181,14 @@ function leafDiffSide(preview: MoveLeafPreview, mode: "add" | "remove"): HTMLEle
 
 /**
  * Chip-list before/after for permission moves. Highlights are driven by the
- * delta between this side's `key_before` / `key_after`, not by membership
- * in the source's list — for a `permission_list` move the destination may
- * already share rules with the source, and those rules are *not* "added"
- * (the array-union skips them). The remove side highlights rules that
- * disappear (`before` minus `after`); the add side highlights rules that
- * appear (`after` minus `before`).
+ * multiset delta between this side's `key_before` / `key_after`, not by
+ * set membership — for a `permission_list` move the destination may
+ * already share rules with the source (those are *not* "added"; array-
+ * union dedupes), and a hand-edited file with the same rule listed twice
+ * may have one copy removed (set membership would miss that, since the
+ * value still appears). Walk `before` (or `after`) and consume entries
+ * from the delta bag in iteration order so the highlight maps onto the
+ * actual entries that change.
  */
 function permissionListDiff(
   preview: MoveLeafPreview,
@@ -1173,16 +1208,26 @@ function permissionListDiff(
   const itemsBefore = extractPermissionList(side.key_before, kind);
   const itemsAfter = extractPermissionList(side.key_after, kind);
   const items = mode === "remove" ? itemsBefore : itemsAfter;
-  const beforeSet = new Set(itemsBefore);
-  const afterSet = new Set(itemsAfter);
+  // Multiset subtraction: B \ A retains duplicates correctly. Computed
+  // once outside the loop, then drained by the per-item walk so each
+  // highlighted chip corresponds to exactly one delta entry.
+  const deltaBag =
+    mode === "remove"
+      ? multisetSubtract(itemsBefore, itemsAfter)
+      : multisetSubtract(itemsAfter, itemsBefore);
 
   for (const rule of items) {
     const li = document.createElement("li");
     const code = document.createElement("code");
     code.textContent = rule;
-    const isDelta = mode === "remove" ? !afterSet.has(rule) : !beforeSet.has(rule);
-    if (isDelta) {
+    const remaining = deltaBag.get(rule) ?? 0;
+    if (remaining > 0) {
       li.className = mode === "remove" ? "diff-removed" : "diff-added";
+      if (remaining === 1) {
+        deltaBag.delete(rule);
+      } else {
+        deltaBag.set(rule, remaining - 1);
+      }
     }
     li.appendChild(code);
     list.appendChild(li);
@@ -1194,6 +1239,24 @@ function permissionListDiff(
     list.appendChild(li);
   }
   return list;
+}
+
+/**
+ * Multiset subtraction `a - b`: returns a `Map<string, number>` whose
+ * entries are the per-string surplus counts in `a` that aren't covered
+ * by `b`. Used by `permissionListDiff` so duplicate rule strings get
+ * counted, not collapsed by set semantics.
+ */
+function multisetSubtract(a: readonly string[], b: readonly string[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const x of a) out.set(x, (out.get(x) ?? 0) + 1);
+  for (const x of b) {
+    const c = out.get(x);
+    if (c === undefined) continue;
+    if (c <= 1) out.delete(x);
+    else out.set(x, c - 1);
+  }
+  return out;
 }
 
 function removeVerdict(kind: MoveLeafKind): string {
