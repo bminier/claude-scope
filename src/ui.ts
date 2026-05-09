@@ -155,6 +155,20 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
     return;
   }
 
+  // Seed `openTreeNodes` with the default-open permission branches once per
+  // project, on the first render that has scopes available. Done here
+  // (rather than inside `treeBranch`'s own auto-open clause) so a manual
+  // collapse via `<details>.toggle` is *authoritative* — without this,
+  // any subsequent render after a move or filter change would reopen the
+  // branch and the collapsed state would be impossible to persist.
+  // `lastSeededProjectDir` decouples the seed from `lastRenderedProjectDir`
+  // because scopes can lag a project change by one render (busy=true,
+  // scopes=null first; scopes arrive on the next render).
+  if (lastSeededProjectDir !== props.projectDir) {
+    lastSeededProjectDir = props.projectDir;
+    seedDefaultOpenPermissions(props.scopes);
+  }
+
   // Lowercase the query once per render instead of per rule; scopeGrid/
   // combinedPanel push this down into every filter call.
   const lowerQuery = props.query.toLowerCase();
@@ -535,6 +549,35 @@ const openTreeNodes = new Set<string>();
 // in a different project that happens to share scope+path strings.
 let lastRenderedProjectDir: string | null = null;
 
+// Tracks the project directory we last seeded with default-open permission
+// branches. Distinct from `lastRenderedProjectDir` because the first render
+// after a project pick is usually `busy: true` with no scopes yet; the seed
+// has to wait for the second render where scopes are available.
+let lastSeededProjectDir: string | null = null;
+
+/**
+ * One-shot seed of `openTreeNodes` for the permission branches we want to
+ * default-open on a fresh project load: `permissions` itself plus each
+ * non-empty `permissions.<kind>` array. Mirrors the old single-pane
+ * visibility from before the unified-tree migration so the user lands on
+ * the same allow / deny / ask content without clicking. After this, the
+ * `<details>.toggle` listener in `treeBranch` is the only writer of
+ * `openTreeNodes`, so a manual collapse persists across re-renders.
+ */
+function seedDefaultOpenPermissions(loaded: LoadedScopes): void {
+  for (const view of loaded.scopes) {
+    const perms = view.values.permissions;
+    if (!perms || typeof perms !== "object" || Array.isArray(perms)) continue;
+    openTreeNodes.add(treeKey(view.scope, ["permissions"]));
+    const permsObj = perms as { [k: string]: JsonValue };
+    for (const kind of PERMISSION_KINDS) {
+      if (Array.isArray(permsObj[kind])) {
+        openTreeNodes.add(treeKey(view.scope, ["permissions", kind]));
+      }
+    }
+  }
+}
+
 // HTML5 drag-and-drop source state. Set by `dragstart` on a movable tree
 // node, cleared by `dragend` (or by renderApp on a re-render that tears
 // down the source mid-drag). Lives at module scope because `dragover` on
@@ -661,15 +704,13 @@ function treeBranch(
     }
   }
 
-  // Auto-expand permission branches under the unified tree (parent is "permissions")
-  // so the user doesn't need to click into the tree to see allow / deny / ask
-  // — that was the old single-pane visibility before the migration.
-  const isPermissionsChild = path.length === 2 && path[0] === "permissions";
-  const shouldAutoOpen =
-    openTreeNodes.has(key) ||
-    (path.length === 1 && path[0] === "permissions") ||
-    isPermissionsChild;
-  if (shouldAutoOpen) {
+  // `openTreeNodes` is the single source of truth for which branches are
+  // open. `seedDefaultOpenPermissions` (in `renderApp`) pre-populates it
+  // with `permissions` and each non-empty `permissions.<kind>` on the
+  // first render per project, so the unified tree starts in the same
+  // shape as the old single-pane view; subsequent renders defer to
+  // whatever the user toggled.
+  if (openTreeNodes.has(key)) {
     details.open = true;
     populate();
   }
