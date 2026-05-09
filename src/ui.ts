@@ -1,3 +1,4 @@
+import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { lintRule } from "./lint.ts";
 import type {
   AddLeafPreview,
@@ -1931,13 +1932,16 @@ function buildMoveToSubmenu(
   return items;
 }
 
-/** Copy text to the clipboard, fall back gracefully if the API is missing. */
+/**
+ * Copy text to the OS clipboard via Tauri's clipboard plugin (#8). Goes
+ * through the native side so the webview never prompts the user for
+ * `navigator.clipboard` permissions — desktop UX shouldn't ask "may
+ * localhost access your clipboard?" on every right-click.
+ */
 function copyToClipboard(text: string): void {
-  if (navigator.clipboard?.writeText) {
-    void navigator.clipboard.writeText(text).catch((err) => {
-      console.warn("clipboard write failed:", err);
-    });
-  }
+  void writeText(text).catch((err) => {
+    console.warn("clipboard write failed:", err);
+  });
 }
 
 /**
@@ -2139,7 +2143,9 @@ function scopeColumnContextMenuItems(scope: Scope, props: AppProps): MenuItem[] 
         void (async () => {
           let text = "";
           try {
-            text = (await navigator.clipboard?.readText()) ?? "";
+            // Tauri's clipboard plugin reads from the OS via Rust, so this
+            // doesn't go through the webview's permissions prompt.
+            text = (await readText()) ?? "";
           } catch (err) {
             alert(`Couldn't read clipboard: ${err}`);
             return;

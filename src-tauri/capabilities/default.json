@@ -3,5 +3,11 @@
   "identifier": "default",
   "description": "default permissions",
   "windows": ["main"],
-  "permissions": ["core:default", "core:path:default", "dialog:default"]
+  "permissions": [
+    "core:default",
+    "core:path:default",
+    "dialog:default",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text"
+  ]
 }

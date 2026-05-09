@@ -27,6 +27,12 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // Clipboard goes through Tauri's plugin (not `navigator.clipboard`) so
+        // Copy / Paste in the right-click menu (#8) hit the OS clipboard via
+        // Rust and don't trigger the webview's browser-style permission
+        // prompt — desktop UX shouldn't ask "may localhost access your
+        // clipboard?" on every right-click.
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(watcher::WatchState::default())
         .manage(overrides)
         .invoke_handler(tauri::generate_handler![
