@@ -617,7 +617,7 @@ function treeBranch(
   summary.appendChild(name);
   const peek = document.createElement("span");
   peek.className = "tree-peek";
-  peek.textContent = Array.isArray(value) ? `[${value.length}]` : `{${Object.keys(value).length}}`;
+  peek.textContent = treeBranchPeek(path, value, lowerQuery);
   summary.appendChild(peek);
   if (props && isMovablePath(path)) {
     summary.appendChild(leafMoveButtons(scope, path, props));
@@ -688,8 +688,9 @@ function treeLeaf(
   // Permission rule leaves under `permissions.<kind>` get the rule-chip
   // styling, lint badge, origin tooltip, drag handle, and per-target move
   // buttons that the old `ruleRow` used to render. Filter the row out
-  // entirely when the search query is active and doesn't match — keeps the
-  // "(m/n)" hint on the parent branch summary truthful.
+  // entirely when the search query is active and doesn't match — that drop
+  // is what `treeBranchPeek` then surfaces as the `m/N` count on the
+  // parent branch summary.
   if (isPermissionRule && permKind) {
     const rule = value as string;
     if (lowerQuery !== "" && !matchesLoweredQuery(rule, lowerQuery)) {
@@ -781,6 +782,38 @@ function describePath(path: PathSeg[]): string {
     }
   }
   return out || "(root)";
+}
+
+/**
+ * Compact summary shown in the branch row's right gutter. For most
+ * branches it's the unfiltered shape — `[N]` for arrays, `{N}` for
+ * objects. For a `permissions.<kind>` array under an active filter it
+ * becomes `[m/N]` so the user can see how many rules in this list match,
+ * mirroring the old rule-group `(m/n)` indicator that lived above each
+ * kind section before the unified-tree migration.
+ */
+function treeBranchPeek(
+  path: PathSeg[],
+  value: JsonValue[] | { [key: string]: JsonValue },
+  lowerQuery: string,
+): string {
+  if (Array.isArray(value)) {
+    if (
+      lowerQuery !== "" &&
+      path.length === 2 &&
+      path[0] === "permissions" &&
+      typeof path[1] === "string" &&
+      PERMISSION_KINDS.includes(path[1] as PermissionKind)
+    ) {
+      let matched = 0;
+      for (const item of value) {
+        if (typeof item === "string" && matchesLoweredQuery(item, lowerQuery)) matched++;
+      }
+      return `[${matched}/${value.length}]`;
+    }
+    return `[${value.length}]`;
+  }
+  return `{${Object.keys(value).length}}`;
 }
 
 function leafType(value: JsonValue): string {
@@ -935,7 +968,14 @@ function countPermissionRules(values: { [key: string]: JsonValue }): number {
   let total = 0;
   for (const kind of PERMISSION_KINDS) {
     const list = (perms as { [k: string]: JsonValue })[kind];
-    if (Array.isArray(list)) total += list.length;
+    if (!Array.isArray(list)) continue;
+    // Mirror Rust's `permissions_from_values` and `countMatchingRules`:
+    // only string entries count as permission rules. Hand-edited files
+    // can put numbers / objects in the array, and counting those would
+    // make the column status disagree with the renderer + filter UI.
+    for (const item of list) {
+      if (typeof item === "string") total++;
+    }
   }
   return total;
 }

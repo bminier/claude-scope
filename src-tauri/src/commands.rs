@@ -632,9 +632,12 @@ mod tests {
 
     /// Build a synthetic `ScopeView` for the combined-panel tests below,
     /// going through the new `values` map shape — `permissions_from_values`
-    /// pulls the rules back out, mirroring the load_scopes path. Empty
-    /// allow/deny/ask lists still produce a `permissions` entry so the
-    /// extractor sees the canonical shape rather than a missing key.
+    /// pulls the rules back out, mirroring the load_scopes path. Triplets
+    /// of empty lists are emitted as a missing `permissions` entry; the
+    /// extractor degrades gracefully there (returns empty
+    /// `PermissionRules`), and "no rules" matching "no key" makes the
+    /// fixture closest to the realistic on-disk shape for a settings file
+    /// without any permission rules.
     fn make_view(
         scope: Scope,
         exists: bool,
