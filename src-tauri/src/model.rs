@@ -348,10 +348,7 @@ impl SettingsDoc {
                 // overwrite (its documented shape-mismatch path), which for
                 // a permission move means propagating a malformed
                 // `permissions.<kind>` (a string, scalar, object) into the
-                // destination scope. The frontend already suppresses move
-                // affordances for malformed permission lists, but defense
-                // in depth at the IPC boundary keeps a hand-crafted
-                // request from corrupting the destination file.
+                // destination scope.
                 if !value.is_array() {
                     return Err(format!(
                         "permission list at `permissions.{}` must be a JSON array, got {}",
@@ -359,8 +356,30 @@ impl SettingsDoc {
                         json_type_name(&value)
                     ));
                 }
-                let arr = ensure_permission_list(&mut self.root, kind);
-                array_union_in_place(arr, value);
+                // Refuse to move when any entry isn't a string. The
+                // renderer, combined panel, count helpers, and confirm
+                // modal all treat permission lists as string-rules-only
+                // (non-strings are filtered silently) — unioning a number
+                // or object would write data the UI never shows on the
+                // dest. Filtering them out on the wire would silently
+                // drop the user's data without telling them; the
+                // explicit error gives them a chance to fix the file
+                // before retrying. Defense in depth: the frontend
+                // suppresses the affordance too, but a hand-crafted IPC
+                // would otherwise corrupt the destination.
+                let arr = value.as_array().expect("value.is_array()");
+                if let Some((idx, bad)) = arr.iter().enumerate().find(|(_, v)| !v.is_string()) {
+                    return Err(format!(
+                        "permission list at `permissions.{}` contains a non-string entry \
+                         at index {} ({}); ClaudeScope only treats string entries as rules \
+                         — fix the file before moving the list",
+                        kind.key(),
+                        idx,
+                        json_type_name(bad)
+                    ));
+                }
+                let arr_slot = ensure_permission_list(&mut self.root, kind);
+                array_union_in_place(arr_slot, value);
                 Ok(())
             }
             MovablePath::PermissionRule(kind, _) => {
@@ -1462,6 +1481,32 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("must be a JSON array"));
+        // Destination unchanged.
+        assert_eq!(
+            *doc.get_top_level("permissions").unwrap(),
+            serde_json::json!({"allow": ["a"]})
+        );
+    }
+
+    #[test]
+    fn merge_at_path_rejects_permission_list_with_non_string_entry() {
+        // Source array contains a number — the rest of the codebase treats
+        // permission lists as string-rules-only (renderer + combined panel
+        // + count helpers all filter), so a permission-list move must
+        // refuse rather than silently union an entry the UI never shows on
+        // the dest. The error names the bad index so the user can find it.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"permissions": {"allow": ["a"]}}),
+            Indent::Spaces(2),
+        );
+        let err = doc
+            .merge_at_path(
+                &[key("permissions"), key("allow")],
+                serde_json::json!(["valid", 42, "another"]),
+            )
+            .unwrap_err();
+        assert!(err.contains("non-string entry"));
+        assert!(err.contains("index 1"));
         // Destination unchanged.
         assert_eq!(
             *doc.get_top_level("permissions").unwrap(),

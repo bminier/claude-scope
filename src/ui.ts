@@ -660,6 +660,19 @@ function treeBranch(
   if (permKind) details.classList.add(`tree-perm-${permKind}`);
   const key = treeKey(scope, path);
 
+  // Permission-list branches with any non-string entries can't be moved
+  // — the backend's `merge_at_path` rejects them so the renderer + combined
+  // panel + count helpers stay consistent (only string entries count as
+  // rules). Suppress the affordance here so the action isn't offered before
+  // the IPC says no. The check fires only at the `permissions.<kind>` depth
+  // (length 2) where the value is the rule array itself.
+  const isMalformedPermissionListBranch =
+    permKind !== null &&
+    path.length === 2 &&
+    Array.isArray(value) &&
+    value.some((item) => typeof item !== "string");
+  const offerMoveAffordance = isMovablePath(path) && !isMalformedPermissionListBranch;
+
   const summary = document.createElement("summary");
   summary.className = "tree-summary";
   const name = document.createElement("span");
@@ -669,7 +682,7 @@ function treeBranch(
   // branches: starting a drag on the inner span lets the browser suppress
   // the `<details>` toggle that would otherwise fire on click, and isolates
   // the affordance from nested key labels which aren't movable.
-  if (props && !props.busy && isMovablePath(path)) {
+  if (props && !props.busy && offerMoveAffordance) {
     setupLeafDragSource(name, scope, path);
   }
   summary.appendChild(name);
@@ -677,7 +690,7 @@ function treeBranch(
   peek.className = "tree-peek";
   peek.textContent = treeBranchPeek(path, value, lowerQuery);
   summary.appendChild(peek);
-  if (props && isMovablePath(path)) {
+  if (props && offerMoveAffordance) {
     summary.appendChild(leafMoveButtons(scope, path, props));
   }
   details.appendChild(summary);
