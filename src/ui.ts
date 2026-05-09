@@ -777,15 +777,21 @@ function treeLeaf(
     return row;
   }
 
-  // Permission entries that aren't strings are rare (they only show up in
-  // hand-edited settings.json) but they exist; the backend rejects a move
-  // for them at `merge_at_path`, so suppress the affordances here rather
-  // than offer an action that's guaranteed to fail. The path itself is
-  // still classified as movable by `isMovablePath` — the gate is on the
-  // value's runtime shape, which lives only at this leaf.
-  const isMalformedPermissionEntry =
+  // Permission paths can be malformed in hand-edited settings.json: a
+  // whole list at `permissions.<kind>` (length 2) might be a string or
+  // object instead of an array, and a single rule slot (length 3) might
+  // be a number / null instead of a string. The backend's `merge_at_path`
+  // rejects both of those at the IPC, so suppress the affordances here
+  // rather than offer an action that's guaranteed to fail.
+  //
+  // Reaching `treeLeaf` for a length-2 permissions path implies the value
+  // is non-array (otherwise `treeNode` would have routed to `treeBranch`),
+  // so any length-2 permissions leaf is by construction malformed.
+  const isMalformedPermissionList = permKind !== null && path.length === 2;
+  const isMalformedPermissionRule =
     permKind !== null && path.length === 3 && typeof value !== "string";
-  const offerMoveAffordance = !isMalformedPermissionEntry && isMovablePath(path);
+  const offerMoveAffordance =
+    !isMalformedPermissionList && !isMalformedPermissionRule && isMovablePath(path);
 
   const row = document.createElement("div");
   row.className = "tree-node tree-leaf";
@@ -896,6 +902,11 @@ function treeBranchPeek(
         total++;
         if (matchesLoweredQuery(item, lowerQuery)) matched++;
       }
+      // Fall back to plain `[N]` when there are no string entries to
+      // match — `[0/0]` next to a non-empty array of malformed items
+      // would suggest the branch is empty when expanding it would still
+      // show those entries.
+      if (total === 0) return `[${value.length}]`;
       return `[${matched}/${total}]`;
     }
     return `[${value.length}]`;

@@ -343,6 +343,22 @@ impl SettingsDoc {
                 Ok(())
             }
             MovablePath::PermissionList(kind) => {
+                // Reject up front when the source value isn't an array.
+                // `array_union_in_place` would otherwise fall back to an
+                // overwrite (its documented shape-mismatch path), which for
+                // a permission move means propagating a malformed
+                // `permissions.<kind>` (a string, scalar, object) into the
+                // destination scope. The frontend already suppresses move
+                // affordances for malformed permission lists, but defense
+                // in depth at the IPC boundary keeps a hand-crafted
+                // request from corrupting the destination file.
+                if !value.is_array() {
+                    return Err(format!(
+                        "permission list at `permissions.{}` must be a JSON array, got {}",
+                        kind.key(),
+                        json_type_name(&value)
+                    ));
+                }
                 let arr = ensure_permission_list(&mut self.root, kind);
                 array_union_in_place(arr, value);
                 Ok(())
@@ -1426,6 +1442,31 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("must be a JSON string"));
+    }
+
+    #[test]
+    fn merge_at_path_rejects_non_array_permission_list() {
+        // Hand-edited file where `permissions.allow` ended up as a string
+        // (or any non-array). Without this guard, `array_union_in_place`
+        // would fall back to overwrite and propagate the malformed shape
+        // into the destination scope. The frontend already suppresses the
+        // affordance, but the IPC must refuse a hand-crafted request too.
+        let mut doc = SettingsDoc::from_value(
+            serde_json::json!({"permissions": {"allow": ["a"]}}),
+            Indent::Spaces(2),
+        );
+        let err = doc
+            .merge_at_path(
+                &[key("permissions"), key("allow")],
+                serde_json::json!("not-an-array"),
+            )
+            .unwrap_err();
+        assert!(err.contains("must be a JSON array"));
+        // Destination unchanged.
+        assert_eq!(
+            *doc.get_top_level("permissions").unwrap(),
+            serde_json::json!({"allow": ["a"]})
+        );
     }
 
     #[test]
