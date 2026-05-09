@@ -1017,10 +1017,12 @@ mod tests {
     #[test]
     fn move_leaf_permission_list_unions_into_destination() {
         // The new shape that wasn't expressible under the old IPCs: move the
-        // entire `permissions.allow` array. Array-union semantics, source
-        // ends up with an empty allow list (the array was removed, but the
-        // permissions key itself stays since deny / ask might still be there
-        // — though here they aren't).
+        // entire `permissions.allow` array. Array-union semantics on the
+        // destination; on the source `remove_at_path` deletes the `allow`
+        // key from the `permissions` object entirely (it doesn't leave an
+        // empty array behind), and the `permissions` key itself stays put
+        // because `deny` / `ask` may still be there — verified below by
+        // the surviving `deny: ["d"]`.
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());
         write(

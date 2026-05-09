@@ -2,6 +2,7 @@ import { lintRule } from "./lint.ts";
 import type {
   JsonValue,
   LoadedScopes,
+  MoveLeafKind,
   MoveLeafPreview,
   MoveLeafRequest,
   MoveLeafSide,
@@ -530,9 +531,9 @@ let lastRenderedProjectDir: string | null = null;
 // element, and the lifecycle is one short user gesture — same shape as
 // `openTreeNodes` / `lastRenderedProjectDir`.
 //
-// `path` mirrors the Rust `Vec<PathSeg>` wire shape. `dropEffectClass` is
-// purely cosmetic — applied to the destination column's hover style so a
-// permission-rule drop highlights the rule list, not the entire column.
+// `path` mirrors the Rust `Vec<PathSeg>` wire shape; `el` is the source
+// node, kept so the move flow can restore focus to it after a confirm
+// modal dismiss.
 interface DragSource {
   path: PathSeg[];
   from: Scope;
@@ -1065,23 +1066,16 @@ function leafDiffSide(preview: MoveLeafPreview, mode: "add" | "remove"): HTMLEle
     verdict.textContent = "(no change)";
     verdict.classList.add("muted");
   } else if (mode === "remove") {
-    verdict.textContent = preview.kind === "top_level_key" ? "key removed" : "rule removed";
+    verdict.textContent = removeVerdict(preview.kind);
     verdict.classList.add("removed");
   } else {
     // `key_before === undefined` is the absence sentinel (Rust skipped the
     // field). For permission shapes the affected key is `permissions`,
-    // which usually pre-exists with empty arrays, so "merged" is the more
-    // accurate verdict than "added" — only show "added" when the whole
-    // affected top-level key is being created from nothing.
+    // which usually pre-exists, so "merged" is the more accurate verdict
+    // than "added" — only show "added" when the whole affected top-level
+    // key is being created from nothing.
     const created = side.key_before === undefined;
-    verdict.textContent =
-      preview.kind === "top_level_key"
-        ? created
-          ? "key added"
-          : "key merged"
-        : created
-          ? "rules added"
-          : "rule added";
+    verdict.textContent = addVerdict(preview.kind, created);
     verdict.classList.add("added");
   }
   head.appendChild(verdict);
@@ -1113,10 +1107,13 @@ function leafDiffSide(preview: MoveLeafPreview, mode: "add" | "remove"): HTMLEle
 }
 
 /**
- * Chip-list before/after for permission moves. For a single-rule move the
- * affected rule is highlighted (struck-through on remove side, marked
- * added on the dest); for a whole-list move every rule is highlighted on
- * the dest side that wasn't already present.
+ * Chip-list before/after for permission moves. Highlights are driven by the
+ * delta between this side's `key_before` / `key_after`, not by membership
+ * in the source's list — for a `permission_list` move the destination may
+ * already share rules with the source, and those rules are *not* "added"
+ * (the array-union skips them). The remove side highlights rules that
+ * disappear (`before` minus `after`); the add side highlights rules that
+ * appear (`after` minus `before`).
  */
 function permissionListDiff(
   preview: MoveLeafPreview,
@@ -1133,27 +1130,19 @@ function permissionListDiff(
     list.appendChild(li);
     return list;
   }
-  const keyValue = mode === "remove" ? side.key_before : side.key_after;
-  const items = extractPermissionList(keyValue, kind);
-
-  // What's "the moving rule"? For a permission_rule move it's the source's
-  // current value at the leaf path — that's the rule being transferred.
-  // For a permission_list move there's no single rule, so highlight every
-  // rule that's in the source list (those are all moving).
-  const movingRules = movingRuleSet(preview);
+  const itemsBefore = extractPermissionList(side.key_before, kind);
+  const itemsAfter = extractPermissionList(side.key_after, kind);
+  const items = mode === "remove" ? itemsBefore : itemsAfter;
+  const beforeSet = new Set(itemsBefore);
+  const afterSet = new Set(itemsAfter);
 
   for (const rule of items) {
     const li = document.createElement("li");
     const code = document.createElement("code");
     code.textContent = rule;
-    if (movingRules.has(rule)) {
-      if (mode === "remove") {
-        li.className = "diff-removed";
-      } else if (side.will_write) {
-        // will_write=false means everything was already present on the
-        // dest; render neutrally so it doesn't look like a fresh addition.
-        li.className = "diff-added";
-      }
+    const isDelta = mode === "remove" ? !afterSet.has(rule) : !beforeSet.has(rule);
+    if (isDelta) {
+      li.className = mode === "remove" ? "diff-removed" : "diff-added";
     }
     li.appendChild(code);
     list.appendChild(li);
@@ -1167,6 +1156,30 @@ function permissionListDiff(
   return list;
 }
 
+function removeVerdict(kind: MoveLeafKind): string {
+  switch (kind) {
+    case "top_level_key":
+      return "key removed";
+    case "permission_list":
+      return "list removed";
+    case "permission_rule":
+      return "rule removed";
+  }
+}
+
+function addVerdict(kind: MoveLeafKind, created: boolean): string {
+  switch (kind) {
+    case "top_level_key":
+      return created ? "key added" : "key merged";
+    case "permission_list":
+      return created ? "list added" : "list merged";
+    case "permission_rule":
+      // Single-rule destination is always a list-append; the parent
+      // `permissions` map's pre-existence is irrelevant to the verdict.
+      return "rule added";
+  }
+}
+
 function extractPermissionList(
   keyValue: JsonValue | undefined,
   kind: PermissionKind,
@@ -1176,21 +1189,6 @@ function extractPermissionList(
   const arr = (keyValue as { [k: string]: JsonValue })[kind];
   if (!Array.isArray(arr)) return [];
   return arr.filter((v): v is string => typeof v === "string");
-}
-
-function movingRuleSet(preview: MoveLeafPreview): Set<string> {
-  const moving = new Set<string>();
-  if (preview.kind === "permission_rule") {
-    const v = leafValueAtPath(preview.from.key_before, preview.path);
-    if (typeof v === "string") moving.add(v);
-    return moving;
-  }
-  if (preview.kind === "permission_list") {
-    const kind = permissionKindForPath(preview.path);
-    if (!kind) return moving;
-    for (const rule of extractPermissionList(preview.from.key_before, kind)) moving.add(rule);
-  }
-  return moving;
 }
 
 function openConfirmModal(opts: {
