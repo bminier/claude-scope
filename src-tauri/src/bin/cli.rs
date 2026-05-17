@@ -533,3 +533,105 @@ fn print_preview(preview: &MoveLeafPreview, json: bool) -> Result<(), Box<dyn st
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_scope_lib::io_atomic::Indent;
+    use claude_scope_lib::model::SettingsDoc;
+    use serde_json::json;
+    use std::path::Path;
+
+    fn doc_from(value: serde_json::Value) -> SettingsDoc {
+        SettingsDoc::from_value(value, Indent::Spaces(2))
+    }
+
+    #[test]
+    fn resolve_paths_uses_project_dir_literally_without_walk_up() {
+        // The CLI must honor `--project-dir <PATH>` as-is. The GUI's
+        // `scope::resolve_with_home` walks up to a parent `.git`/`.claude`,
+        // which would hijack to an unrelated repo on a system where any
+        // ancestor (e.g. $HOME) happens to be a git working tree. Pin the
+        // CLI-literal behavior so a future refactor can't quietly route
+        // back through the walk-up.
+        let project = Path::new("/tmp/clitest-fixture/project");
+        let home = Path::new("/tmp/clitest-fixture/home");
+        let paths = resolve_paths(Some(project), Some(home)).unwrap();
+        assert_eq!(paths.project_dir, project);
+        assert_eq!(
+            paths.local.as_deref().unwrap(),
+            project.join(".claude").join("settings.local.json")
+        );
+        assert_eq!(
+            paths.project.as_deref().unwrap(),
+            project.join(".claude").join("settings.json")
+        );
+    }
+
+    #[test]
+    fn resolve_paths_roots_user_scopes_under_home_override() {
+        // Sandbox / dogfooding parity with the GUI's `--home` override.
+        // Verify user + user-local both resolve under the supplied home,
+        // not the real `dirs::home_dir()`.
+        let project = Path::new("/tmp/clitest-fixture/project");
+        let home = Path::new("/tmp/clitest-fixture/home");
+        let paths = resolve_paths(Some(project), Some(home)).unwrap();
+        assert_eq!(
+            paths.user.as_deref().unwrap(),
+            home.join(".claude").join("settings.json")
+        );
+        assert_eq!(
+            paths.user_local.as_deref().unwrap(),
+            home.join(".claude").join("settings.local.json")
+        );
+    }
+
+    #[test]
+    fn rules_at_returns_rules_for_each_kind() {
+        let doc = doc_from(json!({
+            "permissions": {
+                "allow": ["Bash(git status)", "Read(**)"],
+                "deny": ["WebFetch(domain:evil.example)"],
+            }
+        }));
+        assert_eq!(
+            rules_at(&doc, "allow"),
+            vec!["Bash(git status)".to_string(), "Read(**)".to_string()]
+        );
+        assert_eq!(
+            rules_at(&doc, "deny"),
+            vec!["WebFetch(domain:evil.example)".to_string()]
+        );
+        assert!(rules_at(&doc, "ask").is_empty());
+    }
+
+    #[test]
+    fn rules_at_degrades_to_empty_when_permissions_absent() {
+        // A settings file without a `permissions` key (or with a non-array
+        // shape after hand-editing) must not panic — match the lib's
+        // "partial corruption shouldn't break the UI" stance.
+        let doc = doc_from(json!({ "theme": "dark" }));
+        assert!(rules_at(&doc, "allow").is_empty());
+
+        let weird = doc_from(json!({ "permissions": { "allow": "not-an-array" } }));
+        assert!(rules_at(&weird, "allow").is_empty());
+    }
+
+    #[test]
+    fn locate_rule_finds_index_and_misses_correctly() {
+        let doc = doc_from(json!({
+            "permissions": { "allow": ["Bash(git status)", "Read(**)"] }
+        }));
+        assert_eq!(
+            locate_rule(&doc, PermissionKind::Allow, "Read(**)"),
+            Some(1)
+        );
+        assert_eq!(locate_rule(&doc, PermissionKind::Allow, "Missing(*)"), None);
+        // Looking under a kind that doesn't exist on disk must also miss
+        // rather than panic.
+        assert_eq!(
+            locate_rule(&doc, PermissionKind::Deny, "Bash(git status)"),
+            None
+        );
+    }
+}
