@@ -312,7 +312,7 @@ pub fn save_preferences(prefs: Preferences) -> Result<(), String> {
     preferences::save(&prefs).map_err(|e| e.to_string())
 }
 
-fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::Error>> {
+pub fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::error::Error>> {
     let mut views = Vec::with_capacity(Scope::ALL.len());
 
     for scope in Scope::ALL {
@@ -581,7 +581,7 @@ fn validate_move_request(
     }
 }
 
-fn diff_move_leaf_impl(
+pub fn diff_move_leaf_impl(
     paths: &ScopePaths,
     req: &MoveLeafRequest,
 ) -> Result<MoveLeafPreview, Box<dyn std::error::Error>> {
@@ -767,7 +767,7 @@ fn diff_change_kind_same_scope(
     })
 }
 
-fn apply_move_leaf_impl(
+pub fn apply_move_leaf_impl(
     paths: &ScopePaths,
     req: &MoveLeafRequest,
     backups: &BackupTracker,
