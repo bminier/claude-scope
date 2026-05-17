@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    claude_scope_lib::run();
+    claude_scope_lib::run(tauri::generate_context!());
 }

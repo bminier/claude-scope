@@ -1,13 +1,19 @@
-mod commands;
-mod io_atomic;
-mod model;
+pub mod commands;
+pub mod io_atomic;
+pub mod model;
 mod preferences;
 mod runtime;
-mod scope;
-mod watcher;
+pub mod scope;
+pub mod watcher;
 
+/// Tauri entry point for the GUI. The caller supplies the build-time
+/// `tauri::Context` (via `tauri::generate_context!()` at the bin's compile
+/// site) so the macro — which requires the bundled frontend assets — only
+/// expands when the GUI bin is being built. The CLI bin re-uses the same
+/// library but never calls this function, so it can build without the
+/// frontend's `dist/` being present.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+pub fn run(context: tauri::Context) {
     // Sandbox / scratch-home overrides (#66): parse `--home` / `--project`
     // from argv and `CLAUDE_SCOPE_HOME` / `CLAUDE_SCOPE_PROJECT` from env at
     // launch. Stored as managed state so every subsequent scope::resolve
@@ -47,6 +53,6 @@ pub fn run() {
             commands::save_preferences,
             commands::load_runtime_info,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
