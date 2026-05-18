@@ -6,6 +6,7 @@ import type {
   DeleteLeafPreview,
   DeleteLeafRequest,
   JsonValue,
+  KnownProject,
   LoadedScopes,
   MoveLeafKind,
   MoveLeafPreview,
@@ -29,6 +30,12 @@ interface AppProps {
   query: string;
   preferences: Preferences;
   runtime: RuntimeInfo;
+  /** Every Claude project discovered on this machine (#106). Sourced from
+   *  the Rust backend's `list_known_projects` IPC; empty until that
+   *  resolves and after a discovery failure. The Move-to submenu folds the
+   *  current project in via `getKnownProjects` so the menu is never empty
+   *  even on a fresh install. */
+  knownProjects: KnownProject[];
   onPickProject: () => void;
   onReload: () => void;
   onMoveLeaf: (req: MoveLeafRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
@@ -48,20 +55,30 @@ interface AppProps {
 }
 
 /**
- * Stub for #106 (project discovery). Returns the list of known Claude
- * projects to populate the Move-to submenu — for v1, just the currently
- * loaded project. Replaced when #106 lands; keeping the indirection means
- * the menu rendering doesn't need to change at that point.
+ * Build the list of known Claude projects feeding the Move-to submenu.
+ * Sources from the backend's discovery (`props.knownProjects`) but always
+ * folds in the currently loaded project — so a freshly cloned repo with no
+ * transcripts yet still surfaces *somewhere* in the menu, and the user
+ * never has to leave-and-return to land the current project under their
+ * cursor.
  */
-function getKnownProjects(props: AppProps): { name: string; root: string }[] {
-  if (!props.projectDir) return [];
-  // Use the directory's basename (final path segment) as the display name.
-  // Handles both Windows back-slashes and POSIX forward-slashes so the
-  // label looks right regardless of the OS the loaded project lives on.
-  const root = props.projectDir;
-  const sepIdx = Math.max(root.lastIndexOf("/"), root.lastIndexOf("\\"));
-  const name = sepIdx >= 0 ? root.slice(sepIdx + 1) || root : root;
-  return [{ name, root }];
+function getKnownProjects(props: AppProps): KnownProject[] {
+  const merged: KnownProject[] = [...props.knownProjects];
+  if (props.projectDir) {
+    const root = props.projectDir;
+    const sepIdx = Math.max(root.lastIndexOf("/"), root.lastIndexOf("\\"));
+    const name = sepIdx >= 0 ? root.slice(sepIdx + 1) || root : root;
+    // Case-insensitive de-dupe against the backend list. On Windows the
+    // discovery side's path may differ in case from the picker's, but they
+    // refer to the same directory; surfacing both would put two identical
+    // entries side-by-side in the submenu.
+    const norm = root.toLowerCase();
+    if (!merged.some((p) => p.root.toLowerCase() === norm)) {
+      merged.push({ name, root });
+    }
+  }
+  merged.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+  return merged;
 }
 
 const PERMISSION_KINDS: ReadonlyArray<PermissionKind> = ["allow", "deny", "ask"];

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MoveLeafRequest, MoveOptions, Scope, Theme } from "../../src/types.ts";
+import type { KnownProject, MoveLeafRequest, MoveOptions, Scope, Theme } from "../../src/types.ts";
 import { SEARCH_INPUT_ID } from "../../src/types.ts";
 import { openSettings, renderApp } from "../../src/ui.ts";
 import { buildLoadedScopes, buildPreferences, buildRuntimeInfo } from "../fixtures/loadedScopes.ts";
@@ -22,6 +22,7 @@ interface PropsOverrides {
   query?: string;
   preferences?: ReturnType<typeof buildPreferences>;
   runtime?: ReturnType<typeof buildRuntimeInfo>;
+  knownProjects?: KnownProject[];
   onMoveLeaf?: (req: MoveLeafRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
 }
 
@@ -41,6 +42,7 @@ function makeProps(overrides: PropsOverrides = {}) {
     query: overrides.query ?? "",
     preferences: overrides.preferences ?? buildPreferences(),
     runtime: overrides.runtime ?? buildRuntimeInfo(),
+    knownProjects: overrides.knownProjects ?? [],
     onPickProject: vi.fn(),
     onReload: vi.fn(),
     onMoveLeaf: overrides.onMoveLeaf ?? vi.fn(),
@@ -315,6 +317,39 @@ describe("context menu (#8)", () => {
     expect(moveItems).toContain("User");
     expect(moveItems).toContain("User-Local");
     expect(moveItems).toContain("myproject");
+  });
+
+  it("merges backend-discovered projects with the current project in the Move-to submenu", () => {
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
+      project_dir: "/tmp/myproject",
+    });
+    renderApp(
+      root,
+      makeProps({
+        scopes,
+        knownProjects: [
+          { name: "other-repo", root: "/tmp/other-repo" },
+          // Same path as the loaded project — `getKnownProjects` should
+          // dedupe so the entry doesn't appear twice in the submenu.
+          { name: "myproject", root: "/tmp/myproject" },
+        ],
+      }),
+    );
+    const ruleRow = root.querySelector<HTMLElement>(".rule.rule-allow");
+    if (!ruleRow) throw new Error("expected rule row");
+    rightClick(ruleRow);
+    findMenuItem("Move to")?.click();
+    const menus = document.querySelectorAll<HTMLElement>(".context-menu");
+    const moveItems = Array.from(
+      menus[1].querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    ).map((b) => b.textContent?.replace(/\s*▸$/, "").trim() ?? "");
+    // Both projects show up, exactly once each, and the global scopes are
+    // still present above the divider.
+    expect(moveItems).toContain("User");
+    expect(moveItems).toContain("User-Local");
+    expect(moveItems.filter((l) => l === "myproject")).toHaveLength(1);
+    expect(moveItems).toContain("other-repo");
   });
 
   it("closes the context menu on Escape", () => {

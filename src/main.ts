@@ -8,6 +8,7 @@ import type {
   AddLeafRequest,
   DeleteLeafPreview,
   DeleteLeafRequest,
+  KnownProject,
   LoadedScopes,
   MoveLeafPreview,
   MoveLeafRequest,
@@ -44,6 +45,7 @@ const state: {
   query: string;
   preferences: Preferences;
   runtime: RuntimeInfo;
+  knownProjects: KnownProject[];
 } = {
   scopes: null,
   projectDir: null,
@@ -54,6 +56,10 @@ const state: {
   // sandbox banner is simply omitted in that case, so a slow IPC boot
   // doesn't flash a misleading "Sandbox: …" line.
   runtime: { home_override: null, project_override: null },
+  // Populated by list_known_projects at bootstrap and refreshed when the
+  // user picks a new project (#106). Defaults to empty so the Move-to
+  // submenu degrades gracefully before the IPC resolves.
+  knownProjects: [],
 };
 
 // Set by the scopes-changed listener when it fires while another load or
@@ -70,6 +76,11 @@ async function load(projectDir: string | null): Promise<void> {
     const scopes = await invoke<LoadedScopes>("load_scopes", { project_dir: projectDir });
     state.scopes = scopes;
     state.projectDir = scopes.project_dir;
+    // Refresh the known-projects list alongside the scope load so the
+    // Move-to submenu reflects projects that appeared since launch (e.g.
+    // the user just ran Claude in a new directory). Tolerated failure:
+    // an empty list still lets all other UI work.
+    refreshKnownProjects();
   } catch (err) {
     alert(`Failed to load settings: ${err}`);
   } finally {
@@ -80,6 +91,17 @@ async function load(projectDir: string | null): Promise<void> {
       void load(state.projectDir);
     }
   }
+}
+
+function refreshKnownProjects(): void {
+  invoke<KnownProject[]>("list_known_projects")
+    .then((projects) => {
+      state.knownProjects = projects;
+      render();
+    })
+    .catch((err) => {
+      console.warn("failed to list known projects:", err);
+    });
 }
 
 // Guards against a second move flow starting while one is still running
@@ -383,6 +405,7 @@ function render(): void {
     query: state.query,
     preferences: state.preferences,
     runtime: state.runtime,
+    knownProjects: state.knownProjects,
     onPickProject: pickProject,
     onReload: reload,
     onMoveLeaf: moveLeaf,

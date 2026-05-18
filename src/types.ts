@@ -186,3 +186,14 @@ export interface RuntimeInfo {
   home_override: string | null;
   project_override: string | null;
 }
+
+/**
+ * One Claude project discovered on this machine (#106). Mirrors Rust's
+ * `KnownProject`. `name` is the project root's basename; `root` is the
+ * absolute path. Used to populate the per-project section of the Move-to
+ * context-menu submenu.
+ */
+export interface KnownProject {
+  name: string;
+  root: string;
+}
