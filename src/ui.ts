@@ -140,6 +140,92 @@ function matchesLoweredQuery(rule: string, lowerQuery: string): boolean {
   return rule.toLowerCase().includes(lowerQuery);
 }
 
+/**
+ * Threshold above which a tool's rules collapse under a synthetic group
+ * node in the per-scope tree view (#68). At 2, two rules sharing a tool
+ * (e.g. `handoff(copilot *)` + `handoff(claude *)`) fold together. A future
+ * Settings option (#115) will parameterize this; for now it's the single
+ * compile-time knob the grouping helper reads.
+ */
+const TOOL_GROUP_THRESHOLD = 2;
+
+/**
+ * Entry in the per-kind rule list after grouping. `Single` keeps the
+ * original index so the leaf's path stays addressable; `Group` carries
+ * every member's index so the children can each rebuild their path.
+ *
+ * Children inside a group preserve their original disk index in `members`
+ * — the backend still addresses rules by their position in the on-disk
+ * array, and the UI grouping is purely visual.
+ */
+export type GroupedRuleEntry =
+  | { kind: "single"; index: number; rule: string }
+  | { kind: "group"; tool: string; members: Array<{ index: number; rule: string }> };
+
+/**
+ * Group a flat permission-rule list by the `Tool` prefix in each
+ * `Tool(args)` rule. Rules that don't match `Tool(...)` syntax (no
+ * parentheses, or anything else the regex misses) stay flat as singles.
+ *
+ * Order rule: emit each tool's group at the position of its first member,
+ * absorb later members silently. Singles emit at their original position.
+ * That preserves the user's top-down reading order — a rule never moves
+ * past a sibling that came after it on disk.
+ *
+ * Single-member "groups" collapse back to a `Single` entry so a tool with
+ * only one rule doesn't render a one-child fold.
+ */
+export function groupByToolPrefix(
+  rules: string[],
+  threshold: number = TOOL_GROUP_THRESHOLD,
+): GroupedRuleEntry[] {
+  // First pass: count rules per tool so the second pass knows whether a
+  // tool meets the threshold without rescanning the tail of the list each
+  // time it sees a member.
+  const counts = new Map<string, number>();
+  const tools: Array<string | null> = rules.map((rule) => {
+    const tool = toolPrefixOf(rule);
+    if (tool !== null) counts.set(tool, (counts.get(tool) ?? 0) + 1);
+    return tool;
+  });
+
+  const emitted = new Set<string>();
+  const out: GroupedRuleEntry[] = [];
+  for (let i = 0; i < rules.length; i++) {
+    const rule = rules[i];
+    const tool = tools[i];
+    if (tool === null || (counts.get(tool) ?? 0) < threshold) {
+      out.push({ kind: "single", index: i, rule });
+      continue;
+    }
+    if (emitted.has(tool)) continue;
+    emitted.add(tool);
+    const members: Array<{ index: number; rule: string }> = [];
+    for (let j = i; j < rules.length; j++) {
+      if (tools[j] === tool) members.push({ index: j, rule: rules[j] });
+    }
+    out.push({ kind: "group", tool, members });
+  }
+  return out;
+}
+
+/**
+ * Extract the `Tool` part of a `Tool(args)` rule. Returns null when the
+ * rule doesn't have a `(` (malformed or shorthand the lint flags), so the
+ * caller falls back to rendering it as a plain single.
+ *
+ * Whitespace-tolerant on either side of the `(` to match the lint's
+ * permissive parsing — we'd rather group `handoff (copilot *)` with the
+ * rest of the handoff family than orphan it on a literal whitespace
+ * mismatch.
+ */
+function toolPrefixOf(rule: string): string | null {
+  const paren = rule.indexOf("(");
+  if (paren <= 0) return null;
+  const tool = rule.slice(0, paren).trim();
+  return tool === "" ? null : tool;
+}
+
 const SCOPE_LABELS: Record<Scope, string> = {
   local: "Local",
   project: "Project",
@@ -641,7 +727,18 @@ function seedDefaultOpenPermissions(loaded: LoadedScopes): void {
       // is just visual noise on a fresh project load. The user can still
       // open it manually if they want to add rules.
       if (Array.isArray(arr) && arr.length > 0) {
-        openTreeNodes.add(treeKey(view.scope, ["permissions", kind]));
+        const kindPath: PathSeg[] = ["permissions", kind];
+        openTreeNodes.add(treeKey(view.scope, kindPath));
+        // Seed open state for tool groups (#68) so the synthetic
+        // `<details>` nodes inside an already-open permissions branch
+        // start expanded — users opened the kind branch to read its
+        // rules, so collapsed groups would just hide them again.
+        const ruleStrings = arr.map((v) => (typeof v === "string" ? v : ""));
+        for (const entry of groupByToolPrefix(ruleStrings)) {
+          if (entry.kind === "group") {
+            openTreeNodes.add(treeKey(view.scope, [...kindPath, "__group__", entry.tool]));
+          }
+        }
       }
     }
   }
@@ -774,12 +871,18 @@ function treeBranch(
     if (populated) return;
     populated = true;
     if (Array.isArray(value)) {
-      value.forEach((child, i) => {
-        // Permission rule arrays carry their kind via the parent path; child
-        // construction passes `props` and `lowerQuery` through so the leaf
-        // gets its move buttons + drag + lint badge + filter test.
-        children.appendChild(treeNode(scope, [...path, i], `[${i}]`, child, props, lowerQuery));
-      });
+      // Permission-list arrays (`permissions.<kind>`) collapse rules that
+      // share a `Tool(...)` prefix under synthetic group nodes (#68). Non-
+      // permission arrays fall through to the unchanged flat iteration so
+      // `env` / `hooks` / arbitrary user keys keep today's shape.
+      const isPermissionList = permKind !== null && path.length === 2;
+      if (isPermissionList) {
+        populatePermissionList(scope, path, value, children, props, lowerQuery);
+      } else {
+        value.forEach((child, i) => {
+          children.appendChild(treeNode(scope, [...path, i], `[${i}]`, child, props, lowerQuery));
+        });
+      }
     } else {
       for (const [k, v] of Object.entries(value)) {
         children.appendChild(treeNode(scope, [...path, k], k, v, props, lowerQuery));
@@ -793,6 +896,148 @@ function treeBranch(
   // first render per project, so the unified tree starts in the same
   // shape as the old single-pane view; subsequent renders defer to
   // whatever the user toggled.
+  if (openTreeNodes.has(key)) {
+    details.open = true;
+    populate();
+  }
+  details.addEventListener("toggle", () => {
+    if (details.open) {
+      openTreeNodes.add(key);
+      populate();
+    } else {
+      openTreeNodes.delete(key);
+    }
+  });
+
+  return details;
+}
+
+/**
+ * Populate a `permissions.<kind>` branch's children using the tool-prefix
+ * grouping helper (#68). Each `Single` from the grouper renders exactly
+ * like the pre-#68 flat branch did — `treeNode` with the original index in
+ * the path. Each `Group` renders as a synthetic `<details>` whose
+ * children are the group's members at their original indices, so move /
+ * drag / context menu wiring stays leaf-local.
+ */
+function populatePermissionList(
+  scope: Scope,
+  path: PathSeg[],
+  value: JsonValue[],
+  children: HTMLElement,
+  props: AppProps | undefined,
+  lowerQuery: string,
+): void {
+  // Only string-typed entries participate in tool-prefix grouping — a hand-
+  // edited settings.json can put e.g. an object in `permissions.allow[2]`,
+  // and grouping `null` or a struct under a fake tool name would be more
+  // surprise than help. Keep the malformed entries inline at their
+  // original index so the existing leaf renderer can flag them.
+  const ruleStrings: string[] = value.map((v) => (typeof v === "string" ? v : ""));
+  const grouped = groupByToolPrefix(ruleStrings);
+  for (const entry of grouped) {
+    if (entry.kind === "single") {
+      children.appendChild(
+        treeNode(
+          scope,
+          [...path, entry.index],
+          `[${entry.index}]`,
+          value[entry.index],
+          props,
+          lowerQuery,
+        ),
+      );
+    } else {
+      children.appendChild(toolGroupNode(scope, path, entry, value, props, lowerQuery));
+    }
+  }
+}
+
+/**
+ * Render a synthetic `<details>` for a tool group (#68). The group has no
+ * backend identity — its members each retain their original
+ * `permissions.<kind>[i]` path — but its open/close state is tracked via
+ * an `openTreeNodes` key that uses a `"__group__"` sentinel segment so it
+ * can't collide with a real key path (permission lists are arrays, never
+ * objects with a `__group__` key).
+ *
+ * Filter behavior: when a query is active, hide the group entirely if no
+ * member matches, otherwise show it with the non-matching members
+ * filtered out. The summary's count badge mirrors the combined panel's
+ * `(matched/total)` format so the matched-count signal is consistent
+ * across the two surfaces.
+ */
+function toolGroupNode(
+  scope: Scope,
+  path: PathSeg[],
+  group: Extract<GroupedRuleEntry, { kind: "group" }>,
+  rawValue: JsonValue[],
+  props: AppProps | undefined,
+  lowerQuery: string,
+): HTMLElement {
+  const permKind = permissionKindForPath(path);
+  const matchedMembers =
+    lowerQuery === ""
+      ? group.members
+      : group.members.filter((m) => matchesLoweredQuery(m.rule, lowerQuery));
+  // If nothing in the group matches the active filter, return an empty
+  // hidden node so the children container doesn't grow a "ghost" group
+  // summary with no visible members beneath it.
+  if (lowerQuery !== "" && matchedMembers.length === 0) {
+    const skip = document.createElement("span");
+    skip.hidden = true;
+    return skip;
+  }
+
+  const groupPath: PathSeg[] = [...path, "__group__", group.tool];
+  const key = treeKey(scope, groupPath);
+
+  const details = document.createElement("details");
+  details.className = "tree-node tree-branch tree-tool-group";
+  if (permKind) details.classList.add(`tree-perm-${permKind}`);
+
+  const summary = document.createElement("summary");
+  summary.className = "tree-summary";
+  const name = document.createElement("span");
+  name.className = "tree-key";
+  name.textContent = group.tool;
+  summary.appendChild(name);
+  const peek = document.createElement("span");
+  peek.className = "tree-peek";
+  peek.textContent =
+    lowerQuery === ""
+      ? `(${group.members.length})`
+      : `(${matchedMembers.length}/${group.members.length})`;
+  summary.appendChild(peek);
+  details.appendChild(summary);
+
+  const childrenWrap = document.createElement("div");
+  childrenWrap.className = "tree-children";
+  details.appendChild(childrenWrap);
+
+  let populated = false;
+  function populate(): void {
+    if (populated) return;
+    populated = true;
+    for (const member of matchedMembers) {
+      childrenWrap.appendChild(
+        treeNode(
+          scope,
+          [...path, member.index],
+          `[${member.index}]`,
+          rawValue[member.index],
+          props,
+          lowerQuery,
+        ),
+      );
+    }
+  }
+
+  // Default open: tool groups inside an already-open `permissions.<kind>`
+  // branch should reveal their rules without an extra click — users opened
+  // the parent to read the rules. `seedDefaultOpenPermissions` seeds the
+  // synthetic key for each group at first render; manual collapses then
+  // override.
   if (openTreeNodes.has(key)) {
     details.open = true;
     populate();
