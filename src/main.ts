@@ -38,6 +38,7 @@ import {
 const DEFAULT_PREFERENCES: Preferences = {
   visible_scopes: [...SCOPES],
   theme: "auto",
+  backup_on_write: true,
 };
 
 const state: {
@@ -391,12 +392,18 @@ function onChangeTheme(theme: Theme): void {
   void persistPreferences({ ...state.preferences, theme });
 }
 
+function onToggleBackupOnWrite(enabled: boolean): void {
+  if (state.preferences.backup_on_write === enabled) return;
+  void persistPreferences({ ...state.preferences, backup_on_write: enabled });
+}
+
 function onOpenSettings(trigger?: HTMLElement): void {
   void openSettings(
     {
       preferences: state.preferences,
       onToggleScopeVisibility,
       onChangeTheme,
+      onToggleBackupOnWrite,
     },
     trigger,
   );

@@ -173,6 +173,11 @@ export type Theme = "auto" | "light" | "dark";
 export interface Preferences {
   visible_scopes: Scope[];
   theme: Theme;
+  /** Whether to drop a `.bak` next to every settings file on the first
+   *  write per session (#88). Default `true` on a fresh install — older
+   *  configs without the field also default to `true` server-side, so the
+   *  frontend can read it as a plain `boolean` here. */
+  backup_on_write: boolean;
 }
 
 /**
