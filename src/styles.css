@@ -883,6 +883,130 @@ button:disabled {
   pointer-events: auto;
 }
 
+/* Help tooltip (#9) — sibling to the lint badge in shape, distinct in
+   palette so the two never read as the same affordance. The dotted
+   underline on `.has-help` marks the label as having a hover explanation
+   without crowding it; the `ⓘ` glyph after the label is the focusable
+   click-pin target. */
+.popover-wrap.help-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+}
+
+.has-help {
+  text-decoration: underline dotted var(--muted);
+  text-underline-offset: 2px;
+  /* Keep the underline subtle on mouse hover so it doesn't read as a
+     pressable link — the ⓘ glyph is the actual click target. */
+  cursor: help;
+}
+
+.help-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: help;
+}
+
+.help-info:hover,
+.popover-wrap.help-wrap.is-open > .help-info {
+  /* Override the global `button:hover` --accent recolor so the glyph
+     stays in its neutral palette — help isn't a primary action. */
+  color: var(--accent);
+  border-color: var(--border);
+  background: var(--panel-2);
+}
+
+.help-info:focus-visible {
+  outline: none;
+  color: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--ring-focus);
+}
+
+.help-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  min-width: 220px;
+  max-width: 320px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px var(--popover-shadow);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: normal;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity 120ms ease,
+    visibility 120ms ease;
+}
+
+.help-popover-summary {
+  display: block;
+}
+
+.help-popover-docs {
+  display: inline-block;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+}
+
+.help-popover-docs:hover {
+  text-decoration: underline;
+}
+
+/* Caret pointing back at the ⓘ glyph — same shape as the lint popover so
+   the popover family reads as one visual system. */
+.help-popover::before {
+  content: "";
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 6px solid transparent;
+  border-bottom-color: var(--border);
+}
+.help-popover::after {
+  content: "";
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%) translateY(1px);
+  border: 5px solid transparent;
+  border-bottom-color: var(--panel-2);
+}
+
+.popover-wrap.help-wrap:hover > .help-popover,
+.popover-wrap.help-wrap:focus-within > .help-popover,
+.popover-wrap.help-wrap.is-open > .help-popover {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
 /* Scope-origin tooltip (issue #82). Wraps every permission-rule chip so
    hovering or keyboard-focusing the chip reveals which scope(s) the rule
    originates from. Reuses the lint-warn popover visuals so the two hover

@@ -239,6 +239,232 @@ const KIND_LABELS: Record<PermissionKind, string> = {
   ask: "ask",
 };
 
+/**
+ * Help-tooltip content shape (#9). One-sentence `summary` is the main
+ * payload; `docs` is the optional link the popover footer surfaces. Keep
+ * summaries to ~one sentence — anything longer belongs on the docs site.
+ */
+export interface HelpContent {
+  summary: string;
+  docs?: string;
+}
+
+/** Canonical Claude Code settings docs link, shared by every popover that
+ *  doesn't specify its own. Saves maintaining 12+ deep-links that would rot
+ *  whenever Anthropic reshuffles the docs site. */
+const HELP_DOCS_URL = "https://docs.claude.com/en/docs/claude-code/settings";
+
+/**
+ * One-sentence explanations for the top-level Claude Code settings keys
+ * ClaudeScope surfaces. Unknown keys (anything not in this map) render
+ * without a tooltip — silence beats a confident guess.
+ */
+const KEY_HELP: Record<string, HelpContent> = {
+  permissions: {
+    summary:
+      "Rules controlling which tools Claude Code can use, and which require explicit confirmation.",
+  },
+  env: {
+    summary: "Environment variables Claude Code injects into every tool invocation in this scope.",
+  },
+  hooks: {
+    summary: "Shell commands run on lifecycle events (PreToolUse, Stop, SessionStart, …).",
+  },
+  theme: {
+    summary: "Color theme for Claude Code's terminal UI (dark, light, dark-daltonized, …).",
+  },
+  model: {
+    summary: "Default Claude model id used by sessions started in this scope.",
+  },
+  apiKeyHelper: {
+    summary: "Path to a script Claude Code runs to fetch a fresh API key on demand.",
+  },
+  statusLine: {
+    summary: "Customizes the status line rendered below the prompt during a session.",
+  },
+  enableAllProjectMcpServers: {
+    summary:
+      "When true, every MCP server defined in the project is enabled without per-server prompts.",
+  },
+  enabledMcpjsonServers: {
+    summary:
+      "Explicit allow-list of MCP servers (from a project's `.mcp.json`) enabled in this scope.",
+  },
+  disabledMcpjsonServers: {
+    summary: "Explicit deny-list of MCP servers — overrides the enabled list.",
+  },
+  outputStyle: {
+    summary: "Output formatting preset for Claude's responses (default, explanatory, learning, …).",
+  },
+  forceLoginMethod: {
+    summary: "Pins the login flow to a specific provider (claude-ai, anthropic-api, console).",
+  },
+  cleanupPeriodDays: {
+    summary: "Days before Claude Code cleans up chat history (0 disables cleanup).",
+  },
+  includeCoAuthoredBy: {
+    summary: "Adds a `Co-Authored-By: Claude` trailer to git commits Claude creates.",
+  },
+  spinnerTipsEnabled: {
+    summary: "Shows rotating tips below the spinner during long tool runs.",
+  },
+  alwaysThinkingEnabled: {
+    summary: "Sends every prompt through Claude's extended-thinking mode by default.",
+  },
+};
+
+/**
+ * Per-kind help for `permissions.allow` / `.deny` / `.ask`. Surfaces on
+ * the combined panel's kind label and on the kind's `tree-key` span in
+ * each per-scope tree branch.
+ */
+const KIND_HELP: Record<PermissionKind, HelpContent> = {
+  allow: {
+    summary: "Rules Claude Code may match and use without asking the user first.",
+  },
+  deny: {
+    summary: "Rules Claude Code is forbidden from using — deny always wins over allow.",
+  },
+  ask: {
+    summary: "Rules Claude Code may use only after explicit per-invocation confirmation.",
+  },
+};
+
+/**
+ * Per-scope help on the column header. The precedence sentence shows up
+ * in every scope's tooltip so the relationship is reinforced from
+ * wherever the user happens to hover.
+ */
+const SCOPE_HELP: Record<Scope, HelpContent> = {
+  local: {
+    summary:
+      "Project-local override (`.claude/settings.local.json`). Gitignored. Highest precedence — wins over Project, User-Local, and User.",
+  },
+  project: {
+    summary:
+      "Project-wide settings (`.claude/settings.json`). Committed to the repo. Overrides User-Local and User; overridden by Local.",
+  },
+  user_local: {
+    summary:
+      "Machine-local override (`~/.claude/settings.local.json`). Overrides User; overridden by Project and Local.",
+  },
+  user: {
+    summary:
+      "Machine-global settings (`~/.claude/settings.json`). Lowest precedence — every other scope wins over it.",
+  },
+};
+
+/** Look up help for a top-level settings key. Returns null for unknown
+ *  keys so the caller can skip the affordance entirely (the issue's
+ *  "absence is better than a misleading guess"). */
+export function lookupKeyHelp(key: string): HelpContent | null {
+  // `key in KEY_HELP` instead of Object.hasOwn / hasOwnProperty: avoids
+  // tsconfig's lib level requirement for ES2022 and dodges the no-
+  // prototype-builtins rule biome would otherwise re-format around. The
+  // map is a typed object literal — no inherited keys collide.
+  return key in KEY_HELP ? KEY_HELP[key] : null;
+}
+
+export function lookupKindHelp(kind: PermissionKind): HelpContent {
+  return KIND_HELP[kind];
+}
+
+export function lookupScopeHelp(scope: Scope): HelpContent {
+  return SCOPE_HELP[scope];
+}
+
+/**
+ * Resolve help content for a tree branch by its JSON path. Handles both
+ * the top-level key case (`[<key>]`) and the permission-kind case
+ * (`["permissions", "allow"|"deny"|"ask"]`). Anything deeper returns
+ * null — leaves themselves carry rule-shaped content that doesn't need
+ * generic help.
+ */
+function lookupBranchHelp(path: PathSeg[]): HelpContent | null {
+  if (path.length === 1 && typeof path[0] === "string") {
+    return lookupKeyHelp(path[0]);
+  }
+  if (path.length === 2 && path[0] === "permissions" && typeof path[1] === "string") {
+    const kind = path[1];
+    if (PERMISSION_KINDS.includes(kind as PermissionKind)) {
+      return lookupKindHelp(kind as PermissionKind);
+    }
+  }
+  return null;
+}
+
+let helpPopoverSeq = 0;
+
+/**
+ * Decorate `trigger` with the standard "ⓘ next to it" help affordance
+ * (#9). Appends two siblings to `trigger`'s parent in `parent`:
+ *   1. A focusable `ⓘ` button (the click/keyboard pin target).
+ *   2. A `role="tooltip"` popover holding the summary + docs link.
+ *
+ * `trigger` itself receives a `has-help` class so the dotted underline
+ * shows on the label, and `aria-describedby` so screen readers announce
+ * the popover content. Hover and focus reveals are CSS-driven on the
+ * shared `.popover-wrap`; click pins via the global popover singleton.
+ */
+export function attachHelpTooltip(trigger: HTMLElement, content: HelpContent): HTMLElement {
+  // The trigger needs to live inside a positioned wrap so the absolutely-
+  // positioned popover anchors against it. Build the wrap, move the
+  // trigger inside, and return the wrap so callers can substitute it for
+  // the bare trigger in their layout.
+  const wrap = document.createElement("span");
+  wrap.className = "popover-wrap help-wrap";
+  trigger.classList.add("has-help");
+  wrap.appendChild(trigger);
+
+  const popoverId = `help-popover-${++helpPopoverSeq}`;
+  trigger.setAttribute("aria-describedby", popoverId);
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "help-info";
+  btn.textContent = "ⓘ";
+  // Short `aria-label` only — the descriptive content is on the popover
+  // via `aria-describedby`. Without the short label, screen readers
+  // would announce the glyph as "circled latin small letter i", which
+  // is useless.
+  btn.setAttribute("aria-label", "Help");
+  btn.setAttribute("aria-describedby", popoverId);
+
+  const pop = document.createElement("span");
+  pop.id = popoverId;
+  pop.className = "help-popover";
+  pop.setAttribute("role", "tooltip");
+
+  const summary = document.createElement("span");
+  summary.className = "help-popover-summary";
+  summary.textContent = content.summary;
+  pop.appendChild(summary);
+
+  const docsLink = document.createElement("a");
+  docsLink.className = "help-popover-docs";
+  docsLink.href = content.docs ?? HELP_DOCS_URL;
+  docsLink.textContent = "Open settings docs ↗";
+  // `target=_blank` opens via Tauri's URL handler in the OS browser
+  // instead of inside the webview. `noopener` for the standard
+  // anti-tabnabbing reason.
+  docsLink.target = "_blank";
+  docsLink.rel = "noopener noreferrer";
+  pop.appendChild(docsLink);
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (openPinnedPopover === wrap) {
+      closePinnedPopover();
+    } else {
+      pinPopover(wrap);
+    }
+  });
+
+  wrap.appendChild(btn);
+  wrap.appendChild(pop);
+  return wrap;
+}
+
 let modalIdCounter = 0;
 
 // Set at the top of every `renderApp` call so the tree walkers can cheaply
@@ -263,10 +489,10 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
     : null;
 
   root.innerHTML = "";
-  // The full DOM wipe just destroyed any pinned lint popover; clear the
-  // tracking state so a stale `openLintWrap` doesn't survive re-render and
-  // confuse the next outside-click / Escape.
-  closeLintPopover();
+  // The full DOM wipe just destroyed any pinned popover (lint or help);
+  // clear the tracking state so a stale `openPinnedPopover` doesn't
+  // survive re-render and confuse the next outside-click / Escape.
+  closePinnedPopover();
   // Same reasoning for an in-flight drag: if a re-render lands mid-drag
   // (e.g. an external file change reloads scopes), the source chip is
   // detached and `dragend` may not fire — drop the singleton so the next
@@ -503,7 +729,9 @@ function combinedPanel(loaded: LoadedScopes, props: AppProps, lowerQuery: string
       query === "" || all.length === 0
         ? `${KIND_LABELS[kind]} (${all.length})`
         : `${KIND_LABELS[kind]} (${matchedCount}/${all.length})`;
-    group.appendChild(label);
+    // Wrap with help tooltip (#9) so a hover/focus on the kind label
+    // explains what allow/deny/ask actually do.
+    group.appendChild(attachHelpTooltip(label, lookupKindHelp(kind)));
     for (let i = 0; i < all.length; i++) {
       const rule = all[i];
       if (isFiltering && !matchesLoweredQuery(rule, lowerQuery)) continue;
@@ -587,13 +815,10 @@ function lintBadge(rule: string): HTMLElement | null {
 
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
-    if (openLintWrap && openLintWrap !== wrap) closeLintPopover();
-    const isOpen = wrap.classList.toggle("is-open");
-    if (isOpen) {
-      openLintWrap = wrap;
-      ensureLintGlobalListeners();
-    } else if (openLintWrap === wrap) {
-      openLintWrap = null;
+    if (openPinnedPopover === wrap) {
+      closePinnedPopover();
+    } else {
+      pinPopover(wrap);
     }
   });
 
@@ -650,29 +875,60 @@ function wrapWithOriginTooltip(chip: HTMLElement, scopes: Scope[]): HTMLElement 
 
 let ruleOriginPopoverSeq = 0;
 
-// Pinned-popover state. Hover/focus reveals are handled purely in CSS; this
-// state only tracks popovers that the user clicked to keep open.
+// Pinned-popover singleton. Hover/focus reveals are handled purely in CSS;
+// this state only tracks popovers the user clicked to keep open. Shared
+// across every popover kind in the UI (lint badges on rule chips, help
+// tooltips on settings keys, …) so only one ever sits pinned at a time —
+// opening a help tooltip auto-closes a pinned lint badge and vice versa.
 let lintPopoverSeq = 0;
-let openLintWrap: HTMLElement | null = null;
-let lintGlobalListenersAttached = false;
+let openPinnedPopover: HTMLElement | null = null;
+let popoverGlobalListenersAttached = false;
 
-function closeLintPopover(): void {
-  if (!openLintWrap) return;
-  // The wrap may already be detached (e.g. after a renderApp() rebuild);
-  // touching classList is harmless but the state still needs nulling.
-  if (openLintWrap.isConnected) openLintWrap.classList.remove("is-open");
-  openLintWrap = null;
+/**
+ * Pin `wrap` as the currently-open popover, closing whatever else was
+ * pinned. Registers the global click/Escape listeners on first use so
+ * pinning is the only event that has to attach them.
+ */
+function pinPopover(wrap: HTMLElement): void {
+  if (openPinnedPopover && openPinnedPopover !== wrap) closePinnedPopover();
+  wrap.classList.add("is-open");
+  openPinnedPopover = wrap;
+  ensurePopoverGlobalListeners();
 }
 
-function ensureLintGlobalListeners(): void {
-  if (lintGlobalListenersAttached) return;
-  lintGlobalListenersAttached = true;
+function closePinnedPopover(): void {
+  if (!openPinnedPopover) return;
+  // The wrap may already be detached (e.g. after a renderApp() rebuild);
+  // touching classList is harmless but the state still needs nulling.
+  if (openPinnedPopover.isConnected) openPinnedPopover.classList.remove("is-open");
+  openPinnedPopover = null;
+}
+
+/**
+ * Best-effort focus restore when a popover closes via Escape. Each popover
+ * kind owns a different trigger element — lint warns on a `.lint-warn`
+ * button, help tooltips on a `.help-info` button — so we probe a small
+ * known set inside the wrap. Falls through silently when the wrap was
+ * already torn down by a re-render between pin and Escape: focusing a
+ * detached node is a no-op in some browsers and a stray scroll/focus
+ * jump in others.
+ */
+function restorePopoverFocus(wrap: HTMLElement): void {
+  const trigger =
+    wrap.querySelector<HTMLButtonElement>(".lint-warn") ??
+    wrap.querySelector<HTMLButtonElement>(".help-info");
+  if (trigger?.isConnected) trigger.focus();
+}
+
+function ensurePopoverGlobalListeners(): void {
+  if (popoverGlobalListenersAttached) return;
+  popoverGlobalListenersAttached = true;
   document.addEventListener("click", (e) => {
-    if (!openLintWrap) return;
-    if (!openLintWrap.contains(e.target as Node)) closeLintPopover();
+    if (!openPinnedPopover) return;
+    if (!openPinnedPopover.contains(e.target as Node)) closePinnedPopover();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key !== "Escape" || !openLintWrap) return;
+    if (e.key !== "Escape" || !openPinnedPopover) return;
     // Skip if another handler already consumed Escape (e.g. the search
     // input clears its value on Escape and calls preventDefault), so the
     // pinned popover doesn't close as a side-effect.
@@ -680,12 +936,9 @@ function ensureLintGlobalListeners(): void {
     // A visible modal owns Escape — otherwise closing a pinned popover
     // here would consume the keystroke and the dialog would stay open.
     if (document.querySelector(".modal-backdrop")) return;
-    const btn = openLintWrap.querySelector<HTMLButtonElement>(".lint-warn");
-    closeLintPopover();
-    // Skip focus restore if the badge was torn down by a re-render between
-    // pin and Escape — focusing a detached node is a no-op in some
-    // browsers and a stray scroll/focus jump in others.
-    if (btn?.isConnected) btn.focus();
+    const wrap = openPinnedPopover;
+    closePinnedPopover();
+    restorePopoverFocus(wrap);
   });
 }
 
@@ -847,7 +1100,16 @@ function treeBranch(
   if (props && !props.busy && offerMoveAffordance) {
     setupLeafDragSource(name, scope, path);
   }
-  summary.appendChild(name);
+  // Help tooltip (#9) on recognized top-level keys and on permission-kind
+  // branches. Wrap before append so the popover positioning anchor lives
+  // alongside the label rather than getting absorbed by `<summary>`'s
+  // flexbox math.
+  const branchHelp = lookupBranchHelp(path);
+  if (branchHelp) {
+    summary.appendChild(attachHelpTooltip(name, branchHelp));
+  } else {
+    summary.appendChild(name);
+  }
   const peek = document.createElement("span");
   peek.className = "tree-peek";
   peek.textContent = treeBranchPeek(path, value, lowerQuery);
@@ -1328,7 +1590,13 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
   const head = document.createElement("div");
   head.className = "col-head";
   const h = document.createElement("h3");
-  h.textContent = SCOPE_LABELS[view.scope];
+  // Nest the label in a span so the help-tooltip wrap (inline) doesn't
+  // sit directly inside the h3 — the span becomes the popover anchor,
+  // the h3 stays semantically the column heading.
+  const headLabel = document.createElement("span");
+  headLabel.className = "col-head-label";
+  headLabel.textContent = SCOPE_LABELS[view.scope];
+  h.appendChild(attachHelpTooltip(headLabel, lookupScopeHelp(view.scope)));
   head.appendChild(h);
 
   const pathEl = document.createElement("div");
@@ -1950,7 +2218,7 @@ function closeOpenContextMenu(): void {
  */
 function openContextMenu(items: MenuItem[], x: number, y: number, trigger?: HTMLElement): void {
   closeOpenContextMenu();
-  closeLintPopover();
+  closePinnedPopover();
 
   let closed = false;
   const stack: HTMLElement[] = [];

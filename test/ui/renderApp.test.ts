@@ -9,7 +9,11 @@ import type {
 } from "../../src/types.ts";
 import { SEARCH_INPUT_ID } from "../../src/types.ts";
 import {
+  attachHelpTooltip,
   groupByToolPrefix,
+  lookupKeyHelp,
+  lookupKindHelp,
+  lookupScopeHelp,
   openAbout,
   openSettings,
   renderApp,
@@ -204,7 +208,12 @@ describe("renderApp", () => {
       root,
       makeProps({ scopes, preferences: buildPreferences({ visible_scopes: visible }) }),
     );
-    const headings = Array.from(root.querySelectorAll(".col h3")).map((el) => el.textContent);
+    // Each column h3 nests the label inside `.col-head-label` so the
+    // help-tooltip wrap can anchor next to it; querying the label span
+    // directly keeps this assertion robust to those siblings.
+    const headings = Array.from(root.querySelectorAll(".col .col-head-label")).map(
+      (el) => el.textContent,
+    );
     expect(headings).toEqual(["Project"]);
   });
 });
@@ -791,5 +800,159 @@ describe("tool-prefix grouping in the scope tree (#68)", () => {
       from: "project",
       to: "user",
     });
+  });
+});
+
+describe("help tooltips (#9)", () => {
+  let root: HTMLElement;
+
+  beforeEach(() => {
+    // Earlier openSettings/openAbout tests leak their modal keydown
+    // listeners (the `removeEventListener` site uses `{capture: true}`,
+    // the `addEventListener` site doesn't — so the remove silently
+    // mismatches). Each leaked listener calls `preventDefault()` on
+    // Escape, which would set `defaultPrevented=true` and stop our
+    // popover Escape handler. Force a real Escape with cancelable=true
+    // up-front so every leaked modal's `close()` runs and detaches.
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    root = makeRoot();
+  });
+
+  afterEach(() => {
+    clearBody();
+    // Module-level openPinnedPopover state survives across tests; click
+    // somewhere off-popover to release any pin left over from a previous
+    // case. Cheap, makes each test self-contained.
+    document.body.click();
+  });
+
+  it("lookupKeyHelp returns content for recognized keys and null for unknown", () => {
+    expect(lookupKeyHelp("permissions")?.summary).toBeTruthy();
+    expect(lookupKeyHelp("env")?.summary).toBeTruthy();
+    expect(lookupKeyHelp("nonsense-key")).toBeNull();
+  });
+
+  it("attaches a help affordance to recognized top-level settings keys", () => {
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/help-known-key",
+      scopes: [
+        {
+          scope: "project",
+          permissions: { allow: ["Bash(git status)"] },
+          // `env` is a recognized top-level key; the tree should render
+          // its tree-key with the .has-help affordance and a sibling ⓘ.
+          other_values: { env: { FOO: "bar" } },
+        },
+      ],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const envKey = Array.from(root.querySelectorAll<HTMLElement>(".tree-key")).find(
+      (el) => el.textContent === "env",
+    );
+    expect(envKey).toBeDefined();
+    expect(envKey?.classList.contains("has-help")).toBe(true);
+    const wrap = envKey?.parentElement;
+    expect(wrap?.classList.contains("help-wrap")).toBe(true);
+    expect(wrap?.querySelector(".help-info")).not.toBeNull();
+  });
+
+  it("does NOT attach a help affordance to unrecognized top-level keys", () => {
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/help-unknown-key",
+      scopes: [
+        {
+          scope: "project",
+          permissions: { allow: ["Bash(git status)"] },
+          other_values: { someUserKey: "whatever" },
+        },
+      ],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const userKey = Array.from(root.querySelectorAll<HTMLElement>(".tree-key")).find(
+      (el) => el.textContent === "someUserKey",
+    );
+    expect(userKey).toBeDefined();
+    expect(userKey?.classList.contains("has-help")).toBe(false);
+    expect(userKey?.parentElement?.classList.contains("help-wrap")).toBe(false);
+  });
+
+  it("attaches help to combined-panel kind labels (allow / deny / ask)", () => {
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/help-kind-labels",
+      scopes: [
+        {
+          scope: "project",
+          permissions: { allow: ["Bash(ls)"], deny: ["Bash(rm -rf *)"] },
+        },
+      ],
+    });
+    renderApp(root, makeProps({ scopes }));
+    for (const kind of ["allow", "deny", "ask"]) {
+      const label = root.querySelector<HTMLElement>(`.combo-${kind} .combo-label`);
+      expect(label, `combo-label for ${kind}`).not.toBeNull();
+      expect(label?.classList.contains("has-help")).toBe(true);
+    }
+  });
+
+  it("attaches help to scope column headers", () => {
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/help-scope-header",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const projectLabel = Array.from(
+      root.querySelectorAll<HTMLElement>(".col-head-label"),
+    ).find((el) => el.textContent === "Project");
+    expect(projectLabel).toBeDefined();
+    expect(projectLabel?.classList.contains("has-help")).toBe(true);
+    const h3 = projectLabel?.closest("h3");
+    expect(h3?.querySelector(".help-info")).not.toBeNull();
+  });
+
+  it("clicking the ⓘ glyph pins the popover; clicking outside closes it", () => {
+    const trigger = document.createElement("span");
+    trigger.textContent = "permissions";
+    document.body.appendChild(attachHelpTooltip(trigger, lookupKindHelp("allow")));
+    const wrap = trigger.parentElement;
+    expect(wrap?.classList.contains("is-open")).toBe(false);
+    const btn = wrap?.querySelector<HTMLButtonElement>(".help-info");
+    if (!btn) throw new Error("expected help-info button");
+    btn.click();
+    expect(wrap?.classList.contains("is-open")).toBe(true);
+    document.body.click();
+    expect(wrap?.classList.contains("is-open")).toBe(false);
+  });
+
+  it("Escape on a pinned help popover closes it", () => {
+    const trigger = document.createElement("span");
+    trigger.textContent = "env";
+    document.body.appendChild(attachHelpTooltip(trigger, lookupScopeHelp("project")));
+    const wrap = trigger.parentElement;
+    const btn = wrap?.querySelector<HTMLButtonElement>(".help-info");
+    btn?.click();
+    expect(wrap?.classList.contains("is-open")).toBe(true);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(wrap?.classList.contains("is-open")).toBe(false);
+  });
+
+  it("opening a second help popover closes the first — singleton pin across instances", () => {
+    const a = document.createElement("span");
+    a.textContent = "a";
+    document.body.appendChild(attachHelpTooltip(a, lookupKindHelp("allow")));
+    const b = document.createElement("span");
+    b.textContent = "b";
+    document.body.appendChild(attachHelpTooltip(b, lookupKindHelp("deny")));
+    const wrapA = a.parentElement;
+    const wrapB = b.parentElement;
+
+    wrapA?.querySelector<HTMLButtonElement>(".help-info")?.click();
+    expect(wrapA?.classList.contains("is-open")).toBe(true);
+    expect(wrapB?.classList.contains("is-open")).toBe(false);
+
+    wrapB?.querySelector<HTMLButtonElement>(".help-info")?.click();
+    expect(wrapA?.classList.contains("is-open")).toBe(false);
+    expect(wrapB?.classList.contains("is-open")).toBe(true);
   });
 });
