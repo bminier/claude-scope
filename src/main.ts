@@ -6,6 +6,7 @@ import "./styles.css";
 import type {
   AddLeafPreview,
   AddLeafRequest,
+  AppInfo,
   DeleteLeafPreview,
   DeleteLeafRequest,
   KnownProject,
@@ -25,6 +26,7 @@ import {
   confirmAddLeaf,
   confirmDeleteLeaf,
   confirmMoveLeaf,
+  openAbout,
   openSettings,
   renderApp,
 } from "./ui.ts";
@@ -46,6 +48,7 @@ const state: {
   preferences: Preferences;
   runtime: RuntimeInfo;
   knownProjects: KnownProject[];
+  appInfo: AppInfo | null;
 } = {
   scopes: null,
   projectDir: null,
@@ -60,6 +63,10 @@ const state: {
   // user picks a new project (#106). Defaults to empty so the Move-to
   // submenu degrades gracefully before the IPC resolves.
   knownProjects: [],
+  // Populated once at bootstrap by `get_app_info` (#21). Stays null on
+  // discovery failure; `openAbout` renders a Loading… stub in that case
+  // rather than treating it as an error.
+  appInfo: null,
 };
 
 // Set by the scopes-changed listener when it fires while another load or
@@ -413,8 +420,13 @@ function render(): void {
     onDeleteLeaf: deleteLeaf,
     onAddLeaf: addLeaf,
     onOpenSettings,
+    onOpenAbout: handleOpenAbout,
     onQueryChange: setQuery,
   });
+}
+
+function handleOpenAbout(trigger?: HTMLElement): void {
+  openAbout(state.appInfo, trigger ?? null);
 }
 
 // Pressing "/" anywhere focuses the rule-search input, GitHub / Gmail style —
@@ -476,9 +488,10 @@ async function bootstrap(): Promise<void> {
   // initial render applies them (column visibility, sandbox banner)
   // instead of flashing defaults first and then switching. Both calls are
   // independent — fire them in parallel and tolerate either failing.
-  const [prefsResult, runtimeResult] = await Promise.allSettled([
+  const [prefsResult, runtimeResult, appInfoResult] = await Promise.allSettled([
     invoke<Preferences>("load_preferences"),
     invoke<RuntimeInfo>("load_runtime_info"),
+    invoke<AppInfo>("get_app_info"),
   ]);
   if (prefsResult.status === "fulfilled") {
     state.preferences = prefsResult.value;
@@ -494,6 +507,12 @@ async function bootstrap(): Promise<void> {
     state.runtime = runtimeResult.value;
   } else {
     console.warn("failed to load runtime info:", runtimeResult.reason);
+  }
+  if (appInfoResult.status === "fulfilled") {
+    state.appInfo = appInfoResult.value;
+  } else {
+    // Non-fatal — About dialog will render "Loading…" instead.
+    console.warn("failed to load app info:", appInfoResult.reason);
   }
   await load(null);
 }

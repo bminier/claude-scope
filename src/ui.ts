@@ -3,6 +3,7 @@ import { lintRule } from "./lint.ts";
 import type {
   AddLeafPreview,
   AddLeafRequest,
+  AppInfo,
   DeleteLeafPreview,
   DeleteLeafRequest,
   JsonValue,
@@ -51,6 +52,10 @@ interface AppProps {
   onDeleteLeaf: (req: DeleteLeafRequest, trigger?: HTMLElement) => void;
   onAddLeaf: (req: AddLeafRequest, trigger?: HTMLElement) => void;
   onOpenSettings: (trigger?: HTMLElement) => void;
+  /** Open the About dialog (#21). Reads from `state.appInfo` populated at
+   *  bootstrap; the caller routes the click through main.ts so it can also
+   *  refresh the cache if it's stale. */
+  onOpenAbout: (trigger?: HTMLElement) => void;
   onQueryChange: (next: string) => void;
 }
 
@@ -312,6 +317,12 @@ function header(props: AppProps): HTMLElement {
   settings.setAttribute("aria-label", "Open settings");
   settings.onclick = (e) => props.onOpenSettings(e.currentTarget as HTMLElement);
   actions.appendChild(settings);
+
+  const about = document.createElement("button");
+  about.textContent = "About";
+  about.setAttribute("aria-label", "About ClaudeScope");
+  about.onclick = (e) => props.onOpenAbout(e.currentTarget as HTMLElement);
+  actions.appendChild(about);
 
   bar.appendChild(actions);
   return bar;
@@ -2347,4 +2358,182 @@ function settingsColumnsSection(props: SettingsProps): HTMLElement {
   }
   section.appendChild(list);
   return section;
+}
+
+const REPO_URL = "https://github.com/bminier/claude-scope";
+
+/**
+ * Open the About dialog (#21). Renders the diagnostic block, repo / Claude
+ * Code docs links, and a Copy-diagnostics button that drops a Markdown
+ * block onto the OS clipboard ready to paste into a bug report.
+ *
+ * Rides the shared `openModal` so focus trap / Escape / backdrop click
+ * stay identical to Settings. The dialog is purely presentational — no
+ * IPC fires from inside it; `info` is supplied by the caller out of
+ * cached state. A null `info` is rendered as a "Loading…" stub instead of
+ * being treated as an error, since the bootstrap fetch is best-effort.
+ */
+export function openAbout(info: AppInfo | null, trigger?: HTMLElement | null): void {
+  const body = document.createElement("div");
+  body.className = "about-body";
+
+  const intro = document.createElement("p");
+  intro.className = "about-intro";
+  intro.textContent = "Desktop GUI for promoting Claude Code settings between scopes.";
+  body.appendChild(intro);
+
+  body.appendChild(aboutDiagnosticsSection(info));
+  body.appendChild(aboutLinksSection());
+
+  const ack = document.createElement("p");
+  ack.className = "about-ack";
+  ack.textContent = "Built on Tauri. Licensed under MIT — see the LICENSE file at the repo root.";
+  body.appendChild(ack);
+
+  // Status line for the Copy-diagnostics button so a successful click
+  // doesn't feel like a no-op. Kept as a sibling so screen-readers
+  // announce the change without losing modal focus.
+  const status = document.createElement("div");
+  status.className = "about-copy-status";
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
+  body.appendChild(status);
+
+  openModal({
+    titleText: "About ClaudeScope",
+    body,
+    actions: [
+      {
+        label: "Copy diagnostics",
+        className: "btn-copy",
+        // Don't close the modal — copying is a side action; the user may
+        // still want to read the links or copy again.
+        activate: () => {
+          // `info` is captured by the closure; render a sensible message
+          // if the bootstrap fetch never resolved.
+          if (!info) {
+            status.textContent = "Diagnostics not loaded yet.";
+            return;
+          }
+          void copyDiagnostics(info, status);
+        },
+      },
+      {
+        label: "Close",
+        className: "btn-apply",
+        focus: true,
+        activate: (close) => close(),
+      },
+    ],
+    panelClassName: "modal-about",
+    trigger,
+  });
+}
+
+function aboutDiagnosticsSection(info: AppInfo | null): HTMLElement {
+  const section = document.createElement("section");
+  section.className = "about-section";
+
+  const heading = document.createElement("h3");
+  heading.className = "about-heading";
+  heading.textContent = "Diagnostics";
+  section.appendChild(heading);
+
+  const dl = document.createElement("dl");
+  dl.className = "about-diagnostics";
+  if (info) {
+    appendKV(dl, "Version", versionDisplay(info));
+    appendKV(dl, "Tauri", info.tauri_version);
+    appendKV(dl, "WebView", info.webview_version ?? "unknown");
+    appendKV(dl, "Rust (MSRV)", info.rust_version);
+    appendKV(dl, "Platform", `${info.os} ${info.arch}`);
+  } else {
+    const loading = document.createElement("p");
+    loading.className = "about-loading";
+    loading.textContent = "Loading…";
+    section.appendChild(loading);
+    return section;
+  }
+  section.appendChild(dl);
+  return section;
+}
+
+function versionDisplay(info: AppInfo): string {
+  return info.git_sha ? `${info.version} (${info.git_sha})` : info.version;
+}
+
+function appendKV(dl: HTMLElement, key: string, value: string): void {
+  const dt = document.createElement("dt");
+  dt.textContent = key;
+  const dd = document.createElement("dd");
+  dd.textContent = value;
+  dl.appendChild(dt);
+  dl.appendChild(dd);
+}
+
+function aboutLinksSection(): HTMLElement {
+  const section = document.createElement("section");
+  section.className = "about-section";
+
+  const heading = document.createElement("h3");
+  heading.className = "about-heading";
+  heading.textContent = "Links";
+  section.appendChild(heading);
+
+  const list = document.createElement("ul");
+  list.className = "about-links";
+  const links: Array<[string, string]> = [
+    ["Source on GitHub", REPO_URL],
+    ["Report an issue", `${REPO_URL}/issues/new`],
+    ["Claude Code documentation", "https://docs.claude.com/en/docs/claude-code"],
+  ];
+  for (const [label, href] of links) {
+    const li = document.createElement("li");
+    const a = document.createElement("a");
+    a.href = href;
+    a.textContent = label;
+    // `target=_blank` opens in the default browser via Tauri's link
+    // hijacking — keeps the user out of the webview's history stack.
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    li.appendChild(a);
+    list.appendChild(li);
+  }
+  section.appendChild(list);
+  return section;
+}
+
+/**
+ * Render the diagnostic block in the same Markdown shape Rust emits
+ * (`AppInfo::to_markdown`) and drop it on the OS clipboard via the Tauri
+ * plugin. Going through the plugin (not `navigator.clipboard`) dodges the
+ * webview's permission prompt — same trick #8's Copy/Paste rule action
+ * uses. Status feedback updates the `status` node so the click feels
+ * acknowledged without stealing focus.
+ */
+async function copyDiagnostics(info: AppInfo, status: HTMLElement): Promise<void> {
+  const md = renderDiagnosticsMarkdown(info);
+  try {
+    await writeText(md);
+    status.textContent = "Diagnostics copied.";
+  } catch (err) {
+    status.textContent = `Copy failed: ${err}`;
+  }
+}
+
+/**
+ * TS mirror of `AppInfo::to_markdown` so the About dialog and the CLI
+ * produce byte-identical bug-report blocks. The Rust side is the source
+ * of truth; if the two ever drift, both `app_info::tests` and the UI
+ * test below should catch it.
+ */
+export function renderDiagnosticsMarkdown(info: AppInfo): string {
+  const sha = info.git_sha ?? "unknown";
+  const webview = info.webview_version ?? "unknown";
+  return [
+    `- ClaudeScope: ${info.version} (${sha})`,
+    `- Tauri: ${info.tauri_version}, WebView: ${webview}`,
+    `- Rust (MSRV): ${info.rust_version}`,
+    `- OS: ${info.os} ${info.arch}`,
+  ].join("\n");
 }

@@ -197,3 +197,20 @@ export interface KnownProject {
   name: string;
   root: string;
 }
+
+/**
+ * Build- and runtime-time diagnostic block surfaced by the About dialog
+ * (#21). Mirrors Rust's `AppInfo` in `src-tauri/src/app_info.rs`. Optional
+ * fields are absent (not present-but-empty) when the build couldn't
+ * capture them — the dialog formats those as "unknown" so a pasted
+ * bug-report block has a stable shape.
+ */
+export interface AppInfo {
+  version: string;
+  git_sha: string | null;
+  tauri_version: string;
+  webview_version: string | null;
+  rust_version: string;
+  os: string;
+  arch: string;
+}
