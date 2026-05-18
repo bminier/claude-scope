@@ -490,6 +490,7 @@ describe("openSettings – theme radios", () => {
       preferences: buildPreferences({ theme }),
       onToggleScopeVisibility: vi.fn(),
       onChangeTheme,
+      onToggleBackupOnWrite: vi.fn(),
     };
   }
 
@@ -533,5 +534,49 @@ describe("openSettings – theme radios", () => {
     expect(group).not.toBeNull();
     const heading = document.getElementById("settings-theme-heading");
     expect(heading?.textContent).toBe("Theme");
+  });
+});
+
+describe("openSettings – backup toggle (#88)", () => {
+  afterEach(() => {
+    clearBody();
+  });
+
+  function backupCheckbox(): HTMLInputElement {
+    const heading = document.getElementById("settings-backup-heading");
+    if (!heading) throw new Error("expected backup section heading");
+    const section = heading.parentElement;
+    if (!section) throw new Error("expected backup section parent");
+    const cb = section.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    if (!cb) throw new Error("expected backup checkbox");
+    return cb;
+  }
+
+  it("reflects the current preference value on render", () => {
+    for (const enabled of [true, false]) {
+      clearBody();
+      openSettings({
+        preferences: buildPreferences({ backup_on_write: enabled }),
+        onToggleScopeVisibility: vi.fn(),
+        onChangeTheme: vi.fn(),
+        onToggleBackupOnWrite: vi.fn(),
+      });
+      expect(backupCheckbox().checked).toBe(enabled);
+    }
+  });
+
+  it("calls onToggleBackupOnWrite with the new value when the checkbox is changed", () => {
+    const onToggleBackupOnWrite = vi.fn();
+    openSettings({
+      preferences: buildPreferences({ backup_on_write: true }),
+      onToggleScopeVisibility: vi.fn(),
+      onChangeTheme: vi.fn(),
+      onToggleBackupOnWrite,
+    });
+    const cb = backupCheckbox();
+    cb.checked = false;
+    cb.dispatchEvent(new Event("change"));
+    expect(onToggleBackupOnWrite).toHaveBeenCalledTimes(1);
+    expect(onToggleBackupOnWrite).toHaveBeenCalledWith(false);
   });
 });

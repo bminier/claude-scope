@@ -2226,6 +2226,10 @@ interface SettingsProps {
   preferences: Preferences;
   onToggleScopeVisibility: (scope: Scope, visible: boolean) => void;
   onChangeTheme: (theme: Theme) => void;
+  /** Toggle `.bak` creation on writes (#88). Same persist-on-click model
+   *  as the other settings — the new pref hits the backend immediately so
+   *  the very next move respects it without a dialog round-trip. */
+  onToggleBackupOnWrite: (enabled: boolean) => void;
 }
 
 const THEME_OPTIONS: ReadonlyArray<{ value: Theme; label: string }> = [
@@ -2250,6 +2254,7 @@ export function openSettings(props: SettingsProps, trigger?: HTMLElement | null)
   const body = document.createElement("div");
   body.appendChild(settingsThemeSection(props));
   body.appendChild(settingsColumnsSection(props));
+  body.appendChild(settingsBackupSection(props));
 
   openModal({
     titleText: "Settings",
@@ -2356,6 +2361,48 @@ function settingsColumnsSection(props: SettingsProps): HTMLElement {
     row.appendChild(label);
     list.appendChild(row);
   }
+  section.appendChild(list);
+  return section;
+}
+
+/**
+ * Backup toggle section in the Settings dialog (#88). One checkbox,
+ * persisted on click via the same `onToggleBackupOnWrite` callback the
+ * other settings rows use. The hint copy spells out *why* the safety
+ * exists so a user who's about to flip it sees the trade-off before
+ * removing the net — recoverability from a misclicked move.
+ */
+function settingsBackupSection(props: SettingsProps): HTMLElement {
+  const section = document.createElement("section");
+  section.className = "settings-section";
+
+  const heading = document.createElement("h3");
+  heading.id = "settings-backup-heading";
+  heading.className = "settings-heading";
+  heading.textContent = "Backups";
+  section.appendChild(heading);
+
+  const hint = document.createElement("p");
+  hint.className = "settings-hint";
+  hint.textContent =
+    "On the first write of each session, ClaudeScope can drop a `.bak` next to each settings file. Disable if your `.claude/` directory is version-controlled or you don't want the extra files.";
+  section.appendChild(hint);
+
+  const list = document.createElement("div");
+  list.className = "settings-checklist";
+  const row = document.createElement("label");
+  row.className = "settings-check";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = props.preferences.backup_on_write;
+  cb.addEventListener("change", () => {
+    props.onToggleBackupOnWrite(cb.checked);
+  });
+  row.appendChild(cb);
+  const label = document.createElement("span");
+  label.textContent = "Create `.bak` files on save";
+  row.appendChild(label);
+  list.appendChild(row);
   section.appendChild(list);
   return section;
 }
