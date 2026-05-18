@@ -349,3 +349,47 @@ fn list_projects_hides_stale_roots_with_no_dot_claude() {
         "stale root should be filtered out: {s}"
     );
 }
+
+#[test]
+fn version_subcommand_prints_diagnostic_block() {
+    // No sandbox needed — `version` doesn't touch any files, so it runs
+    // outside the Sandbox's `--project-dir` / `--home-dir` plumbing.
+    let out = Command::new(BIN)
+        .arg("version")
+        .output()
+        .expect("failed to execute claude-scope-cli");
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let s = stdout(&out);
+    // Every line of `AppInfo::to_markdown` should appear in stdout.
+    assert!(s.contains("ClaudeScope:"));
+    assert!(s.contains("Tauri:"));
+    assert!(s.contains("Rust (MSRV):"));
+    assert!(s.contains("OS:"));
+    // CLI has no webview → renders as the explicit `unknown` sentinel.
+    assert!(s.contains("WebView: unknown"));
+}
+
+#[test]
+fn version_subcommand_json_shape_is_stable() {
+    let out = Command::new(BIN)
+        .args(["version", "--json"])
+        .output()
+        .expect("failed to execute claude-scope-cli");
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("non-json stdout");
+    // Every required key appears. Assert presence (not exact values) so the
+    // test survives release-please bumps and platform differences.
+    for key in [
+        "version",
+        "git_sha",
+        "tauri_version",
+        "webview_version",
+        "rust_version",
+        "os",
+        "arch",
+    ] {
+        assert!(v.get(key).is_some(), "missing key `{key}` in: {v}");
+    }
+    // CLI process: `webview_version` must be null, not a fabricated string.
+    assert!(v["webview_version"].is_null());
+}

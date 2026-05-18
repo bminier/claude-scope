@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use claude_scope_lib::app_info::AppInfo;
 use claude_scope_lib::commands::{
     apply_move_leaf_impl, build_loaded, diff_move_leaf_impl, MoveLeafPreview, MoveLeafRequest,
 };
@@ -86,6 +87,15 @@ enum Command {
     /// `~/.claude/projects/` transcript registry (#106).
     ListProjects {
         /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print the same diagnostic block the GUI's About dialog shows (#21).
+    /// Useful for bug reports: paste the output into the issue. `--version`
+    /// (clap-builtin) still prints just the version line.
+    Version {
+        /// Emit machine-readable JSON instead of the Markdown block.
         #[arg(long)]
         json: bool,
     },
@@ -182,6 +192,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Command::ListProjects { json } = cli.command {
         return cmd_list_projects(cli.home_dir.as_deref(), json);
     }
+    // `version` doesn't read any files either — same dispatch-early reason.
+    // A user pasting `claude-scope-cli version` from `/tmp` for a bug report
+    // shouldn't error on missing settings.
+    if let Command::Version { json } = cli.command {
+        return cmd_version(json);
+    }
 
     let paths = resolve_paths(cli.project_dir.as_deref(), cli.home_dir.as_deref())?;
     match cli.command {
@@ -193,6 +209,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => cmd_show(&paths, scope, effective, json),
         Command::ListRules { scope, kind, json } => cmd_list_rules(&paths, scope, kind, json),
         Command::ListProjects { .. } => unreachable!("handled above"),
+        Command::Version { .. } => unreachable!("handled above"),
         Command::Move {
             rule,
             kind,
@@ -455,6 +472,19 @@ fn cmd_list_projects(
         for p in &entries {
             println!("{}\t{}", p.name, p.root.display());
         }
+    }
+    Ok(())
+}
+
+fn cmd_version(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // No webview in the CLI process — `AppInfo::to_markdown()` will render
+    // the field as `unknown`, which is the right answer rather than a
+    // misleading "0.0.0".
+    let info = AppInfo::build(None);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&info)?);
+    } else {
+        println!("{}", info.to_markdown());
     }
     Ok(())
 }
