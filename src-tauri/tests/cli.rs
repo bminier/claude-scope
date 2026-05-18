@@ -54,6 +54,23 @@ impl Sandbox {
         std::fs::read_to_string(self.home.join(".claude").join("settings.json")).unwrap()
     }
 
+    /// Seed a fake `~/.claude/projects/<encoded>/<session>.jsonl` referencing
+    /// `cwd_root`. The created root has a `.claude/` directory so it passes
+    /// the loadability filter in `projects::list_known_projects`.
+    fn seed_known_project(&self, encoded: &str, name: &str) -> PathBuf {
+        let cwd = self._tmp.path().join(name);
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        let dir = self.home.join(".claude").join("projects").join(encoded);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd_str = cwd.to_string_lossy().replace('\\', "\\\\");
+        std::fs::write(
+            dir.join("0001-session.jsonl"),
+            format!(r#"{{"sessionId":"s","cwd":"{cwd_str}"}}"#),
+        )
+        .unwrap();
+        cwd
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         Command::new(BIN)
             .args([
@@ -263,4 +280,72 @@ fn version_flag_prints_crate_version() {
     // version-shaped trailer.
     assert!(s.starts_with("claude-scope-cli "));
     assert!(s.split_whitespace().nth(1).is_some());
+}
+
+#[test]
+fn list_projects_reports_empty_when_registry_missing() {
+    let sb = Sandbox::new();
+    // No `~/.claude/projects/` exists in the sandbox home.
+    let out = sb.run(&["list-projects"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("(no Claude projects discovered)"));
+}
+
+#[test]
+fn list_projects_lists_seeded_projects_sorted() {
+    let sb = Sandbox::new();
+    sb.seed_known_project("D--gamma", "gamma");
+    sb.seed_known_project("D--alpha", "alpha");
+    sb.seed_known_project("D--Beta", "Beta");
+
+    let out = sb.run(&["list-projects"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let s = stdout(&out);
+    // Each line: "<name>\t<root>". Pull names in output order and assert
+    // alphabetical (case-insensitive).
+    let names: Vec<&str> = s
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.split('\t').next())
+        .collect();
+    assert_eq!(names, vec!["alpha", "Beta", "gamma"]);
+}
+
+#[test]
+fn list_projects_json_shape_is_stable() {
+    let sb = Sandbox::new();
+    sb.seed_known_project("D--alpha", "alpha");
+
+    let out = sb.run(&["list-projects", "--json"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("non-json stdout");
+    let arr = v["projects"].as_array().expect("projects array missing");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "alpha");
+    assert!(arr[0]["root"].as_str().unwrap().ends_with("alpha"));
+}
+
+#[test]
+fn list_projects_hides_stale_roots_with_no_dot_claude() {
+    let sb = Sandbox::new();
+    // Seed a transcript that points at a path with no `.claude/` —
+    // simulating a project that was deleted or never had Claude state.
+    let bogus = sb._tmp.path().join("stale-root");
+    std::fs::create_dir_all(&bogus).unwrap();
+    let dir = sb.home.join(".claude").join("projects").join("D--stale");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cwd_str = bogus.to_string_lossy().replace('\\', "\\\\");
+    std::fs::write(dir.join("0001.jsonl"), format!(r#"{{"cwd":"{cwd_str}"}}"#)).unwrap();
+    // And a real one alongside so the test asserts filtering, not just
+    // emptiness.
+    sb.seed_known_project("D--real", "real");
+
+    let out = sb.run(&["list-projects"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let s = stdout(&out);
+    assert!(s.contains("real"), "expected loadable project in output");
+    assert!(
+        !s.contains("stale-root"),
+        "stale root should be filtered out: {s}"
+    );
 }
