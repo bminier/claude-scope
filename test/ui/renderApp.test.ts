@@ -8,7 +8,13 @@ import type {
   Theme,
 } from "../../src/types.ts";
 import { SEARCH_INPUT_ID } from "../../src/types.ts";
-import { openAbout, openSettings, renderApp, renderDiagnosticsMarkdown } from "../../src/ui.ts";
+import {
+  groupByToolPrefix,
+  openAbout,
+  openSettings,
+  renderApp,
+  renderDiagnosticsMarkdown,
+} from "../../src/ui.ts";
 import { buildLoadedScopes, buildPreferences, buildRuntimeInfo } from "../fixtures/loadedScopes.ts";
 
 // `openAbout` calls into the Tauri clipboard plugin, which probes the IPC
@@ -578,5 +584,212 @@ describe("openSettings – backup toggle (#88)", () => {
     cb.dispatchEvent(new Event("change"));
     expect(onToggleBackupOnWrite).toHaveBeenCalledTimes(1);
     expect(onToggleBackupOnWrite).toHaveBeenCalledWith(false);
+  });
+});
+
+describe("groupByToolPrefix (#68)", () => {
+  it("folds 2+ rules sharing a tool into a group", () => {
+    const got = groupByToolPrefix(["handoff(copilot *)", "handoff(claude *)", "handoff(codex *)"]);
+    expect(got).toHaveLength(1);
+    expect(got[0]).toEqual({
+      kind: "group",
+      tool: "handoff",
+      members: [
+        { index: 0, rule: "handoff(copilot *)" },
+        { index: 1, rule: "handoff(claude *)" },
+        { index: 2, rule: "handoff(codex *)" },
+      ],
+    });
+  });
+
+  it("emits a single-rule tool as a Single, not a one-child group", () => {
+    const got = groupByToolPrefix(["Read(**)"]);
+    expect(got).toEqual([{ kind: "single", index: 0, rule: "Read(**)" }]);
+  });
+
+  it("preserves original disk order: group emits at the position of its first member", () => {
+    // Read sits between Bash[0] and Bash[2]. The Bash group should emit at
+    // position 0 (Bash's first member), and Read should still be reachable
+    // — Bash[2] gets absorbed silently into the group rather than re-
+    // emitting at index 2.
+    const got = groupByToolPrefix(["Bash(ls)", "Read(**)", "Bash(grep)"]);
+    expect(got.length).toBe(2);
+    expect(got[0]).toMatchObject({ kind: "group", tool: "Bash" });
+    expect(got[1]).toEqual({ kind: "single", index: 1, rule: "Read(**)" });
+    if (got[0].kind !== "group") throw new Error("expected group");
+    expect(got[0].members.map((m) => m.index)).toEqual([0, 2]);
+  });
+
+  it("rules without a Tool(args) shape stay flat", () => {
+    // No paren → no tool prefix → never grouped. Two malformed rules don't
+    // get folded together as an empty-tool group.
+    const got = groupByToolPrefix(["weird-rule-no-parens", "another-weirdo"]);
+    expect(got).toEqual([
+      { kind: "single", index: 0, rule: "weird-rule-no-parens" },
+      { kind: "single", index: 1, rule: "another-weirdo" },
+    ]);
+  });
+
+  it("threshold parameter controls when a tool folds", () => {
+    const rules = ["Bash(ls)", "Bash(grep)"];
+    expect(groupByToolPrefix(rules, 2)[0].kind).toBe("group");
+    // Two rules, threshold 3 → stays flat.
+    const at3 = groupByToolPrefix(rules, 3);
+    expect(at3.every((e) => e.kind === "single")).toBe(true);
+  });
+
+  it("Tool() with empty args still groups by the Tool prefix", () => {
+    const got = groupByToolPrefix(["WebFetch()", "WebFetch(domain:example.com)"]);
+    expect(got).toHaveLength(1);
+    expect(got[0]).toMatchObject({ kind: "group", tool: "WebFetch" });
+  });
+});
+
+describe("tool-prefix grouping in the scope tree (#68)", () => {
+  let root: HTMLElement;
+
+  beforeEach(() => {
+    root = makeRoot();
+  });
+
+  afterEach(() => {
+    clearBody();
+  });
+
+  it("renders a synthetic group node when 2+ rules share a tool", () => {
+    // Unique project_dir per test so `seedDefaultOpenPermissions` re-runs
+    // against this scenario's rules instead of inheriting `openTreeNodes`
+    // state from an earlier describe block that didn't include groups.
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/grouping-render",
+      scopes: [
+        {
+          scope: "project",
+          permissions: {
+            allow: ["handoff(copilot *)", "handoff(claude *)", "handoff(codex *)"],
+          },
+        },
+      ],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const groups = root.querySelectorAll<HTMLDetailsElement>(".tree-tool-group");
+    expect(groups.length).toBe(1);
+    const summary = groups[0].querySelector(".tree-summary");
+    expect(summary?.textContent).toContain("handoff");
+    expect(summary?.textContent).toContain("(3)");
+    // Three rule rows nested inside the group, addressed by their original
+    // indices on disk — paths stay leaf-level for the move primitive.
+    const rules = groups[0].querySelectorAll<HTMLElement>(".rule.rule-allow");
+    expect(rules.length).toBe(3);
+    const ruleTexts = Array.from(rules).map((r) => r.querySelector(".rule-text")?.textContent);
+    expect(ruleTexts).toEqual(["handoff(copilot *)", "handoff(claude *)", "handoff(codex *)"]);
+  });
+
+  it("leaves a single-rule tool as a flat leaf alongside a multi-rule group", () => {
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/grouping-mixed",
+      scopes: [
+        {
+          scope: "project",
+          permissions: {
+            allow: ["Bash(ls)", "Read(**)", "Bash(grep)"],
+          },
+        },
+      ],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const groups = root.querySelectorAll<HTMLDetailsElement>(".tree-tool-group");
+    // Only Bash collapses; Read stays a top-level leaf.
+    expect(groups.length).toBe(1);
+    expect(groups[0].querySelector(".tree-summary")?.textContent).toContain("Bash");
+    // The kind branch should still hold a direct leaf for Read at its
+    // original index, plus the group node for Bash. Picking the kind
+    // branch by class instead of by structural index keeps the assertion
+    // resilient to future seeding changes.
+    const kindBranch = root.querySelector<HTMLDetailsElement>(".tree-branch.tree-perm-allow");
+    if (!kindBranch) throw new Error("expected permissions.allow branch");
+    const directChildren = kindBranch.querySelector(".tree-children");
+    if (!directChildren) throw new Error("expected children container");
+    // First-level children: 1 group + 1 leaf (Read). The group's *own*
+    // children are deeper and don't count here.
+    const topLevel = Array.from(directChildren.children).filter(
+      (el) =>
+        el.classList.contains("tree-tool-group") ||
+        (el.classList.contains("rule") && el.classList.contains("rule-allow")),
+    );
+    expect(topLevel.length).toBe(2);
+    const readLeaf = topLevel.find(
+      (el) =>
+        el.classList.contains("rule") && el.querySelector(".rule-text")?.textContent === "Read(**)",
+    );
+    expect(readLeaf).toBeDefined();
+  });
+
+  it("filtering hides non-matching members and shows matched/total in the group label", () => {
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/grouping-filter",
+      scopes: [
+        {
+          scope: "project",
+          permissions: {
+            allow: ["handoff(copilot *)", "handoff(claude *)", "handoff(codex *)"],
+          },
+        },
+      ],
+    });
+    renderApp(root, makeProps({ scopes, query: "copilot" }));
+    const groups = root.querySelectorAll<HTMLDetailsElement>(".tree-tool-group");
+    expect(groups.length).toBe(1);
+    const summary = groups[0].querySelector(".tree-summary");
+    // Matched count first, total second — same shape the combined panel
+    // uses for kind labels under an active filter.
+    expect(summary?.textContent).toContain("(1/3)");
+    // Only the matching rule renders inside the group.
+    const rules = groups[0].querySelectorAll<HTMLElement>(".rule.rule-allow");
+    const visibleRules = Array.from(rules).filter((r) => !r.hidden);
+    expect(visibleRules.length).toBe(1);
+    expect(visibleRules[0].querySelector(".rule-text")?.textContent).toBe("handoff(copilot *)");
+  });
+
+  it("group members keep leaf-level paths so move buttons still address the rule directly", () => {
+    const onMoveLeaf = vi.fn();
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/grouping-move",
+      scopes: [
+        {
+          scope: "project",
+          permissions: { allow: ["Bash(ls)", "Bash(grep)"] },
+        },
+      ],
+    });
+    renderApp(root, makeProps({ scopes, onMoveLeaf }));
+    // Inside the Bash group: click the second member's "→ User" button and
+    // assert the dispatched path is `permissions.allow[1]`, not anything
+    // group-relative.
+    const group = root.querySelector<HTMLDetailsElement>(".tree-tool-group");
+    if (!group) throw new Error("expected tool group");
+    const memberRows = group.querySelectorAll<HTMLElement>(".rule.rule-allow");
+    expect(memberRows.length).toBe(2);
+    const toUser = memberRows[1].querySelector<HTMLButtonElement>(".rule-moves .move-btn");
+    if (!toUser || toUser.textContent !== "→ User") {
+      // The first matching scope target may differ depending on default
+      // visibility; fall back to searching by label across all buttons in
+      // the row.
+      const buttons = Array.from(
+        memberRows[1].querySelectorAll<HTMLButtonElement>(".rule-moves .move-btn"),
+      );
+      const fallback = buttons.find((b) => b.textContent === "→ User");
+      if (!fallback) throw new Error("expected → User button");
+      fallback.click();
+    } else {
+      toUser.click();
+    }
+    expect(onMoveLeaf).toHaveBeenCalledTimes(1);
+    const [req] = onMoveLeaf.mock.calls[0];
+    expect(req).toEqual({
+      path: ["permissions", "allow", 1],
+      from: "project",
+      to: "user",
+    });
   });
 });
