@@ -26,6 +26,22 @@ fn backups() -> &'static BackupTracker {
     BACKUPS.get_or_init(BackupTracker::new)
 }
 
+/// Resolve which backup-tracker (if any) a write command should pass into
+/// the impl. Reads `Preferences::backup_on_write` on every call so a
+/// toggle in the Settings dialog takes effect on the very next write
+/// without needing a restart or in-memory cache invalidation. Read costs
+/// one small JSON parse; negligible against the rest of the write path.
+/// Defaults to `Some(backups())` when the preferences file is missing or
+/// malformed — the load helper itself collapses to defaults in that
+/// case (#88).
+fn backups_for_session() -> Option<&'static BackupTracker> {
+    if preferences::load().backup_on_write {
+        Some(backups())
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ScopeView {
     pub scope: Scope,
@@ -241,7 +257,7 @@ pub fn apply_move_leaf(
 ) -> Result<(), String> {
     let paths =
         resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
-    apply_move_leaf_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
+    apply_move_leaf_impl(&paths, &req, backups_for_session(), &watch).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -264,7 +280,7 @@ pub fn apply_delete_leaf(
 ) -> Result<(), String> {
     let paths =
         resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
-    apply_delete_leaf_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
+    apply_delete_leaf_impl(&paths, &req, backups_for_session(), &watch).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -287,7 +303,7 @@ pub fn apply_add_leaf(
 ) -> Result<(), String> {
     let paths =
         resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
-    apply_add_leaf_impl(&paths, &req, backups(), &watch).map_err(|e| e.to_string())
+    apply_add_leaf_impl(&paths, &req, backups_for_session(), &watch).map_err(|e| e.to_string())
 }
 
 /// Snapshot of the launch-time overrides — the front-end uses this to
@@ -791,7 +807,7 @@ fn diff_change_kind_same_scope(
 pub fn apply_move_leaf_impl(
     paths: &ScopePaths,
     req: &MoveLeafRequest,
-    backups: &BackupTracker,
+    backups: Option<&BackupTracker>,
     watch: &WatchState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let movable = validate_movable_path(&req.path)?;
@@ -900,7 +916,7 @@ fn apply_change_kind_same_scope(
     paths: &ScopePaths,
     req: &MoveLeafRequest,
     movable: &MovablePath<'_>,
-    backups: &BackupTracker,
+    backups: Option<&BackupTracker>,
     watch: &WatchState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = require_path(paths, req.from)?.to_path_buf();
@@ -1014,7 +1030,7 @@ fn diff_delete_leaf_impl(
 fn apply_delete_leaf_impl(
     paths: &ScopePaths,
     req: &DeleteLeafRequest,
-    backups: &BackupTracker,
+    backups: Option<&BackupTracker>,
     watch: &WatchState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let movable = validate_movable_path(&req.path)?;
@@ -1092,7 +1108,7 @@ fn diff_add_leaf_impl(
 fn apply_add_leaf_impl(
     paths: &ScopePaths,
     req: &AddLeafRequest,
-    backups: &BackupTracker,
+    backups: Option<&BackupTracker>,
     watch: &WatchState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _movable = validate_movable_path(&req.path)?;
@@ -1506,7 +1522,7 @@ mod tests {
                 to: Scope::User,
                 to_kind: None,
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -1526,6 +1542,59 @@ mod tests {
             user_doc.permissions().allow,
             vec!["Bash(git status)".to_string()]
         );
+    }
+
+    #[test]
+    fn apply_move_leaf_with_none_backups_writes_without_creating_bak() {
+        // #88: when the user opts out of `.bak` files via Preferences, the
+        // command handler passes `None` into the impl. Verify both that the
+        // write still lands AND that no sibling `.bak` is created — the
+        // latter is the whole point of the opt-out.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(git status)"]}}"#,
+        );
+        write(
+            paths.user.as_ref().unwrap(),
+            r#"{"permissions":{"allow":[]}}"#,
+        );
+
+        apply_move_leaf_impl(
+            &paths,
+            &MoveLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Project,
+                to: Scope::User,
+                to_kind: None,
+            },
+            None,
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        // Move landed on both sides.
+        let project_doc = io_atomic::load(paths.project.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(project_doc.permissions().allow.is_empty());
+        let user_doc = io_atomic::load(paths.user.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            user_doc.permissions().allow,
+            vec!["Bash(git status)".to_string()]
+        );
+
+        // No `.bak` for either file. Probing both because the move writes to
+        // *both* the source and destination scopes, and a regression on
+        // either arm would silently re-introduce the clutter the pref opts
+        // out of.
+        let project_bak = paths.project.as_ref().unwrap().with_extension("json.bak");
+        let user_bak = paths.user.as_ref().unwrap().with_extension("json.bak");
+        assert!(!project_bak.exists(), "expected no .bak at {project_bak:?}");
+        assert!(!user_bak.exists(), "expected no .bak at {user_bak:?}");
     }
 
     #[test]
@@ -1552,7 +1621,7 @@ mod tests {
                 to: Scope::User,
                 to_kind: None,
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -1595,7 +1664,7 @@ mod tests {
                 to: Scope::User,
                 to_kind: None,
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -1641,7 +1710,7 @@ mod tests {
                 to: Scope::User,
                 to_kind: None,
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -1690,7 +1759,7 @@ mod tests {
                 to: Scope::User,
                 to_kind: None,
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -1771,7 +1840,7 @@ mod tests {
                 to: Scope::User,
                 to_kind: None,
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap_err();
@@ -1791,7 +1860,7 @@ mod tests {
                 to: Scope::Project,
                 to_kind: None,
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap_err();
@@ -1811,7 +1880,7 @@ mod tests {
                 to: Scope::User,
                 to_kind: None,
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap_err();
@@ -1841,7 +1910,7 @@ mod tests {
                 to: Scope::Project,
                 to_kind: Some(PermissionKind::Deny),
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -1876,7 +1945,7 @@ mod tests {
                 to: Scope::Project,
                 to_kind: Some(PermissionKind::Deny),
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -1910,7 +1979,7 @@ mod tests {
                 to: Scope::User,
                 to_kind: Some(PermissionKind::Deny),
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -1946,7 +2015,7 @@ mod tests {
                 to: Scope::Project,
                 to_kind: Some(PermissionKind::Allow),
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap_err();
@@ -1972,7 +2041,7 @@ mod tests {
                 to: Scope::User,
                 to_kind: Some(PermissionKind::Deny),
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap_err();
@@ -1986,7 +2055,7 @@ mod tests {
                 to: Scope::User,
                 to_kind: Some(PermissionKind::Allow),
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap_err();
@@ -2046,7 +2115,7 @@ mod tests {
                 path: vec![key("permissions"), key("allow"), idx(0)],
                 from: Scope::Project,
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -2075,7 +2144,7 @@ mod tests {
                 path: vec![key("permissions"), key("allow"), idx(0)],
                 from: Scope::Project,
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -2101,7 +2170,7 @@ mod tests {
                 path: vec![key("theme")],
                 from: Scope::Project,
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -2124,7 +2193,7 @@ mod tests {
                 path: vec![key("permissions"), key("allow"), idx(0)],
                 from: Scope::Project,
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap_err();
@@ -2181,7 +2250,7 @@ mod tests {
                 to: Scope::User,
                 value: serde_json::json!("WebFetch(domain:evil.example)"),
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -2213,7 +2282,7 @@ mod tests {
                 to: Scope::User,
                 value: serde_json::json!("Bash(ls)"),
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
@@ -2245,7 +2314,7 @@ mod tests {
                 to: Scope::User,
                 value: serde_json::json!("Bash(ls)"),
             },
-            &BackupTracker::new(),
+            Some(&BackupTracker::new()),
             &WatchState::default(),
         )
         .unwrap();
