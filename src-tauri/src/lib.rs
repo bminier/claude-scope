@@ -1,3 +1,4 @@
+pub mod app_info;
 pub mod commands;
 pub mod io_atomic;
 pub mod model;
@@ -54,6 +55,7 @@ pub fn run(context: tauri::Context) {
             commands::save_preferences,
             commands::load_runtime_info,
             commands::list_known_projects,
+            commands::get_app_info,
         ])
         .run(context)
         .expect("error while running tauri application");

@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
+use crate::app_info::AppInfo;
 use crate::io_atomic::{self, BackupTracker};
 use crate::model::{
     describe_path, key_policy, validate_movable_path, KeyPolicy, MovablePath, PathSeg,
@@ -305,6 +306,15 @@ pub fn list_known_projects(
     overrides: State<'_, RuntimeOverrides>,
 ) -> Result<Vec<KnownProject>, String> {
     projects::list_known_projects(overrides.home()).map_err(|e| e.to_string())
+}
+
+/// Build- and runtime-time diagnostic block for the About dialog (#21).
+/// `webview_version` is queried at command time — it's the one field that
+/// can vary across processes (a system WebView2 update mid-session) and
+/// the only one that needs a live Tauri context.
+#[tauri::command]
+pub fn get_app_info() -> AppInfo {
+    AppInfo::build(tauri::webview_version().ok())
 }
 
 /// Read user preferences. A missing / malformed config file falls back to
