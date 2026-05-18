@@ -12,6 +12,7 @@ use crate::model::{
     PermissionKind, PermissionRules, SettingsDoc,
 };
 use crate::preferences::{self, Preferences};
+use crate::projects::{self, KnownProject};
 use crate::runtime::{RuntimeInfo, RuntimeOverrides};
 use crate::scope::{self, Scope, ScopePaths};
 use crate::watcher::WatchState;
@@ -294,6 +295,16 @@ pub fn apply_add_leaf(
 #[tauri::command]
 pub fn load_runtime_info(overrides: State<'_, RuntimeOverrides>) -> RuntimeInfo {
     RuntimeInfo::from_overrides(&overrides)
+}
+
+/// Enumerate every Claude project on this machine for the Move-to submenu
+/// (#106). Routes through `RuntimeOverrides::home` so sandbox mode (#66)
+/// reads from the scratch home instead of the real `~/.claude/projects/`.
+#[tauri::command]
+pub fn list_known_projects(
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<Vec<KnownProject>, String> {
+    projects::list_known_projects(overrides.home()).map_err(|e| e.to_string())
 }
 
 /// Read user preferences. A missing / malformed config file falls back to

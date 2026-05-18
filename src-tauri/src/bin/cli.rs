@@ -17,6 +17,7 @@ use claude_scope_lib::commands::{
 };
 use claude_scope_lib::io_atomic::{self, BackupTracker};
 use claude_scope_lib::model::{PathSeg, PermissionKind};
+use claude_scope_lib::projects::{self, KnownProject};
 use claude_scope_lib::scope::{self, Scope, ScopePaths};
 use claude_scope_lib::watcher::WatchState;
 
@@ -76,6 +77,14 @@ enum Command {
         #[arg(long, value_name = "KIND")]
         kind: Option<KindArg>,
 
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List Claude projects discovered on this machine via the
+    /// `~/.claude/projects/` transcript registry (#106).
+    ListProjects {
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -167,6 +176,13 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // `list-projects` operates on the home registry only and doesn't need a
+    // resolved project root, so dispatch it before `resolve_paths` to avoid
+    // a spurious walk-up when the CLI is invoked outside any repo.
+    if let Command::ListProjects { json } = cli.command {
+        return cmd_list_projects(cli.home_dir.as_deref(), json);
+    }
+
     let paths = resolve_paths(cli.project_dir.as_deref(), cli.home_dir.as_deref())?;
     match cli.command {
         Command::Scopes { json } => cmd_scopes(&paths, json),
@@ -176,6 +192,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             json,
         } => cmd_show(&paths, scope, effective, json),
         Command::ListRules { scope, kind, json } => cmd_list_rules(&paths, scope, kind, json),
+        Command::ListProjects { .. } => unreachable!("handled above"),
         Command::Move {
             rule,
             kind,
@@ -402,6 +419,41 @@ fn cmd_list_rules(
     } else {
         for row in &rows {
             println!("{:<11} {:<6} {}", row.scope, row.kind, row.rule);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_list_projects(
+    home: Option<&std::path::Path>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entries = projects::list_known_projects(home)?;
+    if json {
+        // Wrap in `KnownProjectOut` so the wire format is stable even if
+        // the lib struct grows new fields. `serde_json::to_value` on
+        // `KnownProject` would silently start exposing those fields.
+        #[derive(Serialize)]
+        struct KnownProjectOut<'a> {
+            name: &'a str,
+            root: String,
+        }
+        let out: Vec<KnownProjectOut<'_>> = entries
+            .iter()
+            .map(|p: &KnownProject| KnownProjectOut {
+                name: &p.name,
+                root: p.root.display().to_string(),
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "projects": out }))?
+        );
+    } else if entries.is_empty() {
+        println!("(no Claude projects discovered)");
+    } else {
+        for p in &entries {
+            println!("{}\t{}", p.name, p.root.display());
         }
     }
     Ok(())

@@ -53,6 +53,7 @@ pub fn run(context: tauri::Context) {
             commands::load_preferences,
             commands::save_preferences,
             commands::load_runtime_info,
+            commands::list_known_projects,
         ])
         .run(context)
         .expect("error while running tauri application");
