@@ -538,7 +538,12 @@ fn cmd_move(
         return Ok(());
     }
 
-    apply_move_leaf_impl(paths, &req, &BackupTracker::new(), &WatchState::default())?;
+    apply_move_leaf_impl(
+        paths,
+        &req,
+        Some(&BackupTracker::new()),
+        &WatchState::default(),
+    )?;
 
     if json {
         let out = json!({

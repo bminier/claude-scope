@@ -188,21 +188,26 @@ pub fn load_with_stamp(path: &Path) -> Result<(Option<SettingsDoc>, FileStamp), 
     ))
 }
 
-/// Atomic write with revalidation and one-time-per-session backup.
+/// Atomic write with revalidation and (optionally) a one-time-per-session
+/// backup.
 ///
 /// Convenience wrapper that renders a [`SettingsDoc`] and routes the bytes
-/// through [`atomic_write_json`] with backups enabled. `expected` carries
-/// the [`FileStamp`] the caller captured at load time so a concurrent edit
-/// is detected and refused — pass `None` to skip the check (e.g. on a
-/// rollback path where the app is the canonical writer).
+/// through [`atomic_write_json`]. `backups` is `Some(_)` for user-data files
+/// where a one-shot recovery copy is worth the surprise of an extra file on
+/// disk; `None` opts out of the `.bak` (#88) — both the user preference and
+/// callers like `preferences::save` (for ClaudeScope-owned config files)
+/// use this arm. `expected` carries the [`FileStamp`] the caller captured
+/// at load time so a concurrent edit is detected and refused — pass `None`
+/// to skip the check (e.g. on a rollback path where the app is the
+/// canonical writer).
 pub fn save(
     path: &Path,
     doc: &SettingsDoc,
-    backups: &BackupTracker,
+    backups: Option<&BackupTracker>,
     expected: Option<&FileStamp>,
 ) -> Result<(), IoError> {
     let rendered = doc.render();
-    atomic_write_json(path, rendered.as_bytes(), Some(backups), expected)
+    atomic_write_json(path, rendered.as_bytes(), backups, expected)
 }
 
 /// The single chokepoint every write path in the app must use.
@@ -405,14 +410,14 @@ mod tests {
 
         let backups = BackupTracker::new();
         let doc = load(&path).unwrap().unwrap();
-        save(&path, &doc, &backups, None).unwrap();
+        save(&path, &doc, Some(&backups), None).unwrap();
 
         let bak = path.with_file_name("settings.json.bak");
         assert!(bak.exists(), "first save should create .bak");
 
         // Second save should not update the .bak.
         let bak_mtime = std::fs::metadata(&bak).unwrap().modified().unwrap();
-        save(&path, &doc, &backups, None).unwrap();
+        save(&path, &doc, Some(&backups), None).unwrap();
         let bak_mtime2 = std::fs::metadata(&bak).unwrap().modified().unwrap();
         assert_eq!(bak_mtime, bak_mtime2);
     }
@@ -428,7 +433,7 @@ mod tests {
 
         let backups = BackupTracker::new();
         let doc = load(&path).unwrap().unwrap();
-        save(&path, &doc, &backups, None).unwrap();
+        save(&path, &doc, Some(&backups), None).unwrap();
 
         let bak_contents = std::fs::read_to_string(&bak).unwrap();
         assert!(

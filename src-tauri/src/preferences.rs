@@ -46,6 +46,13 @@ pub struct Preferences {
     /// `Light`/`Dark` pin the palette regardless of OS preference.
     #[serde(default, deserialize_with = "deserialize_theme")]
     pub theme: Theme,
+    /// Whether to drop a `.bak` next to a settings file on the first write
+    /// per session (#88). Default `true` — silently dropping the safety net
+    /// for existing users would be a worse default than minor clutter for
+    /// the users who opt out. When `false`, command handlers pass `None`
+    /// into `io_atomic::save` and the existing no-backup arm runs.
+    #[serde(default = "default_backup_on_write")]
+    pub backup_on_write: bool,
 }
 
 impl Default for Preferences {
@@ -53,12 +60,17 @@ impl Default for Preferences {
         Self {
             visible_scopes: default_visible_scopes(),
             theme: Theme::default(),
+            backup_on_write: default_backup_on_write(),
         }
     }
 }
 
 fn default_visible_scopes() -> Vec<Scope> {
     Scope::ALL.to_vec()
+}
+
+fn default_backup_on_write() -> bool {
+    true
 }
 
 /// Normalize a `visible_scopes` list: dedupe, reorder to match `Scope::ALL`,
@@ -208,6 +220,7 @@ mod tests {
         let prefs = Preferences {
             visible_scopes: vec![Scope::Local, Scope::Project],
             theme: Theme::Light,
+            backup_on_write: false,
         };
         let json = serde_json::to_string(&prefs).unwrap();
         let parsed: Preferences = serde_json::from_str(&json).unwrap();
@@ -234,6 +247,7 @@ mod tests {
             let prefs = Preferences {
                 visible_scopes: default_visible_scopes(),
                 theme,
+                backup_on_write: true,
             };
             let json = serde_json::to_string(&prefs).unwrap();
             let parsed: Preferences = serde_json::from_str(&json).unwrap();
@@ -257,11 +271,37 @@ mod tests {
         let prefs = Preferences {
             visible_scopes: default_visible_scopes(),
             theme: Theme::Dark,
+            backup_on_write: true,
         };
         let json = serde_json::to_string(&prefs).unwrap();
         // The JS side reads this string verbatim — pinning the casing
         // here keeps the IPC contract from drifting silently.
         assert!(json.contains(r#""theme":"dark""#));
+    }
+
+    #[test]
+    fn backup_on_write_defaults_to_true() {
+        // Default constructor (the load-path fallback) must keep the
+        // existing safety behavior so a fresh install or unreadable config
+        // doesn't silently regress to no-backup writes.
+        let prefs = Preferences::default();
+        assert!(prefs.backup_on_write);
+    }
+
+    #[test]
+    fn backup_on_write_missing_field_defaults_to_true() {
+        // Older configs predate the field; missing key must collapse to
+        // the safe default, not deserialize as `false` (the bool default).
+        let prefs: Preferences = serde_json::from_str(r#"{"visible_scopes":["project"]}"#).unwrap();
+        assert!(prefs.backup_on_write);
+    }
+
+    #[test]
+    fn backup_on_write_explicit_false_survives_round_trip() {
+        let prefs: Preferences = serde_json::from_str(r#"{"backup_on_write":false}"#).unwrap();
+        assert!(!prefs.backup_on_write);
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert!(json.contains(r#""backup_on_write":false"#));
     }
 
     /// Exercise the save path against a real filesystem so the
@@ -277,6 +317,7 @@ mod tests {
         let first = Preferences {
             visible_scopes: vec![Scope::Local],
             theme: Theme::Auto,
+            backup_on_write: true,
         };
         let body = serde_json::to_vec_pretty(&first).unwrap();
         let parent = target.parent().unwrap();
@@ -291,6 +332,7 @@ mod tests {
         let second = Preferences {
             visible_scopes: vec![Scope::Project, Scope::User],
             theme: Theme::Dark,
+            backup_on_write: false,
         };
         let body2 = serde_json::to_vec_pretty(&second).unwrap();
         let mut tmpfile2 = tempfile::NamedTempFile::new_in(parent).unwrap();
