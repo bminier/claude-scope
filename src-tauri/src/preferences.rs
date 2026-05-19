@@ -23,6 +23,14 @@ use crate::scope::Scope;
 /// turning the menu into a vertical scroll.
 pub const RECENT_PROJECTS_CAP: usize = 10;
 
+/// Bounds on the user-configurable audit-log rotation cap (#127). The
+/// floor is small but non-zero so a misclick can't trigger rotation on
+/// every append; the ceiling is high enough that "effectively never" is
+/// expressible without a separate kill-switch.
+pub const AUDIT_LOG_MAX_SIZE_MB_MIN: u32 = 1;
+pub const AUDIT_LOG_MAX_SIZE_MB_MAX: u32 = 1000;
+pub const AUDIT_LOG_MAX_SIZE_MB_DEFAULT: u32 = 10;
+
 /// Shape of the persisted config file. Every field carries a `#[serde(default)]`
 /// so unknown or missing keys degrade gracefully to sensible defaults — the
 /// schema can evolve without forcing a migration on every launch.
@@ -65,6 +73,23 @@ pub struct Preferences {
     /// older config can't push the menu into an unbounded list.
     #[serde(default, deserialize_with = "deserialize_recent_projects")]
     pub recent_projects: Vec<PathBuf>,
+    /// Whether to rotate `audit.jsonl` once it exceeds
+    /// [`Self::audit_log_max_size_mb`] (#127). Default `true` — auto-rotation
+    /// is the safer default for a personal tool that will otherwise
+    /// accumulate years of writes into a single file. Toggle off only if
+    /// you want the audit log to grow without fragmenting into archives.
+    #[serde(default = "default_audit_log_rotate")]
+    pub audit_log_rotate: bool,
+    /// Size threshold in MB at which `audit.jsonl` is rotated. Clamped at
+    /// load time to `[AUDIT_LOG_MAX_SIZE_MB_MIN, AUDIT_LOG_MAX_SIZE_MB_MAX]`
+    /// so a hand-edited or older config can't push the cap to zero (which
+    /// would rotate on every append) or absurdly large (effectively
+    /// disabling, which is what `audit_log_rotate=false` is for).
+    #[serde(
+        default = "default_audit_log_max_size_mb",
+        deserialize_with = "deserialize_audit_log_max_size_mb"
+    )]
+    pub audit_log_max_size_mb: u32,
 }
 
 impl Default for Preferences {
@@ -74,6 +99,8 @@ impl Default for Preferences {
             theme: Theme::default(),
             backup_on_write: default_backup_on_write(),
             recent_projects: Vec::new(),
+            audit_log_rotate: default_audit_log_rotate(),
+            audit_log_max_size_mb: default_audit_log_max_size_mb(),
         }
     }
 }
@@ -84,6 +111,30 @@ fn default_visible_scopes() -> Vec<Scope> {
 
 fn default_backup_on_write() -> bool {
     true
+}
+
+fn default_audit_log_rotate() -> bool {
+    true
+}
+
+fn default_audit_log_max_size_mb() -> u32 {
+    AUDIT_LOG_MAX_SIZE_MB_DEFAULT
+}
+
+/// Clamp the deserialized audit-log size cap so a hand-edited config
+/// can't ship the user a silently-broken rotation policy. Out-of-range
+/// values fall back to the default rather than the nearest boundary, so
+/// the user sees the safe baseline instead of a value they didn't pick.
+fn deserialize_audit_log_max_size_mb<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = u32::deserialize(deserializer)?;
+    if (AUDIT_LOG_MAX_SIZE_MB_MIN..=AUDIT_LOG_MAX_SIZE_MB_MAX).contains(&raw) {
+        Ok(raw)
+    } else {
+        Ok(default_audit_log_max_size_mb())
+    }
 }
 
 /// Normalize a `visible_scopes` list: dedupe, reorder to match `Scope::ALL`,
@@ -299,6 +350,8 @@ mod tests {
             theme: Theme::Light,
             backup_on_write: false,
             recent_projects: Vec::new(),
+            audit_log_rotate: false,
+            audit_log_max_size_mb: 25,
         };
         let json = serde_json::to_string(&prefs).unwrap();
         let parsed: Preferences = serde_json::from_str(&json).unwrap();
@@ -327,6 +380,8 @@ mod tests {
                 theme,
                 backup_on_write: true,
                 recent_projects: Vec::new(),
+                audit_log_rotate: true,
+                audit_log_max_size_mb: AUDIT_LOG_MAX_SIZE_MB_DEFAULT,
             };
             let json = serde_json::to_string(&prefs).unwrap();
             let parsed: Preferences = serde_json::from_str(&json).unwrap();
@@ -352,6 +407,8 @@ mod tests {
             theme: Theme::Dark,
             backup_on_write: true,
             recent_projects: Vec::new(),
+            audit_log_rotate: true,
+            audit_log_max_size_mb: AUDIT_LOG_MAX_SIZE_MB_DEFAULT,
         };
         let json = serde_json::to_string(&prefs).unwrap();
         // The JS side reads this string verbatim — pinning the casing
@@ -382,6 +439,55 @@ mod tests {
         assert!(!prefs.backup_on_write);
         let json = serde_json::to_string(&prefs).unwrap();
         assert!(json.contains(r#""backup_on_write":false"#));
+    }
+
+    #[test]
+    fn audit_log_rotate_defaults_to_true() {
+        // The safer default: a personal tool's audit log auto-rotates
+        // rather than growing for years into a hard-to-grep file. Older
+        // configs predate the field; missing key must collapse to true.
+        let prefs: Preferences = serde_json::from_str("{}").unwrap();
+        assert!(prefs.audit_log_rotate);
+    }
+
+    #[test]
+    fn audit_log_max_size_mb_defaults_to_constant() {
+        let prefs = Preferences::default();
+        assert_eq!(prefs.audit_log_max_size_mb, AUDIT_LOG_MAX_SIZE_MB_DEFAULT);
+    }
+
+    #[test]
+    fn audit_log_max_size_mb_clamps_out_of_range_to_default() {
+        // Hand-edited config sets the cap to zero (which would rotate on
+        // every append) — must clamp back to the default rather than
+        // pinning to the floor, so the user sees the safe baseline
+        // instead of a value they didn't pick.
+        let prefs: Preferences = serde_json::from_str(r#"{"audit_log_max_size_mb":0}"#).unwrap();
+        assert_eq!(prefs.audit_log_max_size_mb, AUDIT_LOG_MAX_SIZE_MB_DEFAULT);
+        // Same for absurdly large values — `audit_log_rotate=false` is
+        // the intended way to express "don't rotate".
+        let prefs: Preferences =
+            serde_json::from_str(r#"{"audit_log_max_size_mb":99999}"#).unwrap();
+        assert_eq!(prefs.audit_log_max_size_mb, AUDIT_LOG_MAX_SIZE_MB_DEFAULT);
+    }
+
+    #[test]
+    fn audit_log_max_size_mb_in_range_survives_round_trip() {
+        let prefs: Preferences = serde_json::from_str(r#"{"audit_log_max_size_mb":25}"#).unwrap();
+        assert_eq!(prefs.audit_log_max_size_mb, 25);
+        // Boundary values stay (min and max are valid).
+        let prefs: Preferences = serde_json::from_str(r#"{"audit_log_max_size_mb":1}"#).unwrap();
+        assert_eq!(prefs.audit_log_max_size_mb, 1);
+        let prefs: Preferences = serde_json::from_str(r#"{"audit_log_max_size_mb":1000}"#).unwrap();
+        assert_eq!(prefs.audit_log_max_size_mb, 1000);
+    }
+
+    #[test]
+    fn audit_log_rotate_explicit_false_survives_round_trip() {
+        let prefs: Preferences = serde_json::from_str(r#"{"audit_log_rotate":false}"#).unwrap();
+        assert!(!prefs.audit_log_rotate);
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert!(json.contains(r#""audit_log_rotate":false"#));
     }
 
     #[test]
@@ -499,6 +605,8 @@ mod tests {
             theme: Theme::Auto,
             backup_on_write: true,
             recent_projects: Vec::new(),
+            audit_log_rotate: true,
+            audit_log_max_size_mb: AUDIT_LOG_MAX_SIZE_MB_DEFAULT,
         };
         let body = serde_json::to_vec_pretty(&first).unwrap();
         let parent = target.parent().unwrap();
@@ -515,6 +623,8 @@ mod tests {
             theme: Theme::Dark,
             backup_on_write: false,
             recent_projects: vec![PathBuf::from("/tmp/p1"), PathBuf::from("/tmp/p2")],
+            audit_log_rotate: false,
+            audit_log_max_size_mb: 5,
         };
         let body2 = serde_json::to_vec_pretty(&second).unwrap();
         let mut tmpfile2 = tempfile::NamedTempFile::new_in(parent).unwrap();

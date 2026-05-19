@@ -42,6 +42,8 @@ const DEFAULT_PREFERENCES: Preferences = {
   theme: "auto",
   backup_on_write: true,
   recent_projects: [],
+  audit_log_rotate: true,
+  audit_log_max_size_mb: 10,
 };
 
 const state: {
@@ -430,6 +432,16 @@ function onToggleBackupOnWrite(enabled: boolean): void {
   void persistPreferences({ ...state.preferences, backup_on_write: enabled });
 }
 
+function onToggleAuditLogRotate(enabled: boolean): void {
+  if (state.preferences.audit_log_rotate === enabled) return;
+  void persistPreferences({ ...state.preferences, audit_log_rotate: enabled });
+}
+
+function onChangeAuditLogMaxSizeMb(mb: number): void {
+  if (state.preferences.audit_log_max_size_mb === mb) return;
+  void persistPreferences({ ...state.preferences, audit_log_max_size_mb: mb });
+}
+
 function onOpenSettings(trigger?: HTMLElement): void {
   void openSettings(
     {
@@ -437,6 +449,8 @@ function onOpenSettings(trigger?: HTMLElement): void {
       onToggleScopeVisibility,
       onChangeTheme,
       onToggleBackupOnWrite,
+      onToggleAuditLogRotate,
+      onChangeAuditLogMaxSizeMb,
     },
     trigger,
   );

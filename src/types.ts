@@ -183,7 +183,26 @@ export interface Preferences {
    *  can render this list directly without re-normalizing. Defaults to
    *  empty for older configs. */
   recent_projects: string[];
+  /** Whether to rotate `audit.jsonl` once it exceeds
+   *  `audit_log_max_size_mb` (#127). Default `true` on older configs —
+   *  auto-rotation is the safer baseline. */
+  audit_log_rotate: boolean;
+  /** Size threshold in MB at which `audit.jsonl` is rotated. Clamped
+   *  server-side to `[1, 1000]`; out-of-range values fall back to the
+   *  default rather than the nearest boundary. */
+  audit_log_max_size_mb: number;
 }
+
+/** Bounds on `Preferences.audit_log_max_size_mb`. Mirrors Rust's
+ *  `AUDIT_LOG_MAX_SIZE_MB_MIN` / `_MAX` / `_DEFAULT` constants — the
+ *  settings UI uses these to populate the number input's min/max and
+ *  to compute the default-restore action. Kept as a single object so a
+ *  future schema bump is one site to update. */
+export const AUDIT_LOG_MAX_SIZE_MB = {
+  min: 1,
+  max: 1000,
+  default: 10,
+} as const;
 
 /**
  * Launch-time override snapshot from the Rust side. Mirrors `RuntimeInfo`

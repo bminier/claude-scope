@@ -1175,6 +1175,25 @@ button:disabled {
   accent-color: var(--accent);
 }
 
+/* Number-input variant of .settings-check (#127 rotation size cap).
+   Reuses the checkbox row's layout but the input itself wants a fixed
+   width so a 4-digit cap doesn't push the label off to the right. */
+.settings-check-number .settings-number-input {
+  width: 70px;
+  padding: 2px 4px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+}
+
+.settings-check-number .settings-number-input:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* About dialog (#21) — same shell as settings, but the diagnostic block
    wants a tighter two-column grid and the links need plain-list defaults
    stripped. */
