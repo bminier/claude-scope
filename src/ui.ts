@@ -153,13 +153,25 @@ function matchesLoweredQuery(rule: string, lowerQuery: string): boolean {
 }
 
 /**
- * Threshold above which a tool's rules collapse under a synthetic group
- * node in the per-scope tree view (#68). At 2, two rules sharing a tool
- * (e.g. `handoff(copilot *)` + `handoff(claude *)`) fold together. A future
- * Settings option (#115) will parameterize this; for now it's the single
- * compile-time knob the grouping helper reads.
+ * Default threshold above which a tool's rules collapse under a
+ * synthetic group node in the per-scope tree view (#68). Matches
+ * `Preferences.group_rules_at`'s default — the runtime value comes from
+ * the user's preference (#115) via [`resolveGroupThreshold`]. This
+ * constant is retained as the default for unit-test call sites that
+ * exercise the grouping helper directly without an `AppProps` in scope.
  */
 const TOOL_GROUP_THRESHOLD = 2;
+
+/**
+ * Resolve the user's `group_rules_at` preference to the integer
+ * threshold the grouping helper expects. `null` (= "never group" per
+ * the user's choice) is mapped to `Infinity` so the helper's
+ * `count < threshold` check never fires and every rule renders as a
+ * `Single`. Same call site contract as the default-2 constant.
+ */
+function resolveGroupThreshold(prefs: Preferences): number {
+  return prefs.group_rules_at ?? Number.POSITIVE_INFINITY;
+}
 
 /**
  * Entry in the per-kind rule list after grouping. `Single` keeps the
@@ -555,7 +567,7 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   // scopes=null first; scopes arrive on the next render).
   if (lastSeededProjectDir !== props.projectDir) {
     lastSeededProjectDir = props.projectDir;
-    seedDefaultOpenPermissions(props.scopes);
+    seedDefaultOpenPermissions(props.scopes, resolveGroupThreshold(props.preferences));
   }
 
   // Lowercase the query once per render instead of per rule; scopeGrid/
@@ -1080,7 +1092,7 @@ let lastSeededProjectDir: string | null = null;
  * `<details>.toggle` listener in `treeBranch` is the only writer of
  * `openTreeNodes`, so a manual collapse persists across re-renders.
  */
-function seedDefaultOpenPermissions(loaded: LoadedScopes): void {
+function seedDefaultOpenPermissions(loaded: LoadedScopes, threshold: number): void {
   for (const view of loaded.scopes) {
     const perms = view.values.permissions;
     if (!perms || typeof perms !== "object" || Array.isArray(perms)) continue;
@@ -1097,9 +1109,11 @@ function seedDefaultOpenPermissions(loaded: LoadedScopes): void {
         // Seed open state for tool groups (#68) so the synthetic
         // `<details>` nodes inside an already-open permissions branch
         // start expanded — users opened the kind branch to read its
-        // rules, so collapsed groups would just hide them again.
+        // rules, so collapsed groups would just hide them again. The
+        // grouping has to use the user's current threshold (#115) so
+        // we don't seed open state for groups the renderer won't form.
         const ruleStrings = arr.map((v) => (typeof v === "string" ? v : ""));
-        for (const entry of groupByToolPrefix(ruleStrings)) {
+        for (const entry of groupByToolPrefix(ruleStrings, threshold)) {
           if (entry.kind === "group") {
             openTreeNodes.add(treeKey(view.scope, [...kindPath, "__group__", entry.tool]));
           }
@@ -1558,7 +1572,12 @@ function populatePermissionList(
   // surprise than help. Keep the malformed entries inline at their
   // original index so the existing leaf renderer can flag them.
   const ruleStrings: string[] = value.map((v) => (typeof v === "string" ? v : ""));
-  const grouped = groupByToolPrefix(ruleStrings);
+  // `props` can be undefined for previews / tests that render the
+  // tree without a full AppProps; in that case fall back to the
+  // default threshold so the tree still groups the same way #68
+  // shipped with.
+  const threshold = props ? resolveGroupThreshold(props.preferences) : TOOL_GROUP_THRESHOLD;
+  const grouped = groupByToolPrefix(ruleStrings, threshold);
   for (const entry of grouped) {
     if (entry.kind === "single") {
       children.appendChild(
@@ -3173,6 +3192,9 @@ interface SettingsProps {
    *  clamps to `[1, 1000]`; the UI also enforces those bounds at the
    *  input level so the user sees the limits inline. */
   onChangeAuditLogMaxSizeMb: (mb: number) => void;
+  /** Set the tool-grouping threshold (#115). `null` = never group;
+   *  otherwise group when this many rules share a tool prefix. */
+  onChangeGroupRulesAt: (value: number | null) => void;
 }
 
 const THEME_OPTIONS: ReadonlyArray<{ value: Theme; label: string }> = [
@@ -3197,6 +3219,7 @@ export function openSettings(props: SettingsProps, trigger?: HTMLElement | null)
   const body = document.createElement("div");
   body.appendChild(settingsThemeSection(props));
   body.appendChild(settingsColumnsSection(props));
+  body.appendChild(settingsGroupRulesSection(props));
   body.appendChild(settingsBackupSection(props));
   body.appendChild(settingsAuditRotationSection(props));
 
@@ -3362,6 +3385,69 @@ function settingsBackupSection(props: SettingsProps): HTMLElement {
  * typing "2", "20", "200". `change` fires on commit (blur or Enter),
  * which lines up with how the rest of the settings dialog works.
  */
+/**
+ * Tool-grouping threshold radios (#115). Three discrete states — group
+ * at 2, group at 3, or never — chosen over a free number input because
+ * the meaningful range is small and users disagree on the right value;
+ * spelling out the three options inline makes the trade-off legible.
+ *
+ * The wire shape (`number | null`) admits values >= 4 if a future
+ * config edit asks for one; we just don't expose a UI for them. That
+ * keeps the schema forward-compatible without crowding the dialog.
+ */
+function settingsGroupRulesSection(props: SettingsProps): HTMLElement {
+  const section = document.createElement("section");
+  section.className = "settings-section";
+
+  const heading = document.createElement("h3");
+  heading.id = "settings-group-rules-heading";
+  heading.className = "settings-heading";
+  heading.textContent = "Rule grouping";
+  section.appendChild(heading);
+
+  const hint = document.createElement("p");
+  hint.className = "settings-hint";
+  hint.textContent =
+    "When rules share a tool prefix, fold them into a collapsible group. Lower thresholds fold more aggressively; 'Never' shows every rule flat.";
+  section.appendChild(hint);
+
+  const list = document.createElement("div");
+  list.className = "settings-checklist";
+  list.setAttribute("role", "radiogroup");
+  list.setAttribute("aria-labelledby", "settings-group-rules-heading");
+  const groupName = "settings-group-rules";
+
+  const options: Array<{ value: number | null; label: string }> = [
+    { value: 2, label: "Group at 2 (most aggressive)" },
+    { value: 3, label: "Group at 3" },
+    { value: null, label: "Never group" },
+  ];
+
+  for (const opt of options) {
+    const row = document.createElement("label");
+    row.className = "settings-check";
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = groupName;
+    // Use a sentinel string for `null` so the radio value round-trips
+    // cleanly. The click handler maps it back to `null` before
+    // dispatching.
+    input.value = opt.value === null ? "never" : String(opt.value);
+    input.checked = props.preferences.group_rules_at === opt.value;
+    input.addEventListener("change", () => {
+      if (input.checked) props.onChangeGroupRulesAt(opt.value);
+    });
+    row.appendChild(input);
+    const label = document.createElement("span");
+    label.textContent = opt.label;
+    row.appendChild(label);
+    list.appendChild(row);
+  }
+
+  section.appendChild(list);
+  return section;
+}
+
 function settingsAuditRotationSection(props: SettingsProps): HTMLElement {
   const section = document.createElement("section");
   section.className = "settings-section";

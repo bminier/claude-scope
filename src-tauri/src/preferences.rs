@@ -31,6 +31,16 @@ pub const AUDIT_LOG_MAX_SIZE_MB_MIN: u32 = 1;
 pub const AUDIT_LOG_MAX_SIZE_MB_MAX: u32 = 1000;
 pub const AUDIT_LOG_MAX_SIZE_MB_DEFAULT: u32 = 10;
 
+/// Minimum sensible value for `group_rules_at` (#115). Two rules sharing
+/// a tool prefix is the smallest group that's visually distinct from
+/// flat presentation — any lower would either fold every single rule
+/// (n=1, meaningless) or wrap around to "never group" semantics, which
+/// `None` already expresses cleanly.
+pub const GROUP_RULES_AT_MIN: u32 = 2;
+/// Default grouping threshold — matches #68's original constant so
+/// existing users see the same UI by default.
+pub const GROUP_RULES_AT_DEFAULT: u32 = 2;
+
 /// Shape of the persisted config file. Every field carries a `#[serde(default)]`
 /// so unknown or missing keys degrade gracefully to sensible defaults — the
 /// schema can evolve without forcing a migration on every launch.
@@ -90,6 +100,18 @@ pub struct Preferences {
         deserialize_with = "deserialize_audit_log_max_size_mb"
     )]
     pub audit_log_max_size_mb: u32,
+    /// Threshold above which per-tool rule groups collapse in the tree
+    /// view (#115). `Some(n)` groups when `n` or more rules share a tool
+    /// prefix; `None` disables grouping entirely. Default `Some(2)`
+    /// matches #68's original constant, so existing users see the same
+    /// presentation. Values < [`GROUP_RULES_AT_MIN`] are coerced to the
+    /// default at load time — a hand-edited `1` is meaningless and a
+    /// hand-edited `0` would collapse every individual rule.
+    #[serde(
+        default = "default_group_rules_at",
+        deserialize_with = "deserialize_group_rules_at"
+    )]
+    pub group_rules_at: Option<u32>,
 }
 
 impl Default for Preferences {
@@ -101,6 +123,7 @@ impl Default for Preferences {
             recent_projects: Vec::new(),
             audit_log_rotate: default_audit_log_rotate(),
             audit_log_max_size_mb: default_audit_log_max_size_mb(),
+            group_rules_at: default_group_rules_at(),
         }
     }
 }
@@ -135,6 +158,28 @@ where
     } else {
         Ok(default_audit_log_max_size_mb())
     }
+}
+
+fn default_group_rules_at() -> Option<u32> {
+    Some(GROUP_RULES_AT_DEFAULT)
+}
+
+/// Coerce sub-minimum `Some(n < 2)` values back to the default. `None`
+/// is a legitimate "never group" signal and passes through unchanged.
+/// Any positive value at or above `GROUP_RULES_AT_MIN` is honored as-is
+/// — the upper bound is open-ended on purpose so a user with an
+/// exotic-allowlist project can pick "group at 5" or higher without a
+/// schema bump.
+fn deserialize_group_rules_at<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<u32>::deserialize(deserializer)?;
+    Ok(match raw {
+        Some(n) if n >= GROUP_RULES_AT_MIN => Some(n),
+        Some(_) => default_group_rules_at(),
+        None => None,
+    })
 }
 
 /// Normalize a `visible_scopes` list: dedupe, reorder to match `Scope::ALL`,
@@ -352,6 +397,7 @@ mod tests {
             recent_projects: Vec::new(),
             audit_log_rotate: false,
             audit_log_max_size_mb: 25,
+            group_rules_at: Some(3),
         };
         let json = serde_json::to_string(&prefs).unwrap();
         let parsed: Preferences = serde_json::from_str(&json).unwrap();
@@ -382,6 +428,7 @@ mod tests {
                 recent_projects: Vec::new(),
                 audit_log_rotate: true,
                 audit_log_max_size_mb: AUDIT_LOG_MAX_SIZE_MB_DEFAULT,
+                group_rules_at: default_group_rules_at(),
             };
             let json = serde_json::to_string(&prefs).unwrap();
             let parsed: Preferences = serde_json::from_str(&json).unwrap();
@@ -409,6 +456,7 @@ mod tests {
             recent_projects: Vec::new(),
             audit_log_rotate: true,
             audit_log_max_size_mb: AUDIT_LOG_MAX_SIZE_MB_DEFAULT,
+            group_rules_at: default_group_rules_at(),
         };
         let json = serde_json::to_string(&prefs).unwrap();
         // The JS side reads this string verbatim — pinning the casing
@@ -488,6 +536,46 @@ mod tests {
         assert!(!prefs.audit_log_rotate);
         let json = serde_json::to_string(&prefs).unwrap();
         assert!(json.contains(r#""audit_log_rotate":false"#));
+    }
+
+    #[test]
+    fn group_rules_at_default_matches_legacy_constant() {
+        // Existing users should see the same grouping cadence #68 shipped
+        // with — Some(2). Missing-field deserializes the same way so
+        // older configs don't get a surprise on upgrade.
+        assert_eq!(Preferences::default().group_rules_at, Some(2));
+        let prefs: Preferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(prefs.group_rules_at, Some(2));
+    }
+
+    #[test]
+    fn group_rules_at_null_survives_round_trip() {
+        // `None` is a legitimate "never group" signal, distinct from
+        // any positive integer. Has to round-trip cleanly so the
+        // user's choice sticks.
+        let prefs: Preferences = serde_json::from_str(r#"{"group_rules_at":null}"#).unwrap();
+        assert_eq!(prefs.group_rules_at, None);
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert!(json.contains(r#""group_rules_at":null"#));
+    }
+
+    #[test]
+    fn group_rules_at_accepts_in_range_values() {
+        let prefs: Preferences = serde_json::from_str(r#"{"group_rules_at":3}"#).unwrap();
+        assert_eq!(prefs.group_rules_at, Some(3));
+        let prefs: Preferences = serde_json::from_str(r#"{"group_rules_at":7}"#).unwrap();
+        assert_eq!(prefs.group_rules_at, Some(7));
+    }
+
+    #[test]
+    fn group_rules_at_clamps_sub_minimum_to_default() {
+        // `Some(0)` would collapse every individual rule (nonsense)
+        // and `Some(1)` is no-op — both fall back to default rather
+        // than the floor, mirroring the audit-log size-cap policy.
+        let prefs: Preferences = serde_json::from_str(r#"{"group_rules_at":0}"#).unwrap();
+        assert_eq!(prefs.group_rules_at, default_group_rules_at());
+        let prefs: Preferences = serde_json::from_str(r#"{"group_rules_at":1}"#).unwrap();
+        assert_eq!(prefs.group_rules_at, default_group_rules_at());
     }
 
     #[test]
@@ -607,6 +695,7 @@ mod tests {
             recent_projects: Vec::new(),
             audit_log_rotate: true,
             audit_log_max_size_mb: AUDIT_LOG_MAX_SIZE_MB_DEFAULT,
+            group_rules_at: default_group_rules_at(),
         };
         let body = serde_json::to_vec_pretty(&first).unwrap();
         let parent = target.parent().unwrap();
@@ -625,6 +714,7 @@ mod tests {
             recent_projects: vec![PathBuf::from("/tmp/p1"), PathBuf::from("/tmp/p2")],
             audit_log_rotate: false,
             audit_log_max_size_mb: 5,
+            group_rules_at: None,
         };
         let body2 = serde_json::to_vec_pretty(&second).unwrap();
         let mut tmpfile2 = tempfile::NamedTempFile::new_in(parent).unwrap();
