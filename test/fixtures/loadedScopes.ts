@@ -155,6 +155,7 @@ export function buildPreferences(overrides: Partial<Preferences> = {}): Preferen
     visible_scopes: overrides.visible_scopes ?? [...SCOPES],
     theme: overrides.theme ?? "auto",
     backup_on_write: overrides.backup_on_write ?? true,
+    recent_projects: overrides.recent_projects ?? [],
   };
 }
 

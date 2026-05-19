@@ -39,6 +39,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   visible_scopes: [...SCOPES],
   theme: "auto",
   backup_on_write: true,
+  recent_projects: [],
 };
 
 const state: {
@@ -89,6 +90,11 @@ async function load(projectDir: string | null): Promise<void> {
     // the user just ran Claude in a new directory). Tolerated failure:
     // an empty list still lets all other UI work.
     refreshKnownProjects();
+    // Re-read preferences so the recent-projects dropdown (#47) reflects
+    // the LRU update the backend just persisted alongside this load.
+    // Fire-and-forget — a stale list is purely cosmetic and self-heals on
+    // the next successful load.
+    refreshPreferences();
   } catch (err) {
     alert(`Failed to load settings: ${err}`);
   } finally {
@@ -109,6 +115,17 @@ function refreshKnownProjects(): void {
     })
     .catch((err) => {
       console.warn("failed to list known projects:", err);
+    });
+}
+
+function refreshPreferences(): void {
+  invoke<Preferences>("load_preferences")
+    .then((prefs) => {
+      state.preferences = prefs;
+      render();
+    })
+    .catch((err) => {
+      console.warn("failed to refresh preferences:", err);
     });
 }
 
@@ -143,6 +160,20 @@ async function pickProject(): Promise<void> {
 async function reload(): Promise<void> {
   if (moveInFlight) return;
   await load(state.projectDir);
+}
+
+/**
+ * Load a project the user picked from the recent-projects dropdown (#47).
+ * Behaves like `pickProject` minus the OS picker: same query-reset, same
+ * move-in-flight guard, and a no-op when the selected entry is already the
+ * loaded project (clicking your current project shouldn't trigger a reload
+ * surprise).
+ */
+async function pickRecentProject(projectDir: string): Promise<void> {
+  if (moveInFlight) return;
+  if (projectDir === state.projectDir) return;
+  state.query = "";
+  await load(projectDir);
 }
 
 async function moveLeaf(
@@ -421,6 +452,7 @@ function render(): void {
     runtime: state.runtime,
     knownProjects: state.knownProjects,
     onPickProject: pickProject,
+    onPickRecentProject: pickRecentProject,
     onReload: reload,
     onMoveLeaf: moveLeaf,
     onChangeKind: changeKind,

@@ -230,6 +230,38 @@ body {
   white-space: nowrap;
 }
 
+/* Project-dir dropdown trigger (#47): inherits .project-dir layout but
+ * reads as a label, not a button — flat background, muted text, dotted
+ * underline cue that it's interactive. The shared `button` reset above
+ * gives it a panel-2 background by default; override here so the topbar
+ * stays visually flat the way it was before the dropdown affordance
+ * landed. */
+.project-dir-trigger {
+  background: transparent;
+  border: 1px solid transparent;
+  text-align: left;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.project-dir-trigger:hover:not(:disabled),
+.project-dir-trigger:focus-visible {
+  background: var(--panel-2);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.project-dir-trigger:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.project-dir-caret {
+  margin-left: 4px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
 button {
   background: var(--panel-2);
   color: var(--text);

@@ -38,6 +38,10 @@ interface AppProps {
    *  even on a fresh install. */
   knownProjects: KnownProject[];
   onPickProject: () => void;
+  /** Load a project the user picked from the recent-projects dropdown (#47).
+   *  Same query-reset semantics as `onPickProject`; the caller no-ops when
+   *  the picked path equals the currently-loaded project. */
+  onPickRecentProject: (projectDir: string) => void;
   onReload: () => void;
   onMoveLeaf: (req: MoveLeafRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
   /** Reclassify a permission rule between allow / deny / ask within the
@@ -592,6 +596,89 @@ function sandboxBanner(runtime: RuntimeInfo): HTMLElement | null {
   return banner;
 }
 
+/**
+ * Project label rendered as a dropdown of recently-opened projects (#47).
+ * Replaces the static "Project: …" label so users toggling between a small
+ * working set of repos don't have to round-trip the OS picker every time.
+ *
+ * Layout: the button itself shows the current project path (ellipsised by
+ * `.project-dir` styles); clicking it opens the existing `openContextMenu`
+ * primitive — same keyboard nav, outside-click dismissal, and focus-restore
+ * behavior the right-click menu already ships, so there's only one mental
+ * model to learn for menu UX in the app.
+ *
+ * Menu contents:
+ *   - Each entry in `preferences.recent_projects` except the currently
+ *     loaded path (an entry that just reloads what you're on would be
+ *     misleading affordance).
+ *   - A separator.
+ *   - "Open project…" — same callback as the standalone Open button, so
+ *     users who prefer the picker still have a one-click path to it.
+ *
+ * When `recent_projects` is empty (fresh install, or only the current
+ * project has been opened), the menu collapses to just the picker entry —
+ * still a useful affordance, never a dead-end empty menu.
+ */
+function projectDirDropdown(props: AppProps): HTMLElement {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "project-dir project-dir-trigger";
+  btn.setAttribute("aria-haspopup", "menu");
+  btn.setAttribute("aria-expanded", "false");
+  btn.disabled = props.busy;
+  const label = props.projectDir ? `Project: ${props.projectDir}` : "No project selected";
+  btn.textContent = label;
+  // Title attribute carries the full path so the truncated middle of a
+  // long path is still discoverable on hover, the way GitHub does it.
+  btn.title = label;
+
+  // Arrow caret kept inside the button (separate span) so the title /
+  // text-overflow ellipsis on the parent doesn't swallow it when the path
+  // overflows the column. The space before `▾` is part of the button's
+  // text content for visual breathing room without an extra flex layout.
+  const caret = document.createElement("span");
+  caret.className = "project-dir-caret";
+  caret.textContent = " ▾";
+  caret.setAttribute("aria-hidden", "true");
+  btn.appendChild(caret);
+
+  btn.addEventListener("click", (e) => {
+    e.preventDefault();
+    const items = buildRecentProjectMenuItems(props);
+    if (items.length === 0) return;
+    const rect = btn.getBoundingClientRect();
+    openContextMenu(items, rect.left, rect.bottom, btn);
+  });
+
+  return btn;
+}
+
+/**
+ * Items for the project-dir dropdown. Exported indirectly via the surface
+ * area of the button click handler above; kept as a separate function so
+ * vitest can drive it without going through `openContextMenu`'s real DOM
+ * positioning (which is awkward to assert against in a JSDOM environment).
+ */
+function buildRecentProjectMenuItems(props: AppProps): MenuItem[] {
+  const items: MenuItem[] = [];
+  const current = props.projectDir;
+  for (const path of props.preferences.recent_projects) {
+    if (path === current) continue;
+    items.push({
+      label: path,
+      onClick: () => props.onPickRecentProject(path),
+    });
+  }
+  if (items.length > 0) {
+    items.push({ separator: true });
+  }
+  items.push({
+    label: "Open project…",
+    onClick: () => props.onPickProject(),
+  });
+  return items;
+}
+
 function header(props: AppProps): HTMLElement {
   const bar = document.createElement("header");
   bar.className = "topbar";
@@ -602,10 +689,7 @@ function header(props: AppProps): HTMLElement {
     "<strong>ClaudeScope</strong><span class='subtitle'>Promote Claude Code settings between scopes</span>";
   bar.appendChild(title);
 
-  const dir = document.createElement("div");
-  dir.className = "project-dir";
-  dir.textContent = props.projectDir ? `Project: ${props.projectDir}` : "No project selected";
-  bar.appendChild(dir);
+  bar.appendChild(projectDirDropdown(props));
 
   bar.appendChild(searchBox(props));
 

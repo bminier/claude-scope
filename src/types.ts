@@ -178,6 +178,11 @@ export interface Preferences {
    *  configs without the field also default to `true` server-side, so the
    *  frontend can read it as a plain `boolean` here. */
   backup_on_write: boolean;
+  /** LRU of recently-opened project roots, most-recent first (#47). The
+   *  backend dedupes, drops empties, and caps the list, so the frontend
+   *  can render this list directly without re-normalizing. Defaults to
+   *  empty for older configs. */
+  recent_projects: string[];
 }
 
 /**
