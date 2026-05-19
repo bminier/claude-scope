@@ -399,6 +399,42 @@ button:disabled {
   background: var(--drop-target-bg);
 }
 
+/* Keyboard-pickup "ambient" target highlight (#41): every valid target
+   column gets this while a rule is picked up, so the user sees where
+   they can land before they navigate. The currently-focused target
+   stacks `.col-drop-active` on top for a stronger cue. Dashed border
+   keeps it distinct from the solid hover state. */
+.col-drop-available {
+  border-color: var(--accent);
+  border-style: dashed;
+}
+
+/* Visual cue for the picked-up source during a keyboard drag (#41).
+   `aria-pressed=true` is the modern replacement for the deprecated
+   `aria-grabbed`. The outline is offset so it doesn't fight the
+   element's own focus ring. */
+[aria-pressed="true"].rule-text,
+[aria-pressed="true"].tree-key,
+[aria-pressed="true"].chip {
+  outline: 2px dashed var(--accent);
+  outline-offset: 2px;
+}
+
+/* Screen-reader-only live region for the keyboard DnD announcer (#41).
+   Visible to assistive tech, not to sighted users. Classic clip-rect
+   technique — `display: none` would also hide it from AT. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* Grab cursors on the actual drag handles. Only applied when JS marks the
    element draggable (i.e. for whole top-level keys and rule chips when
    the app isn't busy), so non-draggable tree keys keep their default
