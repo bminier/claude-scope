@@ -61,11 +61,18 @@ jobs:
           path: ~/.cargo/bin
           key: ${{ runner.os }}-mdbook-${{ hashFiles('.github/workflows/docs.yml') }}
 
+      # Version pinning: mdbook-linkcheck 0.7.x reads mdbook's
+      # `RenderContext` directly, and that struct changed shape in
+      # mdbook 0.5 — the linkcheck preprocessor errors with
+      # `missing field 'sections'` against newer mdbook. Pinning both
+      # crates to versions known to interoperate is the standard
+      # workaround for that upstream incompatibility. Bump in lockstep
+      # if/when mdbook-linkcheck catches up.
       - name: Install mdbook + mdbook-linkcheck
         if: steps.cache-cargo-bin.outputs.cache-hit != 'true'
         run: |
-          cargo install mdbook --locked
-          cargo install mdbook-linkcheck --locked
+          cargo install mdbook --locked --version 0.4.37
+          cargo install mdbook-linkcheck --locked --version 0.7.7
 
       - name: Build (with hard linkcheck gate)
         # `mdbook build` returns non-zero on linkcheck errors because
