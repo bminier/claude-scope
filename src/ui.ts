@@ -519,8 +519,18 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   // the same scope+path could mean something different.
   if (props.projectDir !== lastRenderedProjectDir) {
     openTreeNodes.clear();
+    // Cross-pane highlight (#49) is project-scoped: a rule that
+    // existed in the previous project's `Bash(...)` allowlist might
+    // be totally unrelated to one with the same string in the new
+    // project. Clear to avoid surprising the user with a highlight
+    // they didn't request in the new context.
+    highlightedRule = null;
     lastRenderedProjectDir = props.projectDir;
   }
+  // Wire the document-level click/keydown handlers exactly once. The
+  // handlers themselves survive `innerHTML = ""` rebuilds; this just
+  // guarantees they're installed by the first render.
+  ensureRuleHighlightDelegation();
   root.appendChild(header(props));
   const banner = sandboxBanner(props.runtime);
   if (banner) root.appendChild(banner);
@@ -554,6 +564,10 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   root.appendChild(combinedPanel(props.scopes, props, lowerQuery));
   root.appendChild(scopeGrid(props, lowerQuery));
   restoreSearchFocus(preserveSearchFocus, caret);
+  // Re-apply the cross-pane highlight (#49) once the new chips are
+  // in the DOM. Self-heals if the previously-highlighted rule no
+  // longer appears anywhere (e.g. just-moved last copy).
+  applyRuleHighlight();
 }
 
 function restoreSearchFocus(
@@ -1093,6 +1107,118 @@ function seedDefaultOpenPermissions(loaded: LoadedScopes): void {
       }
     }
   }
+}
+
+// Cross-pane rule-highlight state (#49). One rule string at a time;
+// clicking the same chip toggles off, clicking a different chip swaps,
+// clicking outside any chip clears. Survives normal re-renders so a
+// watcher reload doesn't drop the highlight, but auto-clears when the
+// highlighted rule no longer appears anywhere on screen (e.g. after a
+// successful move that took the last copy off the grid).
+//
+// Match policy is exact string equality — no glob subsumption. That's
+// #17's job; the highlight is deliberately predictable.
+let highlightedRule: string | null = null;
+let highlightDelegationInstalled = false;
+
+/**
+ * Walk every per-scope rule chip and combined-panel chip on the page
+ * and add `.rule-highlight` to those whose textContent matches the
+ * current highlight. Called from `renderApp` after the tree is built,
+ * and from `setHighlightedRule` when the toggle fires without a full
+ * re-render. Idempotent — running twice in a row is a no-op.
+ *
+ * Self-healing: if `highlightedRule` is set but no chip matches it,
+ * the singleton is cleared. That covers the "moved the last copy"
+ * case without the move flow needing to know about highlights.
+ */
+function applyRuleHighlight(): void {
+  for (const el of document.querySelectorAll<HTMLElement>(".rule-highlight")) {
+    el.classList.remove("rule-highlight");
+  }
+  if (highlightedRule === null) return;
+  let matched = false;
+  for (const el of document.querySelectorAll<HTMLElement>(".rule-text, .chip")) {
+    if (el.textContent === highlightedRule) {
+      el.classList.add("rule-highlight");
+      matched = true;
+    }
+  }
+  if (!matched) highlightedRule = null;
+}
+
+/**
+ * Set or toggle the highlighted rule. Passing the same string twice
+ * clears (the issue spec's "second click toggles off" behavior).
+ * Passing `null` clears unconditionally — the click-outside and
+ * Escape paths use that form.
+ */
+function setHighlightedRule(rule: string | null): void {
+  if (rule !== null && highlightedRule === rule) {
+    highlightedRule = null;
+  } else {
+    highlightedRule = rule;
+  }
+  applyRuleHighlight();
+}
+
+function clearRuleHighlight(): void {
+  if (highlightedRule === null) return;
+  highlightedRule = null;
+  applyRuleHighlight();
+}
+
+/**
+ * Wire document-level click + keydown listeners that drive the
+ * cross-pane highlight. Delegation rather than per-chip handlers so
+ * the wiring survives `renderApp`'s `innerHTML = ""` rebuild — listeners
+ * stay attached, state survives, render-time `applyRuleHighlight`
+ * re-applies the class to whichever chips currently exist.
+ *
+ * Idempotent at module level: a flag prevents double-registration
+ * across reload-style renderApp calls.
+ */
+function ensureRuleHighlightDelegation(): void {
+  if (highlightDelegationInstalled) return;
+  highlightDelegationInstalled = true;
+
+  document.addEventListener("click", (e) => {
+    const target = e.target as HTMLElement | null;
+    if (!target) return;
+    const chip = target.closest<HTMLElement>(".rule-text, .chip");
+    if (chip) {
+      setHighlightedRule(chip.textContent);
+      return;
+    }
+    // Clicks on the chip's neighborhood (lint badge `.lint-info`, the
+    // chip-wrap shell, the rule row) shouldn't clear — the user is
+    // still interacting with the highlighted rule's UI. Only truly
+    // off-rule clicks dismiss.
+    if (target.closest(".chip-wrap, .rule")) return;
+    clearRuleHighlight();
+  });
+
+  document.addEventListener("keydown", (e) => {
+    // Defer to anything that already claimed the keystroke — modals
+    // (Escape closes), context menus (Escape pops one level), etc.
+    if (e.defaultPrevented) return;
+    if (e.key === "Escape") {
+      if (highlightedRule !== null) clearRuleHighlight();
+      return;
+    }
+    if (e.key === "h" || e.key === "H") {
+      const active = document.activeElement as HTMLElement | null;
+      if (!active) return;
+      // Skip while a text input has focus — `h` is a letter, the user
+      // is typing.
+      if (active.tagName === "INPUT" || active.tagName === "TEXTAREA") return;
+      if (active.isContentEditable) return;
+      const chip = active.closest<HTMLElement>(".rule-text, .chip");
+      if (!chip) return;
+      e.preventDefault();
+      setHighlightedRule(chip.textContent);
+    }
+  });
 }
 
 // HTML5 drag-and-drop source state. Set by `dragstart` on a movable tree
