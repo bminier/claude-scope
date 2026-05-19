@@ -11,10 +11,6 @@ description = "Desktop GUI for promoting Claude Code permission rules between sc
 authors = ["Brian Minier"]
 language = "en"
 src = "src"
-# Default multilingual mode would otherwise be picked up if a future
-# translation lands; pinning explicitly keeps the SUMMARY single-source
-# until that's a real concern.
-multilingual = false
 
 [build]
 # Build output goes to `docs/book/` (the mdBook default). The directory
