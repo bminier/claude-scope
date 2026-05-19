@@ -20,6 +20,15 @@ on:
     paths:
       - "docs/**"
       - ".github/workflows/docs.yml"
+  # PRs against dev that touch docs run the build job (linkcheck gate)
+  # but skip the deploy job — see the `if:` on the deploy job below.
+  # Without this, broken internal links could merge to dev and only
+  # fail at publish time, which is the wrong direction for a hard gate.
+  pull_request:
+    branches: [dev]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 concurrency:
