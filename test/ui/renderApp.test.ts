@@ -902,9 +902,9 @@ describe("help tooltips (#9)", () => {
       scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
     });
     renderApp(root, makeProps({ scopes }));
-    const projectLabel = Array.from(
-      root.querySelectorAll<HTMLElement>(".col-head-label"),
-    ).find((el) => el.textContent === "Project");
+    const projectLabel = Array.from(root.querySelectorAll<HTMLElement>(".col-head-label")).find(
+      (el) => el.textContent === "Project",
+    );
     expect(projectLabel).toBeDefined();
     expect(projectLabel?.classList.contains("has-help")).toBe(true);
     const h3 = projectLabel?.closest("h3");
