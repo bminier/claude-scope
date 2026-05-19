@@ -29,6 +29,7 @@ dirs = "6"
 tempfile = "3"
 notify-debouncer-mini = "0.7"
 clap = { version = "4", features = ["derive"] }
+ulid = { version = "1", features = ["serde"] }
 
 [features]
 # By default Tauri runs in production mode.
