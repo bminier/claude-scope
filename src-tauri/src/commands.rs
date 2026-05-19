@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::app_info::AppInfo;
+use crate::audit;
 use crate::io_atomic::{self, BackupTracker};
 use crate::model::{
     describe_path, key_policy, validate_movable_path, KeyPolicy, MovablePath, PathSeg,
@@ -258,16 +259,140 @@ pub fn diff_move_leaf(
     diff_move_leaf_impl(&paths, &req).map_err(|e| e.to_string())
 }
 
+/// Snapshot the value of a single top-level key on `path` if the file
+/// exists, returning `None` for "file absent" or "key absent" alike (the
+/// audit log uses `None` for both — Phase 2+ restore re-reads current
+/// state before computing any delta, so distinguishing the two at log time
+/// would just bloat the schema). Errors are also collapsed to `None`: an
+/// I/O hiccup pre-apply shouldn't poison the post-apply audit entry.
+fn snapshot_top_level_key(path: &Path, key: &str) -> Option<serde_json::Value> {
+    let (doc, _stamp) = io_atomic::load_with_stamp(path).ok()?;
+    doc.and_then(|d| d.get_top_level(key).cloned())
+}
+
+/// Classify a movable leaf path for the audit log. Path shapes mirror
+/// `validate_movable_path` — re-derived from the path itself rather than
+/// running validate again, because by the time the audit-recording code
+/// runs the apply impl has already validated. Keeping this classifier
+/// path-driven also means the audit module doesn't pull in `MovablePath`,
+/// which is a frontend-facing wire enum.
+fn audit_leaf_kind(path: &[PathSeg]) -> audit::LeafKind {
+    if path.len() == 1 {
+        audit::LeafKind::TopLevelKey
+    } else if path.len() == 2
+        && matches!(path.first().and_then(PathSeg::as_key), Some("permissions"))
+    {
+        audit::LeafKind::PermissionList
+    } else {
+        audit::LeafKind::PermissionRule
+    }
+}
+
+/// Build one [`audit::Side`] from the pre-resolved pieces. Returns `None`
+/// when the scope has no file path on this machine (e.g. user scope
+/// disabled on a sandboxed home), so the audit record skips the field
+/// rather than emitting `"file_path":""` placeholder garbage.
+fn audit_side(
+    scope: Scope,
+    file_path: Option<&Path>,
+    key: &str,
+    before: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
+) -> Option<audit::Side> {
+    let file_path = file_path?.to_path_buf();
+    Some(audit::Side {
+        scope,
+        file_path,
+        top_level_key: key.to_string(),
+        key_before: before,
+        key_after: after,
+    })
+}
+
+/// Append one entry to the audit log on a successful write. Fail-open: any
+/// error from the audit append surfaces as a Tauri event but never as a
+/// hard failure to the caller — the primary write already succeeded, and
+/// the user's stated intent (move / add / delete this rule) took effect.
+/// Sandbox sessions (`--home` override active) skip the write entirely so
+/// scratch-mode runs don't pollute the real `~/.claude/claude-scope/`.
+fn emit_audit(app: &AppHandle, overrides: &RuntimeOverrides, record: audit::Record) {
+    if overrides.home().is_some() {
+        return;
+    }
+    if let Err(err) = audit::append(&record, None) {
+        let _ = app.emit("audit-error", err.to_string());
+    }
+}
+
 #[tauri::command]
 pub fn apply_move_leaf(
     req: MoveLeafRequest,
     project_dir: Option<String>,
+    app: AppHandle,
     watch: State<'_, WatchState>,
     overrides: State<'_, RuntimeOverrides>,
 ) -> Result<(), String> {
     let paths =
         resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
-    apply_move_leaf_impl(&paths, &req, backups_for_session(), &watch).map_err(|e| e.to_string())
+
+    // Pre-read affected top-level keys so the audit record can carry a
+    // before-snapshot. Done here at the command boundary (rather than
+    // threading through apply_*_impl) so the 30+ impl-level unit tests
+    // stay untouched and the audit instrumentation is purely additive.
+    let key = path_top_level_key(&req.path).to_string();
+    let from_path = paths.path_for(req.from).map(Path::to_path_buf);
+    let to_path = paths.path_for(req.to).map(Path::to_path_buf);
+    let from_before = from_path
+        .as_deref()
+        .and_then(|p| snapshot_top_level_key(p, &key));
+    let to_before = if req.from == req.to {
+        from_before.clone()
+    } else {
+        to_path
+            .as_deref()
+            .and_then(|p| snapshot_top_level_key(p, &key))
+    };
+
+    apply_move_leaf_impl(&paths, &req, backups_for_session(), &watch).map_err(|e| e.to_string())?;
+
+    let from_after = from_path
+        .as_deref()
+        .and_then(|p| snapshot_top_level_key(p, &key));
+    let to_after = if req.from == req.to {
+        from_after.clone()
+    } else {
+        to_path
+            .as_deref()
+            .and_then(|p| snapshot_top_level_key(p, &key))
+    };
+
+    // Same-scope move with `to_kind` set is the "change kind" flow (#8);
+    // recorded as its own audit kind so a History reader (#19 Phase 2)
+    // can label it correctly instead of presenting a confusing
+    // "Move project → project" line.
+    let kind = if req.from == req.to && req.to_kind.is_some() {
+        audit::Kind::ChangeKind
+    } else {
+        audit::Kind::Move
+    };
+    let record = audit::Record::new(
+        kind,
+        audit_leaf_kind(&req.path),
+        audit::Actor::Gui,
+        project_dir.as_ref().map(PathBuf::from),
+        audit_side(
+            req.from,
+            from_path.as_deref(),
+            &key,
+            from_before,
+            from_after,
+        ),
+        audit_side(req.to, to_path.as_deref(), &key, to_before, to_after),
+        req.path.clone(),
+        req.to_kind,
+    );
+    emit_audit(&app, &overrides, record);
+    Ok(())
 }
 
 #[tauri::command]
@@ -285,12 +410,44 @@ pub fn diff_delete_leaf(
 pub fn apply_delete_leaf(
     req: DeleteLeafRequest,
     project_dir: Option<String>,
+    app: AppHandle,
     watch: State<'_, WatchState>,
     overrides: State<'_, RuntimeOverrides>,
 ) -> Result<(), String> {
     let paths =
         resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
-    apply_delete_leaf_impl(&paths, &req, backups_for_session(), &watch).map_err(|e| e.to_string())
+
+    let key = path_top_level_key(&req.path).to_string();
+    let from_path = paths.path_for(req.from).map(Path::to_path_buf);
+    let from_before = from_path
+        .as_deref()
+        .and_then(|p| snapshot_top_level_key(p, &key));
+
+    apply_delete_leaf_impl(&paths, &req, backups_for_session(), &watch)
+        .map_err(|e| e.to_string())?;
+
+    let from_after = from_path
+        .as_deref()
+        .and_then(|p| snapshot_top_level_key(p, &key));
+
+    let record = audit::Record::new(
+        audit::Kind::Delete,
+        audit_leaf_kind(&req.path),
+        audit::Actor::Gui,
+        project_dir.as_ref().map(PathBuf::from),
+        audit_side(
+            req.from,
+            from_path.as_deref(),
+            &key,
+            from_before,
+            from_after,
+        ),
+        None,
+        req.path.clone(),
+        None,
+    );
+    emit_audit(&app, &overrides, record);
+    Ok(())
 }
 
 #[tauri::command]
@@ -308,12 +465,37 @@ pub fn diff_add_leaf(
 pub fn apply_add_leaf(
     req: AddLeafRequest,
     project_dir: Option<String>,
+    app: AppHandle,
     watch: State<'_, WatchState>,
     overrides: State<'_, RuntimeOverrides>,
 ) -> Result<(), String> {
     let paths =
         resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
-    apply_add_leaf_impl(&paths, &req, backups_for_session(), &watch).map_err(|e| e.to_string())
+
+    let key = path_top_level_key(&req.path).to_string();
+    let to_path = paths.path_for(req.to).map(Path::to_path_buf);
+    let to_before = to_path
+        .as_deref()
+        .and_then(|p| snapshot_top_level_key(p, &key));
+
+    apply_add_leaf_impl(&paths, &req, backups_for_session(), &watch).map_err(|e| e.to_string())?;
+
+    let to_after = to_path
+        .as_deref()
+        .and_then(|p| snapshot_top_level_key(p, &key));
+
+    let record = audit::Record::new(
+        audit::Kind::Add,
+        audit_leaf_kind(&req.path),
+        audit::Actor::Gui,
+        project_dir.as_ref().map(PathBuf::from),
+        None,
+        audit_side(req.to, to_path.as_deref(), &key, to_before, to_after),
+        req.path.clone(),
+        None,
+    );
+    emit_audit(&app, &overrides, record);
+    Ok(())
 }
 
 /// Snapshot of the launch-time overrides — the front-end uses this to
@@ -2387,5 +2569,162 @@ mod tests {
         )
         .unwrap();
         assert!(!preview.to.will_write);
+    }
+
+    // -- audit helpers (#19 Phase 1) ---------------------------------------
+
+    #[test]
+    fn audit_leaf_kind_classifies_paths_by_shape() {
+        // Single-segment path is always a top-level key move (e.g. moving
+        // the whole `env` block between scopes).
+        assert_eq!(audit_leaf_kind(&[key("env")]), audit::LeafKind::TopLevelKey);
+        // Two-segment under `permissions` is a whole-list move.
+        assert_eq!(
+            audit_leaf_kind(&[key("permissions"), key("allow")]),
+            audit::LeafKind::PermissionList
+        );
+        // Three-segment under `permissions` is a single rule.
+        assert_eq!(
+            audit_leaf_kind(&[key("permissions"), key("allow"), idx(2)]),
+            audit::LeafKind::PermissionRule
+        );
+    }
+
+    #[test]
+    fn snapshot_top_level_key_reads_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"permissions":{"allow":["Bash(ls)"]}}"#).unwrap();
+        let snap = snapshot_top_level_key(&path, "permissions").unwrap();
+        assert_eq!(snap, serde_json::json!({"allow": ["Bash(ls)"]}));
+    }
+
+    #[test]
+    fn snapshot_top_level_key_returns_none_for_missing_file_or_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope.json");
+        // File absent — None, not an error.
+        assert!(snapshot_top_level_key(&missing, "permissions").is_none());
+
+        let present = tmp.path().join("settings.json");
+        std::fs::write(&present, r#"{"theme":"dark"}"#).unwrap();
+        // File present but no `permissions` key — also None. The audit
+        // schema uses `None` for both "absent file" and "absent key"
+        // alike, so this collapsing matches the wire contract.
+        assert!(snapshot_top_level_key(&present, "permissions").is_none());
+    }
+
+    #[test]
+    fn audit_side_returns_none_for_scope_with_no_path() {
+        // Some scopes have no file path on disk (e.g. user scope
+        // disabled). The Side builder must skip the field — emitting a
+        // Side with `file_path: ""` would be wire-format garbage.
+        let side = audit_side(
+            Scope::User,
+            None,
+            "permissions",
+            None,
+            Some(serde_json::json!({"allow": []})),
+        );
+        assert!(side.is_none());
+    }
+
+    /// End-to-end: run a real apply_move_leaf_impl, then synthesize the
+    /// same audit record the Tauri command would write, append it through
+    /// the audit module, and read it back. Validates the wire contract
+    /// against a realistic operation rather than only exercising helpers
+    /// in isolation.
+    #[test]
+    fn audit_record_for_apply_move_round_trips_through_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write(
+            paths.project.as_ref().unwrap(),
+            r#"{"permissions":{"allow":["Bash(ls)"]}}"#,
+        );
+        write(paths.user.as_ref().unwrap(), r#"{}"#);
+
+        let req = MoveLeafRequest {
+            path: vec![key("permissions"), key("allow"), idx(0)],
+            from: Scope::Project,
+            to: Scope::User,
+            to_kind: None,
+        };
+
+        // Mirror what the Tauri command does: pre-snapshot, apply,
+        // post-snapshot, build record, append.
+        let key_name = path_top_level_key(&req.path).to_string();
+        let from_before = snapshot_top_level_key(paths.project.as_ref().unwrap(), &key_name);
+        let to_before = snapshot_top_level_key(paths.user.as_ref().unwrap(), &key_name);
+
+        apply_move_leaf_impl(&paths, &req, None, &WatchState::default()).unwrap();
+
+        let from_after = snapshot_top_level_key(paths.project.as_ref().unwrap(), &key_name);
+        let to_after = snapshot_top_level_key(paths.user.as_ref().unwrap(), &key_name);
+
+        let rec = audit::Record::new(
+            audit::Kind::Move,
+            audit_leaf_kind(&req.path),
+            audit::Actor::Gui,
+            Some(paths.project_dir.clone()),
+            audit_side(
+                req.from,
+                paths.path_for(req.from),
+                &key_name,
+                from_before,
+                from_after,
+            ),
+            audit_side(
+                req.to,
+                paths.path_for(req.to),
+                &key_name,
+                to_before,
+                to_after,
+            ),
+            req.path.clone(),
+            req.to_kind,
+        );
+
+        // Sandbox the audit append into the test's tempdir — passing
+        // `Some(tmp.path())` redirects audit_path away from the real
+        // ~/.claude/.
+        audit::append(&rec, Some(tmp.path())).unwrap();
+        let (records, skipped) = audit::read_all(Some(tmp.path())).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(records.len(), 1);
+        let read = &records[0];
+        assert_eq!(read.kind, audit::Kind::Move);
+        assert_eq!(read.leaf_kind, audit::LeafKind::PermissionRule);
+        // The before snapshot must capture the rule we moved; the after
+        // snapshot must show it gone from the source. This is the
+        // restore-feasibility property — Phase 3+ needs both sides.
+        let from_side = read.from.as_ref().unwrap();
+        assert_eq!(
+            from_side.key_before,
+            Some(serde_json::json!({"allow": ["Bash(ls)"]}))
+        );
+        assert!(
+            from_side
+                .key_after
+                .as_ref()
+                .and_then(|v| v.get("allow"))
+                .and_then(|a| a.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "after snapshot should show the rule removed from source: got {:?}",
+            from_side.key_after
+        );
+        let to_side = read.to.as_ref().unwrap();
+        assert!(
+            to_side
+                .key_after
+                .as_ref()
+                .and_then(|v| v.get("allow"))
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().any(|x| x == "Bash(ls)"))
+                .unwrap_or(false),
+            "after snapshot should show the rule landed on destination: got {:?}",
+            to_side.key_after
+        );
     }
 }
