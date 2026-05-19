@@ -6,6 +6,7 @@ authors = ["Brian Minier"]
 license = "MIT"
 edition = "2021"
 rust-version = "1.88"
+default-run = "claude-scope"
 
 [lib]
 name = "claude_scope_lib"
