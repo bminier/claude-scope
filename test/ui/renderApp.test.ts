@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   AppInfo,
+  AuditRecordView,
+  AuditSide,
   KnownProject,
   MoveLeafRequest,
   MoveOptions,
@@ -15,6 +17,7 @@ import {
   lookupKindHelp,
   lookupScopeHelp,
   openAbout,
+  openHistory,
   openSettings,
   renderApp,
   renderDiagnosticsMarkdown,
@@ -73,6 +76,7 @@ function makeProps(overrides: PropsOverrides = {}) {
     knownProjects: overrides.knownProjects ?? [],
     onPickProject: overrides.onPickProject ?? vi.fn(),
     onPickRecentProject: overrides.onPickRecentProject ?? vi.fn(),
+    onOpenHistory: vi.fn(),
     onReload: vi.fn(),
     onMoveLeaf: overrides.onMoveLeaf ?? vi.fn(),
     onChangeKind: vi.fn(),
@@ -1051,5 +1055,193 @@ describe("project-dir dropdown (#47)", () => {
     renderApp(root, makeProps({ busy: true }));
     const trigger = root.querySelector<HTMLButtonElement>(".project-dir-trigger");
     expect(trigger?.disabled).toBe(true);
+  });
+});
+
+describe("History dialog (#19 phase 2)", () => {
+  beforeEach(() => {
+    // Drain any leaked modal Escape listeners from earlier tests in the
+    // file — same trick the help-tooltips suite uses. Without this, a
+    // prior leaked listener's preventDefault would fire BEFORE our own
+    // History dialog's close() and `defaultPrevented = true` would short
+    // our Escape-closes-the-dialog assertion later in the suite.
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    clearBody();
+  });
+
+  afterEach(() => {
+    // Tear down any modal that survived the test.
+    for (const b of Array.from(document.querySelectorAll(".modal-backdrop"))) b.remove();
+    clearBody();
+  });
+
+  function makeRecord(overrides: Partial<AuditRecordView> = {}): AuditRecordView {
+    return {
+      id: "01HFAKEID0000000000000000",
+      kind: "move",
+      leaf_kind: "permission_rule",
+      actor: "gui",
+      path: ["permissions", "allow", 0],
+      claude_scope_version: "0.3.0",
+      ts_ms: 1_700_000_000_000,
+      ...overrides,
+    };
+  }
+
+  function makeSide(scope: Scope, before: unknown, after: unknown): AuditSide {
+    return {
+      scope,
+      file_path: `/fake/${scope}/.claude/settings.json`,
+      top_level_key: "permissions",
+      key_before: before as never,
+      key_after: after as never,
+    };
+  }
+
+  it("empty page renders the empty-state copy and a Close button", () => {
+    openHistory({ records: [], skipped: 0 });
+    const dialog = document.querySelector<HTMLElement>(".modal-history");
+    expect(dialog).not.toBeNull();
+    expect(dialog?.textContent ?? "").toContain("No audit entries yet");
+    expect(document.querySelector(".history-list")).toBeNull();
+  });
+
+  it("null page (read failure) renders the error message instead of empty state", () => {
+    openHistory(null);
+    const dialog = document.querySelector<HTMLElement>(".modal-history");
+    expect(dialog?.textContent ?? "").toContain("could not be read");
+    // The empty-state copy is NOT shown — it would lie about state.
+    expect(dialog?.textContent ?? "").not.toContain("No audit entries yet");
+  });
+
+  it("renders one row per record in reverse-chronological order", () => {
+    const older = makeRecord({ id: "01HOLDER", ts_ms: 1_700_000_000_000 });
+    const newer = makeRecord({ id: "01HNEWER", ts_ms: 1_700_000_100_000 });
+    openHistory({ records: [older, newer], skipped: 0 });
+    const rows = Array.from(document.querySelectorAll<HTMLElement>(".history-row"));
+    expect(rows).toHaveLength(2);
+    // Newer first — that's the reverse of file order.
+    const firstTs = rows[0].querySelector<HTMLTimeElement>(".history-ts");
+    expect(firstTs?.dateTime).toBe(new Date(newer.ts_ms).toISOString());
+  });
+
+  it("renders a Move row with from→to scopes and the moved rule extracted from the diff", () => {
+    const rec = makeRecord({
+      kind: "move",
+      leaf_kind: "permission_rule",
+      from: makeSide("project", { allow: ["Bash(ls)", "Read(*)"] }, { allow: ["Read(*)"] }),
+      to: makeSide("user", { allow: [] }, { allow: ["Bash(ls)"] }),
+    });
+    openHistory({ records: [rec], skipped: 0 });
+    const row = document.querySelector(".history-row");
+    expect(row?.querySelector(".history-verb")?.textContent).toBe("Move permission rule");
+    expect(row?.querySelector(".history-scopes")?.textContent).toBe("Project → User");
+    // Rule diff: the move drops `Bash(ls)` from the source side — that's
+    // the string the History UI should surface.
+    expect(row?.querySelector(".history-rule")?.textContent).toBe("Bash(ls)");
+  });
+
+  it("renders an Add row with just the destination scope and the new rule", () => {
+    const rec = makeRecord({
+      kind: "add",
+      leaf_kind: "permission_rule",
+      from: undefined,
+      to: makeSide("user", { allow: ["Read(*)"] }, { allow: ["Read(*)", "Bash(ls)"] }),
+      path: ["permissions", "allow", 1],
+    });
+    openHistory({ records: [rec], skipped: 0 });
+    const row = document.querySelector(".history-row");
+    expect(row?.querySelector(".history-verb")?.textContent).toBe("Add permission rule");
+    expect(row?.querySelector(".history-scopes")?.textContent).toBe("User");
+    expect(row?.querySelector(".history-rule")?.textContent).toBe("Bash(ls)");
+  });
+
+  it("renders a Delete row with single scope and the dropped rule", () => {
+    const rec = makeRecord({
+      kind: "delete",
+      leaf_kind: "permission_rule",
+      from: makeSide("project", { allow: ["Bash(ls)"] }, { allow: [] }),
+      to: undefined,
+    });
+    openHistory({ records: [rec], skipped: 0 });
+    const row = document.querySelector(".history-row");
+    expect(row?.querySelector(".history-verb")?.textContent).toBe("Delete permission rule");
+    expect(row?.querySelector(".history-scopes")?.textContent).toBe("Project");
+    expect(row?.querySelector(".history-rule")?.textContent).toBe("Bash(ls)");
+  });
+
+  it("renders a ChangeKind row labelling the destination kind", () => {
+    const rec = makeRecord({
+      kind: "change_kind",
+      leaf_kind: "permission_rule",
+      from: makeSide(
+        "project",
+        { allow: ["Bash(rm *)"], deny: [] },
+        { allow: [], deny: ["Bash(rm *)"] },
+      ),
+      to: makeSide(
+        "project",
+        { allow: ["Bash(rm *)"], deny: [] },
+        { allow: [], deny: ["Bash(rm *)"] },
+      ),
+      to_kind: "deny",
+    });
+    openHistory({ records: [rec], skipped: 0 });
+    const row = document.querySelector(".history-row");
+    expect(row?.querySelector(".history-verb")?.textContent).toBe("Change kind → deny");
+    // The diff still pulls the rule string from the from-side disappearance
+    // (allow lost it). That's the property the History UI binds to —
+    // change-kind ops should still surface WHICH rule changed.
+    expect(row?.querySelector(".history-rule")?.textContent).toBe("Bash(rm *)");
+  });
+
+  it("renders a top-level-key row using the key name from the path", () => {
+    const rec = makeRecord({
+      kind: "move",
+      leaf_kind: "top_level_key",
+      path: ["env"],
+      from: makeSide("project", { FOO: "1" }, undefined),
+      to: makeSide("user", undefined, { FOO: "1" }),
+    });
+    openHistory({ records: [rec], skipped: 0 });
+    const row = document.querySelector(".history-row");
+    expect(row?.querySelector(".history-verb")?.textContent).toBe("Move top-level key");
+    expect(row?.querySelector(".history-rule")?.textContent).toBe("env");
+  });
+
+  it("renders the skipped-lines footer warning when records were unreadable", () => {
+    openHistory({ records: [makeRecord()], skipped: 3 });
+    const skipped = document.querySelector(".history-skipped");
+    expect(skipped?.textContent ?? "").toContain("3 unreadable entries were skipped");
+  });
+
+  it("singular vs plural in the skipped footer", () => {
+    openHistory({ records: [makeRecord()], skipped: 1 });
+    expect(document.querySelector(".history-skipped")?.textContent ?? "").toContain(
+      "1 unreadable entry was skipped",
+    );
+  });
+
+  it("renders the project_dir line when present", () => {
+    const rec = makeRecord({ project_dir: "/work/proj-x" });
+    openHistory({ records: [rec], skipped: 0 });
+    const row = document.querySelector(".history-row");
+    expect(row?.querySelector(".history-project")?.textContent).toBe("Project: /work/proj-x");
+  });
+
+  it("omits the project_dir line when the field is absent (user-scope-only op)", () => {
+    openHistory({ records: [makeRecord({ project_dir: undefined })], skipped: 0 });
+    expect(document.querySelector(".history-project")).toBeNull();
+  });
+
+  it("Escape closes the dialog", () => {
+    openHistory({ records: [makeRecord()], skipped: 0 });
+    expect(document.querySelector(".modal-backdrop")).not.toBeNull();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    expect(document.querySelector(".modal-backdrop")).toBeNull();
   });
 });

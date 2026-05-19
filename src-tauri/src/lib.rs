@@ -56,6 +56,7 @@ pub fn run(context: tauri::Context) {
             commands::save_preferences,
             commands::load_runtime_info,
             commands::list_known_projects,
+            commands::list_audit_records,
             commands::get_app_info,
         ])
         .run(context)

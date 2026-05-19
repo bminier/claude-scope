@@ -4,6 +4,9 @@ import type {
   AddLeafPreview,
   AddLeafRequest,
   AppInfo,
+  AuditLogPage,
+  AuditRecordView,
+  AuditSide,
   DeleteLeafPreview,
   DeleteLeafRequest,
   JsonValue,
@@ -60,6 +63,11 @@ interface AppProps {
    *  bootstrap; the caller routes the click through main.ts so it can also
    *  refresh the cache if it's stale. */
   onOpenAbout: (trigger?: HTMLElement) => void;
+  /** Open the audit-log History dialog (#19 phase 2). main.ts fetches the
+   *  records via `list_audit_records` IPC and hands them to the renderer
+   *  in this callback's body, mirroring the openSettings / openAbout
+   *  trigger-pattern so focus restore lands on the History button. */
+  onOpenHistory: (trigger?: HTMLElement) => void;
   onQueryChange: (next: string) => void;
 }
 
@@ -707,6 +715,12 @@ function header(props: AppProps): HTMLElement {
   reload.onclick = props.onReload;
   reload.disabled = props.busy || !props.scopes;
   actions.appendChild(reload);
+
+  const history = document.createElement("button");
+  history.textContent = "History";
+  history.setAttribute("aria-label", "Open audit history");
+  history.onclick = (e) => props.onOpenHistory(e.currentTarget as HTMLElement);
+  actions.appendChild(history);
 
   const settings = document.createElement("button");
   settings.textContent = "Settings";
@@ -3180,4 +3194,273 @@ export function renderDiagnosticsMarkdown(info: AppInfo): string {
     `- Rust (MSRV): ${info.rust_version}`,
     `- OS: ${info.os} ${info.arch}`,
   ].join("\n");
+}
+
+/**
+ * Open the audit-log History dialog (#19 phase 2). Read-only: lists every
+ * write ClaudeScope has made since the audit log was first written, in
+ * reverse-chronological order. The "Restore to before this" action the
+ * issue spec mentions lands with #19 phase 3+; this dialog deliberately
+ * omits it so the read path can ship first.
+ *
+ * `page` arrives null when the bootstrap fetch failed (e.g. the audit
+ * file was unreadable) — the dialog still opens, with an explanatory
+ * status line, rather than swallowing the click. Empty `records` arrays
+ * are common (fresh install, no writes yet) and render as a friendly
+ * empty state.
+ */
+export function openHistory(page: AuditLogPage | null, trigger?: HTMLElement | null): void {
+  const body = document.createElement("div");
+  body.className = "history-body";
+
+  if (page === null) {
+    const err = document.createElement("p");
+    err.className = "history-error";
+    err.textContent = "Audit log could not be read. See the app log for details.";
+    body.appendChild(err);
+  } else if (page.records.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "history-empty";
+    empty.textContent =
+      "No audit entries yet. Every move / add / delete you make from here will appear in this list.";
+    body.appendChild(empty);
+  } else {
+    body.appendChild(historyList(page.records));
+    if (page.skipped > 0) {
+      const warn = document.createElement("p");
+      warn.className = "history-skipped";
+      warn.textContent = `${page.skipped} unreadable ${
+        page.skipped === 1 ? "entry was" : "entries were"
+      } skipped — see the app log for details.`;
+      body.appendChild(warn);
+    }
+  }
+
+  openModal({
+    titleText: "History",
+    body,
+    actions: [
+      {
+        label: "Close",
+        className: "btn-apply",
+        focus: true,
+        activate: (close) => close(),
+      },
+    ],
+    panelClassName: "modal-history",
+    trigger,
+  });
+}
+
+/**
+ * Build the reverse-chronological list of audit entries. The records
+ * arrive in file order from the IPC (which is append order = ULID-sorted
+ * = chronological); flipping here keeps "most recent first" — the most
+ * useful ordering for a "what just happened?" view — without paying for
+ * a backend sort.
+ */
+function historyList(records: AuditRecordView[]): HTMLElement {
+  const ul = document.createElement("ul");
+  ul.className = "history-list";
+  // Slice before reverse so we don't mutate the caller's array — the
+  // History dialog is intentionally side-effect-free.
+  for (const rec of records.slice().reverse()) {
+    ul.appendChild(historyRow(rec));
+  }
+  return ul;
+}
+
+function historyRow(rec: AuditRecordView): HTMLElement {
+  const li = document.createElement("li");
+  li.className = "history-row";
+
+  const head = document.createElement("div");
+  head.className = "history-row-head";
+
+  const verb = document.createElement("span");
+  verb.className = `history-verb history-verb-${rec.kind}`;
+  verb.textContent = historyVerbLabel(rec);
+  head.appendChild(verb);
+
+  const ts = document.createElement("time");
+  ts.className = "history-ts";
+  // Pin to ISO + locale: the ISO form goes in `datetime` so assistive
+  // tech reads the unambiguous absolute time, while the visible text is
+  // the locale-formatted version a user can scan. Avoids the "is that
+  // 06/05 May or June?" ambiguity that any pure-date display invites.
+  const date = new Date(rec.ts_ms);
+  ts.dateTime = date.toISOString();
+  ts.textContent = date.toLocaleString();
+  head.appendChild(ts);
+
+  li.appendChild(head);
+
+  const detail = document.createElement("div");
+  detail.className = "history-row-detail";
+  detail.appendChild(historyScopeArrow(rec));
+  const rule = historyRuleSummary(rec);
+  if (rule) detail.appendChild(rule);
+  li.appendChild(detail);
+
+  if (rec.project_dir) {
+    const proj = document.createElement("div");
+    proj.className = "history-project";
+    proj.textContent = `Project: ${rec.project_dir}`;
+    li.appendChild(proj);
+  }
+
+  return li;
+}
+
+/**
+ * Human-readable verb label for a record. Composes
+ * (`kind`, `leaf_kind`, `to_kind`) into one phrase so the History row
+ * reads as "Move permission rule" / "Delete top-level key" /
+ * "Change kind to deny" instead of forcing the user to reconcile two
+ * fields visually.
+ */
+function historyVerbLabel(rec: AuditRecordView): string {
+  if (rec.kind === "change_kind") {
+    // Same-scope reclassification: name the destination kind explicitly
+    // so the user sees the "what changed" at a glance.
+    return rec.to_kind ? `Change kind → ${rec.to_kind}` : "Change kind";
+  }
+  const noun = historyLeafNoun(rec.leaf_kind);
+  switch (rec.kind) {
+    case "move":
+      return `Move ${noun}`;
+    case "add":
+      return `Add ${noun}`;
+    case "delete":
+      return `Delete ${noun}`;
+  }
+}
+
+function historyLeafNoun(leafKind: AuditRecordView["leaf_kind"]): string {
+  switch (leafKind) {
+    case "permission_rule":
+      return "permission rule";
+    case "permission_list":
+      return "permission list";
+    case "top_level_key":
+      return "top-level key";
+  }
+}
+
+/** "Project → User" arrow for moves, single-scope label for adds/deletes. */
+function historyScopeArrow(rec: AuditRecordView): HTMLElement {
+  const span = document.createElement("span");
+  span.className = "history-scopes";
+  const from = rec.from?.scope;
+  const to = rec.to?.scope;
+  if (from && to && from !== to) {
+    span.textContent = `${scopeLabel(from)} → ${scopeLabel(to)}`;
+  } else if (from) {
+    span.textContent = scopeLabel(from);
+  } else if (to) {
+    span.textContent = scopeLabel(to);
+  } else {
+    span.textContent = "—";
+  }
+  return span;
+}
+
+function scopeLabel(scope: Scope): string {
+  switch (scope) {
+    case "user":
+      return "User";
+    case "user_local":
+      return "User-Local";
+    case "project":
+      return "Project";
+    case "local":
+      return "Local";
+  }
+}
+
+/**
+ * Extract the rule string (or key name) the op touched, by diffing the
+ * before/after snapshots. For a permission-rule op, the rule appears in
+ * either `from.key_before − from.key_after` (move/delete) or
+ * `to.key_after − to.key_before` (add). For a top-level key op, the
+ * `path[0]` segment IS the key name and a snapshot diff isn't needed.
+ *
+ * Falls back to `null` (no element appended) when the diff can't
+ * identify a single rule — better to render an unannotated row than to
+ * lie about what changed.
+ */
+function historyRuleSummary(rec: AuditRecordView): HTMLElement | null {
+  if (rec.leaf_kind === "top_level_key") {
+    const key = typeof rec.path[0] === "string" ? rec.path[0] : null;
+    if (!key) return null;
+    return makeRuleSpan(key);
+  }
+  // Permission rule or list. For a list op, the path[1] is the kind
+  // (allow/deny/ask) and that's the most informative summary.
+  if (rec.leaf_kind === "permission_list") {
+    const kind = typeof rec.path[1] === "string" ? rec.path[1] : null;
+    return kind ? makeRuleSpan(`permissions.${kind}`) : null;
+  }
+  // PermissionRule: diff the snapshots to recover the rule string.
+  const rule = extractRuleFromDiff(rec);
+  return rule ? makeRuleSpan(rule) : null;
+}
+
+function makeRuleSpan(text: string): HTMLElement {
+  const span = document.createElement("span");
+  span.className = "history-rule";
+  span.textContent = text;
+  return span;
+}
+
+/**
+ * Diff the before/after rule arrays on the side that contains the
+ * change, returning the single rule string the op acted on. Picks the
+ * side based on op kind:
+ *
+ *   - Move / ChangeKind: source side loses the rule, so before − after
+ *     on `from` is authoritative.
+ *   - Add: destination gains the rule; after − before on `to`.
+ *   - Delete: source loses the rule; before − after on `from`.
+ *
+ * Returns the first matching string; if the diff yields multiple (a
+ * batch op the schema doesn't yet model), this still surfaces a
+ * representative rule rather than nothing.
+ */
+function extractRuleFromDiff(rec: AuditRecordView): string | null {
+  const kindArg = typeof rec.path[1] === "string" ? rec.path[1] : null;
+  if (!kindArg) return null;
+  if (rec.kind === "add") {
+    const before = rulesForKind(rec.to, kindArg);
+    const after = rulesForKind(rec.to, kindArg, true);
+    return firstNewIn(after, before);
+  }
+  // Move / Delete / ChangeKind: rule disappears from the source side.
+  const before = rulesForKind(rec.from, kindArg);
+  const after = rulesForKind(rec.from, kindArg, true);
+  return firstNewIn(before, after);
+}
+
+/**
+ * Pull the `permissions.<kind>` array off a side's snapshot. `useAfter`
+ * picks `key_after` vs `key_before` — kept as a flag rather than passing
+ * the right field directly so the caller's diff logic reads top-to-bottom
+ * without branching on which side.
+ */
+function rulesForKind(side: AuditSide | undefined, kind: string, useAfter = false): string[] {
+  if (!side) return [];
+  const snapshot = useAfter ? side.key_after : side.key_before;
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return [];
+  const arr = (snapshot as { [key: string]: JsonValue })[kind];
+  if (!Array.isArray(arr)) return [];
+  return arr.filter((v): v is string => typeof v === "string");
+}
+
+/** First element of `a` that doesn't appear in `b`, or null. */
+function firstNewIn(a: string[], b: string[]): string | null {
+  const bSet = new Set(b);
+  for (const v of a) {
+    if (!bSet.has(v)) return v;
+  }
+  return null;
 }

@@ -7,6 +7,7 @@ import type {
   AddLeafPreview,
   AddLeafRequest,
   AppInfo,
+  AuditLogPage,
   DeleteLeafPreview,
   DeleteLeafRequest,
   KnownProject,
@@ -27,6 +28,7 @@ import {
   confirmDeleteLeaf,
   confirmMoveLeaf,
   openAbout,
+  openHistory,
   openSettings,
   renderApp,
 } from "./ui.ts";
@@ -460,12 +462,31 @@ function render(): void {
     onAddLeaf: addLeaf,
     onOpenSettings,
     onOpenAbout: handleOpenAbout,
+    onOpenHistory: handleOpenHistory,
     onQueryChange: setQuery,
   });
 }
 
 function handleOpenAbout(trigger?: HTMLElement): void {
   openAbout(state.appInfo, trigger ?? null);
+}
+
+/**
+ * Fetch the audit log from the backend and open the History dialog
+ * (#19 phase 2). Fetched on each click — the log grows over time and
+ * the dialog should reflect every write, including ones made in this
+ * session. On IPC failure, open the dialog with `null` so the user sees
+ * an error message rather than a silent no-op (the dialog handles that
+ * branch).
+ */
+async function handleOpenHistory(trigger?: HTMLElement): Promise<void> {
+  let page: AuditLogPage | null = null;
+  try {
+    page = await invoke<AuditLogPage>("list_audit_records");
+  } catch (err) {
+    console.warn("failed to read audit log:", err);
+  }
+  openHistory(page, trigger ?? null);
 }
 
 // Pressing "/" anywhere focuses the rule-search input, GitHub / Gmail style —
