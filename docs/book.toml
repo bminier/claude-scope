@@ -1,0 +1,47 @@
+# mdBook configuration for the ClaudeScope docs site (#26).
+#
+# Published to https://bminier.github.io/claude-scope/ via the
+# `.github/workflows/docs.yml` workflow on every push to `dev`.
+# `mdbook-linkcheck` runs as a hard gate during the build — broken
+# internal links fail the workflow.
+
+[book]
+title = "ClaudeScope"
+description = "Desktop GUI for promoting Claude Code permission rules between scopes."
+authors = ["Brian Minier"]
+language = "en"
+src = "src"
+# Default multilingual mode would otherwise be picked up if a future
+# translation lands; pinning explicitly keeps the SUMMARY single-source
+# until that's a real concern.
+multilingual = false
+
+[build]
+# Build output goes to `docs/book/` (the mdBook default). The directory
+# is gitignored; CI uploads it as the Pages artifact. Local previews
+# work via `mdbook serve docs/`.
+build-dir = "book"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/bminier/claude-scope"
+edit-url-template = "https://github.com/bminier/claude-scope/edit/dev/docs/{path}"
+site-url = "/claude-scope/"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+# Hard internal-link gate (#26 DoD). The preprocessor walks every
+# rendered chapter and fails the build if any local Markdown link
+# resolves nowhere. External link rot is handled separately by
+# `.github/workflows/link-check.yml` (lychee, non-blocking) — the two
+# tools are complementary: lychee covers the whole markdown surface
+# weekly with non-fatal reporting, this gate covers the book's internal
+# graph on every build with a hard fail.
+[output.linkcheck]
+follow-web-links = false
+warning-policy = "error"
+exclude = []

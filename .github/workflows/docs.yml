@@ -1,0 +1,87 @@
+# Builds the mdBook docs site (#26) and publishes it to GitHub Pages
+# on every push to dev. Manual dispatch is available for one-off
+# rebuilds (e.g. re-running after a workflow tweak).
+#
+# `mdbook-linkcheck` runs as a hard gate during the build — any broken
+# internal link fails the workflow. External link rot is handled by
+# `.github/workflows/link-check.yml` (lychee, non-blocking) on a
+# weekly schedule; the two tools are complementary.
+#
+# Pages config (one-time, in repo Settings → Pages):
+#   - Source: "GitHub Actions" (not "Deploy from a branch")
+# Without that flip, the actions/deploy-pages step here errors with
+# "Get Pages site failed" — author the workflow first, then enable.
+
+name: Docs
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+concurrency:
+  # One published artifact at a time per ref. Cancel an in-flight
+  # build when a newer push lands so the latest source wins.
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build mdBook
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # `mdbook` and `mdbook-linkcheck` are small, self-contained Rust
+      # binaries. Using `cargo install` keeps the toolchain pinned to
+      # whatever version is current at workflow-run time without
+      # introducing a third-party setup action. Cached so re-runs that
+      # don't change anything skip the compile.
+      - name: Cache cargo bin
+        id: cache-cargo-bin
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cargo/bin
+          key: ${{ runner.os }}-mdbook-${{ hashFiles('.github/workflows/docs.yml') }}
+
+      - name: Install mdbook + mdbook-linkcheck
+        if: steps.cache-cargo-bin.outputs.cache-hit != 'true'
+        run: |
+          cargo install mdbook --locked
+          cargo install mdbook-linkcheck --locked
+
+      - name: Build (with hard linkcheck gate)
+        # `mdbook build` returns non-zero on linkcheck errors because
+        # `book.toml` sets `warning-policy = "error"`. No extra flags
+        # needed — the config is the source of truth so a local
+        # `mdbook build docs/` reproduces CI failure modes.
+        run: mdbook build docs/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book/html
+
+  deploy:
+    name: Deploy to Pages
+    # Only publish from the canonical branch. PR builds run the build
+    # job for the linkcheck gate but don't deploy — that would leak
+    # in-progress edits to the live URL.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/dev'
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
