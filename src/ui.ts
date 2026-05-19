@@ -1111,21 +1111,87 @@ interface DragSource {
   el: HTMLElement;
 }
 let dragSource: DragSource | null = null;
+// Distinguishes a keyboard pickup (#41) from a mouse drag using the same
+// `dragSource` payload. Drives screen-reader announcements (mouse hover
+// doesn't need narration; keyboard target focus does) and the
+// `.col-drop-available` highlight that previews valid targets — mouse
+// drags only highlight the *active* hover, not every available target.
+let keyboardActive = false;
+// Label captured at pickup so the announcer can name the rule when it
+// announces target focus, even after the source element is unmounted
+// mid-drop. Read from the source's textContent at pickup time.
+let keyboardPickupLabel = "";
 
 function clearDragState(): void {
+  if (dragSource?.el) {
+    dragSource.el.removeAttribute("aria-pressed");
+  }
   dragSource = null;
+  keyboardActive = false;
+  keyboardPickupLabel = "";
   // Belt-and-suspenders: a drop on a non-target column doesn't fire its
   // own dragleave, so a stale `.col-drop-active` could survive into the
-  // next render. Sweep them all here on any drag-state reset.
+  // next render. Sweep them all here on any drag-state reset. Same for
+  // `.col-drop-available` (keyboard-pickup target hints) and the
+  // tabindex we added to columns so they could receive focus during
+  // pickup — the column shouldn't stay in the tab order once the
+  // pickup ends.
   for (const el of document.querySelectorAll<HTMLElement>(".col-drop-active")) {
     el.classList.remove("col-drop-active");
   }
+  for (const el of document.querySelectorAll<HTMLElement>(".col-drop-available")) {
+    el.classList.remove("col-drop-available");
+    el.removeAttribute("tabindex");
+  }
+}
+
+/**
+ * Lazy aria-live region for the keyboard DnD flow (#41). Used to
+ * announce pickup, target focus, and cancel — actual move outcomes are
+ * surfaced by the existing scope-reload UI, so the live region stays
+ * focused on the transient gestures the visual UI doesn't otherwise
+ * narrate.
+ *
+ * Idempotent: subsequent calls return the existing node. Sits as a
+ * body-level sibling of the app root so it survives `renderApp`'s
+ * `innerHTML = ""` rebuild (which only clears the app container).
+ * Visually hidden via the `.sr-only` class.
+ */
+function announcerEl(): HTMLElement {
+  let el = document.getElementById("a11y-announcer");
+  if (el) return el;
+  el = document.createElement("div");
+  el.id = "a11y-announcer";
+  el.className = "sr-only";
+  el.setAttribute("role", "status");
+  el.setAttribute("aria-live", "polite");
+  el.setAttribute("aria-atomic", "true");
+  document.body.appendChild(el);
+  return el;
+}
+
+/**
+ * Push a message into the polite live region. Clearing the textContent
+ * before setting the new value forces screen readers to re-announce
+ * even when the new message is identical to the last one — without
+ * that, the second pickup of the same rule would be silent.
+ */
+function announce(message: string): void {
+  const el = announcerEl();
+  el.textContent = "";
+  // Microtask so the clear-then-set is observable to AT instead of
+  // collapsing into a single set. `requestAnimationFrame` would also
+  // work; setTimeout(0) is the smallest hammer that's portable.
+  setTimeout(() => {
+    el.textContent = message;
+  }, 0);
 }
 
 function setupLeafDragSource(el: HTMLElement, scope: Scope, path: PathSeg[]): void {
   el.draggable = true;
   el.addEventListener("dragstart", (e) => {
     dragSource = { path, from: scope, el };
+    keyboardActive = false;
     if (e.dataTransfer) {
       // Custom MIME type used in dragover to reject foreign drags from other
       // apps or browser tabs before checking dragSource. The payload lives in
@@ -1135,6 +1201,78 @@ function setupLeafDragSource(el: HTMLElement, scope: Scope, path: PathSeg[]): vo
     }
   });
   el.addEventListener("dragend", clearDragState);
+
+  // Keyboard pickup (#41). Sources `setupLeafDragSource` runs on are
+  // movable by construction — same set the mouse-DnD pipeline accepts —
+  // so the keyboard surface mirrors the mouse surface without a separate
+  // affordance map. `tabIndex` may already be set by
+  // `wrapWithOriginTooltip` on rule chips; setting it again is idempotent.
+  if (el.tabIndex < 0) el.tabIndex = 0;
+  el.addEventListener("keydown", (e) => {
+    if (e.key !== " " && e.key !== "Enter") return;
+    // Allow Enter to activate the lint badge / help info button when the
+    // user has tabbed into one of those — they're inside the row but
+    // shouldn't pick up the rule. Only initiate pickup when the event
+    // target is the source element itself.
+    if (e.target !== el) return;
+    e.preventDefault();
+    e.stopPropagation();
+    beginKeyboardPickup(el, scope, path);
+  });
+}
+
+/**
+ * Pick up a rule via keyboard (#41). Mirrors `dragstart` but doesn't
+ * route through `DataTransfer` — there's no native equivalent for a
+ * non-pointer drag and we don't need one. Sets the same `dragSource`
+ * the mouse pipeline uses so the drop path in `column()` accepts both
+ * mouse and keyboard pickups identically, with the same `skipConfirm:
+ * true` behavior #70 chose.
+ *
+ * Refuses pickup when another pickup is already active (the active one
+ * has to be cancelled with Escape first) — keyboard pickup is supposed
+ * to be deliberate, and silently swapping sources would undermine that.
+ */
+function beginKeyboardPickup(el: HTMLElement, scope: Scope, path: PathSeg[]): void {
+  if (dragSource) return;
+  dragSource = { path, from: scope, el };
+  keyboardActive = true;
+  keyboardPickupLabel = (el.textContent ?? "").trim() || "this item";
+  el.setAttribute("aria-pressed", "true");
+  highlightAvailableTargets(scope);
+  const firstTarget = document.querySelector<HTMLElement>(".col-drop-available");
+  if (firstTarget) {
+    firstTarget.focus();
+    announce(
+      `Picked up ${keyboardPickupLabel} from ${SCOPE_LABELS[scope]}. ` +
+        `Use Left and Right arrow keys to choose a scope, Enter to drop, Escape to cancel.`,
+    );
+  } else {
+    // No valid targets (other scopes all hidden / busy / same scope) —
+    // back out without leaving the source in a half-picked-up state.
+    dragSource = null;
+    keyboardActive = false;
+    keyboardPickupLabel = "";
+    el.removeAttribute("aria-pressed");
+    announce("No other scope is available as a drop target.");
+  }
+}
+
+/**
+ * Mark every scope column other than `fromScope` as a candidate target,
+ * giving each one a `tabindex` so arrow nav and focus-on-Tab work. The
+ * existing `.col-drop-active` class is reserved for the *current* hover
+ * (mouse) or focus (keyboard); `.col-drop-available` is the "ambient"
+ * highlight that previews every valid target during keyboard pickup so
+ * the user can see where they can land before they navigate.
+ */
+function highlightAvailableTargets(fromScope: Scope): void {
+  for (const col of document.querySelectorAll<HTMLElement>(".col")) {
+    const scope = col.dataset.scope as Scope | undefined;
+    if (!scope || scope === fromScope) continue;
+    col.classList.add("col-drop-available");
+    col.tabIndex = 0;
+  }
 }
 
 function treeKey(scope: Scope, path: PathSeg[]): string {
@@ -1633,6 +1771,10 @@ function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
 function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTMLElement {
   const col = document.createElement("div");
   col.className = "col";
+  // Tag the scope on the DOM node so the keyboard-pickup pipeline (#41)
+  // can pick out which columns are valid targets without re-walking the
+  // ScopeView list it doesn't have a handle to.
+  col.dataset.scope = view.scope;
   // Column-level context menu (#8 paste). Leaf and chip handlers
   // stopPropagation on contextmenu, so this only fires when the user
   // right-clicks on the column chrome itself (header, status row, empty
@@ -1683,6 +1825,62 @@ function scopeColumn(view: ScopeView, props: AppProps, lowerQuery: string): HTML
     // undo lands (#19).
     const opts: MoveOptions = { skipConfirm: true };
     props.onMoveLeaf({ path: src.path, from: src.from, to: view.scope }, trigger, opts);
+  });
+
+  // Keyboard drop / nav (#41). The column only takes keystrokes when a
+  // keyboard pickup is active; if a mouse user happens to tab onto a
+  // column with `.col-drop-available` set (they shouldn't be able to —
+  // we only add `tabindex` during pickup — but defensive), the column
+  // is otherwise inert.
+  col.addEventListener("keydown", (e) => {
+    if (!keyboardActive || !dragSource) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      const src = dragSource;
+      const restoreTarget = src.el.isConnected ? src.el : null;
+      clearDragState();
+      announce("Move cancelled.");
+      restoreTarget?.focus();
+      return;
+    }
+    if (e.key === "Enter" || e.key === " ") {
+      // Don't fire on the source's own column — it can't be a target
+      // (same-scope drops are explicitly out of scope per #43). The
+      // available-target highlighting filters those out, but tabbing
+      // past the visible cue is still possible.
+      if (dragSource.from === view.scope || props.busy) return;
+      e.preventDefault();
+      const src = dragSource;
+      const trigger = src.el.isConnected ? src.el : undefined;
+      clearDragState();
+      props.onMoveLeaf({ path: src.path, from: src.from, to: view.scope }, trigger, {
+        skipConfirm: true,
+      });
+      return;
+    }
+    if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      e.preventDefault();
+      const targets = Array.from(document.querySelectorAll<HTMLElement>(".col-drop-available"));
+      if (targets.length === 0) return;
+      const idx = targets.indexOf(col);
+      const step = e.key === "ArrowRight" ? 1 : -1;
+      const next = targets[(idx + step + targets.length) % targets.length];
+      next.focus();
+    }
+  });
+
+  // Announce when focus lands on a valid target column during keyboard
+  // pickup. Fires for both initial focus (set programmatically in
+  // `beginKeyboardPickup`) and arrow nav — `focus` is the natural
+  // intersection of both paths.
+  col.addEventListener("focus", () => {
+    if (!keyboardActive || !dragSource) return;
+    if (dragSource.from === view.scope) return;
+    col.classList.add("col-drop-active");
+    announce(`${SCOPE_LABELS[view.scope]} scope. Press Enter to drop, Escape to cancel.`);
+  });
+  col.addEventListener("blur", () => {
+    col.classList.remove("col-drop-active");
   });
 
   const head = document.createElement("div");
