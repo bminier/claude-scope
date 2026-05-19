@@ -46,3 +46,9 @@ src-tauri/WixTools/
 # Releases. Belt-and-suspenders ignore in case a stale config or local run
 # resurrects the file.
 CHANGELOG.md
+
+# mdBook output (#26). `mdbook build docs/` regenerates `docs/book/` on
+# every run, and CI publishes it via actions/deploy-pages. Local builds
+# can also be served from `docs/book/`; the source of truth lives at
+# `docs/src/`.
+docs/book/

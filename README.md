@@ -5,6 +5,8 @@
 
 Desktop GUI for promoting [Claude Code](https://docs.claude.com/en/docs/claude-code) permission rules between scopes — without hand-editing JSON.
 
+📖 **User and architecture docs live at [bminier.github.io/claude-scope](https://bminier.github.io/claude-scope/)** — built from `docs/src/` via mdBook, deployed on every push to `dev`.
+
 > For the original problem statement, design goals, and non-goals, see [`CLAUDE.md`](./CLAUDE.md). It's the project brief; the README is the "how to use and hack on it" doc.
 
 ## What it does
