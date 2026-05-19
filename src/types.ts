@@ -224,3 +224,73 @@ export interface AppInfo {
   os: string;
   arch: string;
 }
+
+/**
+ * Audit log entry kinds (#19). Mirrors Rust's `audit::Kind` — snake_case
+ * wire strings pinned by `record_kind_serializes_to_snake_case_strings`
+ * in commands.rs. `change_kind` is the same-scope reclassification flow;
+ * the full set will grow as #16 / #17 / #18 land in future phases.
+ */
+export type AuditKind = "move" | "change_kind" | "add" | "delete";
+
+/**
+ * What shape of leaf the audit record's `path` targets. Mirrors Rust's
+ * `audit::LeafKind`. The History view uses this with [[AuditKind]] to
+ * compose human-readable labels like "Move permission rule" or
+ * "Delete top-level key".
+ */
+export type AuditLeafKind = "top_level_key" | "permission_list" | "permission_rule";
+
+/**
+ * Who triggered an audit record. Phase 1 only emits `gui`; the other
+ * variants reserve wire-format slots for the CLI (#13) and undo / restore
+ * (#19 phases 3-4) so the schema can extend without breaking older
+ * History readers.
+ */
+export type AuditActor = "gui" | "cli" | "skill" | "restore";
+
+/**
+ * One side of an audit record's write. Mirrors Rust's `audit::Side` —
+ * scope, file path, and a snapshot of the affected top-level key both
+ * before and after the op. `null` distinguishes "key absent / file
+ * absent" from a literal JSON `null` (which arrives as `null` in the
+ * `key_*` fields but the surrounding object is still present).
+ */
+export interface AuditSide {
+  scope: Scope;
+  file_path: string;
+  top_level_key: string;
+  key_before?: JsonValue | null;
+  key_after?: JsonValue | null;
+}
+
+/**
+ * One entry in the History view. Mirrors the wire shape from Rust's
+ * `commands::AuditRecordView` — `audit::Record` fields flattened with a
+ * derived `ts_ms` so the frontend doesn't need to parse Crockford base32
+ * ULIDs to render timestamps.
+ */
+export interface AuditRecordView {
+  id: string;
+  kind: AuditKind;
+  leaf_kind: AuditLeafKind;
+  actor: AuditActor;
+  project_dir?: string;
+  from?: AuditSide;
+  to?: AuditSide;
+  path: PathSeg[];
+  to_kind?: PermissionKind;
+  claude_scope_version: string;
+  ts_ms: number;
+}
+
+/**
+ * Payload from `list_audit_records`. `skipped` is the count of malformed
+ * lines the reader silently dropped (truncated tail, schema drift) so
+ * the History view can surface a non-fatal footer warning rather than
+ * acting as if the log were intact.
+ */
+export interface AuditLogPage {
+  records: AuditRecordView[];
+  skipped: number;
+}

@@ -1309,3 +1309,112 @@ button:disabled {
 .modal-diff-single {
   grid-template-columns: 1fr;
 }
+
+/* History dialog (#19 phase 2). Wider than About so long paths and rule
+   strings have room without wrapping into hard-to-scan multi-line blocks. */
+.modal-history {
+  max-width: 640px;
+  padding: 16px 18px;
+}
+
+.history-body {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.history-empty,
+.history-error {
+  margin: 12px 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.history-error {
+  color: var(--danger, #c0392b);
+}
+
+.history-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.history-row {
+  border-top: 1px solid var(--border);
+  padding: 8px 4px;
+  font-size: 13px;
+}
+
+.history-row:first-child {
+  border-top: 0;
+}
+
+.history-row-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.history-verb {
+  font-weight: 600;
+}
+
+/* Subtle color tints by verb so the user can scan the column visually. */
+.history-verb-move {
+  color: var(--accent);
+}
+
+.history-verb-add {
+  color: var(--ok, #2c8a3e);
+}
+
+.history-verb-delete {
+  color: var(--danger, #c0392b);
+}
+
+.history-verb-change_kind {
+  color: var(--warn, #b88216);
+}
+
+.history-ts {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-row-detail {
+  margin-top: 4px;
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.history-scopes {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.history-rule {
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+}
+
+.history-project {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  font-family: var(--mono, monospace);
+}
+
+.history-skipped {
+  margin: 10px 0 0;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+  border-radius: 4px;
+}

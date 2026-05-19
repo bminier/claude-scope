@@ -516,6 +516,51 @@ pub fn list_known_projects(
     projects::list_known_projects(overrides.home()).map_err(|e| e.to_string())
 }
 
+/// One row in the History view's audit-log list (#19 phase 2). Wraps an
+/// [`audit::Record`] with a derived `ts_ms` field so the frontend doesn't
+/// need to ship its own ULID parser to render timestamps. The 48-bit
+/// timestamp is embedded in the first half of the ULID; pulling it out
+/// here keeps that decode in one place.
+#[derive(Debug, Serialize)]
+pub struct AuditRecordView {
+    #[serde(flatten)]
+    pub record: audit::Record,
+    /// Unix millis-since-epoch, decoded from the record's ULID.
+    pub ts_ms: u64,
+}
+
+/// Payload for `list_audit_records`: the records plus a count of any
+/// malformed lines the reader skipped. `skipped > 0` is non-fatal — the
+/// History view surfaces it as a small footer warning so the user knows
+/// some entries are unreadable, but the rest of the log still renders.
+#[derive(Debug, Serialize)]
+pub struct AuditLogPage {
+    pub records: Vec<AuditRecordView>,
+    pub skipped: usize,
+}
+
+/// Read the audit log for the History view (#19 phase 2). Routes through
+/// `RuntimeOverrides::home` so sandbox sessions (#66) and unit tests read
+/// from their scratch home rather than the real `~/.claude/`. A missing
+/// file returns an empty page — fresh installs and users who haven't
+/// made any writes yet shouldn't see an error here.
+///
+/// The records are returned in file order (append order, which matches
+/// chronological order thanks to ULIDs). The frontend reverses for
+/// display.
+#[tauri::command]
+pub fn list_audit_records(overrides: State<'_, RuntimeOverrides>) -> Result<AuditLogPage, String> {
+    let (records, skipped) = audit::read_all(overrides.home()).map_err(|e| e.to_string())?;
+    let records = records
+        .into_iter()
+        .map(|r| {
+            let ts_ms = r.id.timestamp_ms();
+            AuditRecordView { record: r, ts_ms }
+        })
+        .collect();
+    Ok(AuditLogPage { records, skipped })
+}
+
 /// Build- and runtime-time diagnostic block for the About dialog (#21).
 /// `webview_version` is queried at command time — it's the one field that
 /// can vary across processes (a system WebView2 update mid-session) and
@@ -2726,5 +2771,87 @@ mod tests {
             "after snapshot should show the rule landed on destination: got {:?}",
             to_side.key_after
         );
+    }
+
+    // -- list_audit_records / AuditRecordView (#19 phase 2) ----------------
+
+    /// Build the same `AuditLogPage` shape the Tauri command emits, but
+    /// reaching past the `State<RuntimeOverrides>` wrapper that's awkward
+    /// to construct in a unit test. Verifies the ts_ms derivation is
+    /// stable across the ULID → wire round trip — that's the property
+    /// the History UI binds its timestamp rendering to.
+    #[test]
+    fn audit_record_view_decodes_ts_ms_from_ulid() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Append two records spaced apart so ts_ms differences are
+        // observable. The audit module's own tests cover empty / truncated
+        // edge cases; this one only validates the view layer.
+        let rec1 = audit::Record::new(
+            audit::Kind::Move,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            None,
+            None,
+            vec![key("permissions"), key("allow"), idx(0)],
+            None,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let rec2 = audit::Record::new(
+            audit::Kind::Add,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            None,
+            None,
+            vec![key("permissions"), key("deny"), idx(0)],
+            None,
+        );
+        audit::append(&rec1, Some(tmp.path())).unwrap();
+        audit::append(&rec2, Some(tmp.path())).unwrap();
+
+        let (records, skipped) = audit::read_all(Some(tmp.path())).unwrap();
+        assert_eq!(skipped, 0);
+        let views: Vec<AuditRecordView> = records
+            .into_iter()
+            .map(|r| {
+                let ts_ms = r.id.timestamp_ms();
+                AuditRecordView { record: r, ts_ms }
+            })
+            .collect();
+
+        // The derived ts_ms matches the ULID's embedded timestamp — that's
+        // the contract the History UI binds its rendering to.
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].ts_ms, rec1.id.timestamp_ms());
+        assert_eq!(views[1].ts_ms, rec2.id.timestamp_ms());
+        // And the second record's ts_ms is strictly greater — the
+        // 3ms sleep above guarantees ULID monotonicity.
+        assert!(views[1].ts_ms > views[0].ts_ms);
+    }
+
+    #[test]
+    fn audit_record_view_serializes_flattened_with_ts_ms() {
+        // Pin the wire format: `ts_ms` appears at the top level alongside
+        // the record's own fields (flatten), not nested. The History UI's
+        // TS interface mirrors this shape; a serde regression here would
+        // break the frontend silently.
+        let rec = audit::Record::new(
+            audit::Kind::Delete,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            None,
+            None,
+            vec![key("permissions"), key("allow"), idx(0)],
+            None,
+        );
+        let ts_ms = rec.id.timestamp_ms();
+        let view = AuditRecordView { record: rec, ts_ms };
+        let json: serde_json::Value = serde_json::to_value(&view).unwrap();
+        assert_eq!(json.get("kind").and_then(|v| v.as_str()), Some("delete"));
+        assert_eq!(json.get("ts_ms").and_then(|v| v.as_u64()), Some(ts_ms));
+        // `record` is flattened — there should NOT be a nested `record` key.
+        assert!(json.get("record").is_none());
     }
 }
