@@ -50,6 +50,8 @@ interface PropsOverrides {
   runtime?: ReturnType<typeof buildRuntimeInfo>;
   knownProjects?: KnownProject[];
   onMoveLeaf?: (req: MoveLeafRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
+  onPickProject?: () => void;
+  onPickRecentProject?: (projectDir: string) => void;
 }
 
 function makeProps(overrides: PropsOverrides = {}) {
@@ -69,7 +71,8 @@ function makeProps(overrides: PropsOverrides = {}) {
     preferences: overrides.preferences ?? buildPreferences(),
     runtime: overrides.runtime ?? buildRuntimeInfo(),
     knownProjects: overrides.knownProjects ?? [],
-    onPickProject: vi.fn(),
+    onPickProject: overrides.onPickProject ?? vi.fn(),
+    onPickRecentProject: overrides.onPickRecentProject ?? vi.fn(),
     onReload: vi.fn(),
     onMoveLeaf: overrides.onMoveLeaf ?? vi.fn(),
     onChangeKind: vi.fn(),
@@ -954,5 +957,99 @@ describe("help tooltips (#9)", () => {
     wrapB?.querySelector<HTMLButtonElement>(".help-info")?.click();
     expect(wrapA?.classList.contains("is-open")).toBe(false);
     expect(wrapB?.classList.contains("is-open")).toBe(true);
+  });
+});
+
+describe("project-dir dropdown (#47)", () => {
+  let root: HTMLElement;
+
+  beforeEach(() => {
+    root = makeRoot();
+  });
+
+  afterEach(() => {
+    for (const m of Array.from(document.querySelectorAll(".context-menu"))) m.remove();
+    clearBody();
+  });
+
+  function openDropdown(): HTMLElement[] {
+    const trigger = root.querySelector<HTMLButtonElement>(".project-dir-trigger");
+    if (!trigger) throw new Error("expected .project-dir-trigger button");
+    trigger.click();
+    return Array.from(document.querySelectorAll<HTMLElement>(".context-menu"));
+  }
+
+  it("project-dir trigger is a button with aria-haspopup=menu", () => {
+    renderApp(root, makeProps({}));
+    const trigger = root.querySelector<HTMLButtonElement>(".project-dir-trigger");
+    expect(trigger).not.toBeNull();
+    expect(trigger?.tagName).toBe("BUTTON");
+    expect(trigger?.getAttribute("aria-haspopup")).toBe("menu");
+  });
+
+  it("dropdown lists recent projects (filtering out the current one) plus Open project…", () => {
+    const scopes = buildLoadedScopes({ project_dir: "/work/current" });
+    const preferences = buildPreferences({
+      recent_projects: ["/work/current", "/work/alpha", "/home/me/beta"],
+    });
+    renderApp(root, makeProps({ scopes, preferences }));
+    const menus = openDropdown();
+    expect(menus.length).toBe(1);
+    const labels = Array.from(menus[0].querySelectorAll<HTMLButtonElement>(".context-menu-item"))
+      .map((b) => b.textContent ?? "")
+      // The submenu arrow span lives inside the button textContent on
+      // submenu triggers, but this menu has none; readability over
+      // micro-trims.
+      .map((s) => s.trim());
+    // Current project must be filtered — opening it would just reload.
+    expect(labels).not.toContain("/work/current");
+    expect(labels).toContain("/work/alpha");
+    expect(labels).toContain("/home/me/beta");
+    // Picker entry always lands as the last item.
+    expect(labels[labels.length - 1]).toBe("Open project…");
+  });
+
+  it("clicking a recent entry invokes onPickRecentProject with that path", () => {
+    const scopes = buildLoadedScopes({ project_dir: "/work/current" });
+    const preferences = buildPreferences({
+      recent_projects: ["/work/alpha", "/home/me/beta"],
+    });
+    const onPickRecentProject = vi.fn();
+    renderApp(root, makeProps({ scopes, preferences, onPickRecentProject }));
+    const menus = openDropdown();
+    const target = Array.from(
+      menus[0].querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    ).find((b) => (b.textContent ?? "").trim() === "/work/alpha");
+    expect(target).toBeDefined();
+    target?.click();
+    expect(onPickRecentProject).toHaveBeenCalledWith("/work/alpha");
+  });
+
+  it("clicking Open project… invokes onPickProject", () => {
+    const preferences = buildPreferences({ recent_projects: ["/work/alpha"] });
+    const onPickProject = vi.fn();
+    renderApp(root, makeProps({ preferences, onPickProject }));
+    const menus = openDropdown();
+    const opener = Array.from(
+      menus[0].querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    ).find((b) => (b.textContent ?? "").trim() === "Open project…");
+    expect(opener).toBeDefined();
+    opener?.click();
+    expect(onPickProject).toHaveBeenCalled();
+  });
+
+  it("empty recent_projects still shows the picker entry — no dead-end menu", () => {
+    renderApp(root, makeProps({ preferences: buildPreferences({ recent_projects: [] }) }));
+    const menus = openDropdown();
+    const labels = Array.from(
+      menus[0].querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    ).map((b) => (b.textContent ?? "").trim());
+    expect(labels).toEqual(["Open project…"]);
+  });
+
+  it("trigger is disabled while a load is in flight", () => {
+    renderApp(root, makeProps({ busy: true }));
+    const trigger = root.querySelector<HTMLButtonElement>(".project-dir-trigger");
+    expect(trigger?.disabled).toBe(true);
   });
 });

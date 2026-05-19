@@ -11,11 +11,17 @@
 //! or first-run config, not error out.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::scope::Scope;
+
+/// Maximum number of paths kept in `recent_projects`. The dropdown (#47)
+/// shows this many entries plus an "Open project…" escape hatch — enough
+/// for the working set of repos a user typically toggles between without
+/// turning the menu into a vertical scroll.
+pub const RECENT_PROJECTS_CAP: usize = 10;
 
 /// Shape of the persisted config file. Every field carries a `#[serde(default)]`
 /// so unknown or missing keys degrade gracefully to sensible defaults — the
@@ -53,6 +59,12 @@ pub struct Preferences {
     /// into `io_atomic::save` and the existing no-backup arm runs.
     #[serde(default = "default_backup_on_write")]
     pub backup_on_write: bool,
+    /// LRU of project roots the user has opened in ClaudeScope, most-recent
+    /// first. Drives the project-label dropdown (#47). The deserialize hook
+    /// dedupes and caps at [`RECENT_PROJECTS_CAP`] so a hand-edited or
+    /// older config can't push the menu into an unbounded list.
+    #[serde(default, deserialize_with = "deserialize_recent_projects")]
+    pub recent_projects: Vec<PathBuf>,
 }
 
 impl Default for Preferences {
@@ -61,6 +73,7 @@ impl Default for Preferences {
             visible_scopes: default_visible_scopes(),
             theme: Theme::default(),
             backup_on_write: default_backup_on_write(),
+            recent_projects: Vec::new(),
         }
     }
 }
@@ -97,6 +110,70 @@ where
 {
     let raw = Vec::<Scope>::deserialize(deserializer)?;
     Ok(normalize_visible_scopes(raw))
+}
+
+/// Compare two paths for LRU de-dup. Case-insensitive on Windows (filesystem
+/// is case-insensitive there, so two entries differing only in drive-letter
+/// case refer to the same directory and would otherwise stack); exact match
+/// elsewhere.
+fn same_recent_path(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        a.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+/// Drop empty paths, dedupe (preserving first-seen order, which from the
+/// JSON file means most-recent-first), and truncate to the cap. Shared by
+/// the serde hook and the in-process [`push_recent_project`] helper so both
+/// pathways enforce the same invariants.
+fn normalize_recent_projects(input: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::with_capacity(input.len().min(RECENT_PROJECTS_CAP));
+    for p in input {
+        if p.as_os_str().is_empty() {
+            continue;
+        }
+        if out.iter().any(|existing| same_recent_path(existing, &p)) {
+            continue;
+        }
+        out.push(p);
+        if out.len() >= RECENT_PROJECTS_CAP {
+            break;
+        }
+    }
+    out
+}
+
+fn deserialize_recent_projects<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Vec::<PathBuf>::deserialize(deserializer)?;
+    Ok(normalize_recent_projects(raw))
+}
+
+/// Promote `path` to the front of [`Preferences::recent_projects`], removing
+/// any earlier occurrence (case-insensitively on Windows) and truncating to
+/// the cap. Called from `load_scopes` on every successful project load so the
+/// LRU stays honest — the user opening a project IS the signal we want to
+/// record, no extra UI ceremony needed.
+pub fn push_recent_project(prefs: &mut Preferences, path: &Path) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    prefs
+        .recent_projects
+        .retain(|existing| !same_recent_path(existing, path));
+    prefs.recent_projects.insert(0, path.to_path_buf());
+    if prefs.recent_projects.len() > RECENT_PROJECTS_CAP {
+        prefs.recent_projects.truncate(RECENT_PROJECTS_CAP);
+    }
 }
 
 /// Deserialize a `Theme` value, falling back to `Auto` for any unrecognized
@@ -221,6 +298,7 @@ mod tests {
             visible_scopes: vec![Scope::Local, Scope::Project],
             theme: Theme::Light,
             backup_on_write: false,
+            recent_projects: Vec::new(),
         };
         let json = serde_json::to_string(&prefs).unwrap();
         let parsed: Preferences = serde_json::from_str(&json).unwrap();
@@ -248,6 +326,7 @@ mod tests {
                 visible_scopes: default_visible_scopes(),
                 theme,
                 backup_on_write: true,
+                recent_projects: Vec::new(),
             };
             let json = serde_json::to_string(&prefs).unwrap();
             let parsed: Preferences = serde_json::from_str(&json).unwrap();
@@ -272,6 +351,7 @@ mod tests {
             visible_scopes: default_visible_scopes(),
             theme: Theme::Dark,
             backup_on_write: true,
+            recent_projects: Vec::new(),
         };
         let json = serde_json::to_string(&prefs).unwrap();
         // The JS side reads this string verbatim — pinning the casing
@@ -304,6 +384,106 @@ mod tests {
         assert!(json.contains(r#""backup_on_write":false"#));
     }
 
+    #[test]
+    fn recent_projects_default_is_empty() {
+        let prefs = Preferences::default();
+        assert!(prefs.recent_projects.is_empty());
+    }
+
+    #[test]
+    fn recent_projects_missing_field_deserializes_as_empty() {
+        let prefs: Preferences = serde_json::from_str("{}").unwrap();
+        assert!(prefs.recent_projects.is_empty());
+    }
+
+    #[test]
+    fn push_recent_project_prepends() {
+        let mut prefs = Preferences::default();
+        push_recent_project(&mut prefs, Path::new("/a"));
+        push_recent_project(&mut prefs, Path::new("/b"));
+        assert_eq!(
+            prefs.recent_projects,
+            vec![PathBuf::from("/b"), PathBuf::from("/a")],
+        );
+    }
+
+    #[test]
+    fn push_recent_project_promotes_existing_to_front() {
+        let mut prefs = Preferences::default();
+        push_recent_project(&mut prefs, Path::new("/a"));
+        push_recent_project(&mut prefs, Path::new("/b"));
+        push_recent_project(&mut prefs, Path::new("/a"));
+        // `/a` was older; the third push should move it to the front and
+        // drop the stale entry, not double-list it.
+        assert_eq!(
+            prefs.recent_projects,
+            vec![PathBuf::from("/a"), PathBuf::from("/b")],
+        );
+    }
+
+    #[test]
+    fn push_recent_project_caps_at_max() {
+        let mut prefs = Preferences::default();
+        for i in 0..(RECENT_PROJECTS_CAP + 5) {
+            push_recent_project(&mut prefs, &PathBuf::from(format!("/p{i}")));
+        }
+        assert_eq!(prefs.recent_projects.len(), RECENT_PROJECTS_CAP);
+        // The most-recent push must still sit at index 0 — truncation
+        // drops the tail, not the head.
+        assert_eq!(
+            prefs.recent_projects[0],
+            PathBuf::from(format!("/p{}", RECENT_PROJECTS_CAP + 4))
+        );
+    }
+
+    #[test]
+    fn push_recent_project_ignores_empty_path() {
+        let mut prefs = Preferences::default();
+        push_recent_project(&mut prefs, Path::new(""));
+        assert!(prefs.recent_projects.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn push_recent_project_dedupes_case_insensitively_on_windows() {
+        // Windows filesystem is case-insensitive; two entries differing only
+        // in drive-letter case point at the same dir and would otherwise
+        // stack up in the dropdown.
+        let mut prefs = Preferences::default();
+        push_recent_project(&mut prefs, Path::new(r"D:\repos\claude-scope"));
+        push_recent_project(&mut prefs, Path::new(r"d:\repos\Claude-Scope"));
+        assert_eq!(prefs.recent_projects.len(), 1);
+        // The newer (lowercased) entry wins — it represents the user's
+        // most recent observed casing.
+        assert_eq!(
+            prefs.recent_projects[0],
+            PathBuf::from(r"d:\repos\Claude-Scope")
+        );
+    }
+
+    #[test]
+    fn deserializing_recent_projects_dedupes_and_caps() {
+        // Hand-crafted config with duplicates and over-cap length — the
+        // serde hook must clean both up at load time so the in-memory
+        // invariant holds without an extra normalization step at the call
+        // site.
+        let mut raw = String::from(r#"{"recent_projects":["#);
+        for i in 0..(RECENT_PROJECTS_CAP + 3) {
+            if i > 0 {
+                raw.push(',');
+            }
+            raw.push_str(&format!(r#""/p{i}""#));
+        }
+        raw.push_str(r#",""]}"#);
+        let prefs: Preferences = serde_json::from_str(&raw).unwrap();
+        assert_eq!(prefs.recent_projects.len(), RECENT_PROJECTS_CAP);
+        // Empty path entry was dropped.
+        assert!(prefs
+            .recent_projects
+            .iter()
+            .all(|p| !p.as_os_str().is_empty()));
+    }
+
     /// Exercise the save path against a real filesystem so the
     /// `NamedTempFile::persist()` replace succeeds both on first write and
     /// when a previous config file already exists — that second case is
@@ -318,6 +498,7 @@ mod tests {
             visible_scopes: vec![Scope::Local],
             theme: Theme::Auto,
             backup_on_write: true,
+            recent_projects: Vec::new(),
         };
         let body = serde_json::to_vec_pretty(&first).unwrap();
         let parent = target.parent().unwrap();
@@ -333,6 +514,7 @@ mod tests {
             visible_scopes: vec![Scope::Project, Scope::User],
             theme: Theme::Dark,
             backup_on_write: false,
+            recent_projects: vec![PathBuf::from("/tmp/p1"), PathBuf::from("/tmp/p2")],
         };
         let body2 = serde_json::to_vec_pretty(&second).unwrap();
         let mut tmpfile2 = tempfile::NamedTempFile::new_in(parent).unwrap();

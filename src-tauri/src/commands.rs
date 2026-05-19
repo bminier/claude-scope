@@ -224,6 +224,16 @@ pub fn load_scopes(
     let paths =
         resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
     let loaded = build_loaded(&paths).map_err(|e| e.to_string())?;
+    // Promote this project to the front of the recent-projects LRU (#47).
+    // Best-effort: a failure to persist preferences must not fail the load
+    // itself — the user's stated request was "open this project", and the
+    // dropdown's freshness is the secondary concern. Sandbox sessions (#66)
+    // skip the write so a scratch run can't pollute the real config.
+    if overrides.home().is_none() {
+        let mut prefs = preferences::load();
+        preferences::push_recent_project(&mut prefs, &paths.project_dir);
+        let _ = preferences::save(&prefs);
+    }
     // (Re)install the watcher every time we load. This handles both first
     // load and project-switch with no extra command surface area for the
     // front-end to keep in sync. Watcher errors are non-fatal — auto-reload
