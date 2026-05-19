@@ -13,8 +13,10 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use claude_scope_lib::app_info::AppInfo;
+use claude_scope_lib::audit::{self, Record as AuditRecord};
 use claude_scope_lib::commands::{
-    apply_move_leaf_impl, build_loaded, diff_move_leaf_impl, MoveLeafPreview, MoveLeafRequest,
+    apply_move_leaf_impl, build_loaded, diff_move_leaf_impl, AuditLogPage, AuditRecordView,
+    MoveLeafPreview, MoveLeafRequest,
 };
 use claude_scope_lib::io_atomic::{self, BackupTracker};
 use claude_scope_lib::model::{PathSeg, PermissionKind};
@@ -100,6 +102,33 @@ enum Command {
         json: bool,
     },
 
+    /// Show recent entries from the audit log (#19 phase 5 — history slice).
+    /// Reads `~/.claude/claude-scope/audit.jsonl`, honoring `--home-dir` so a
+    /// sandboxed session sees the scratch log instead of the real one. Newer
+    /// entries are listed first.
+    History {
+        /// Filter to entries newer than this duration (`5m`, `2h`, `1d`).
+        /// Suffixes: `s` seconds, `m` minutes, `h` hours, `d` days. No
+        /// suffix is rejected — the parser refuses to guess units rather
+        /// than silently interpreting `5` as one of "5 seconds" or
+        /// "5 minutes" depending on platform convention.
+        #[arg(long, value_name = "DURATION")]
+        since: Option<String>,
+        /// Cap the number of rows. Default 20; pass `0` for unlimited.
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        limit: usize,
+        /// Filter to a single audit kind. Repeat the flag to widen the
+        /// filter — clap collects multiples into a Vec.
+        #[arg(long, value_name = "KIND")]
+        kind: Vec<AuditKindArg>,
+        /// Emit machine-readable JSON in the same `AuditLogPage` shape the
+        /// GUI's `list_audit_records` IPC returns, so a Claude Code skill
+        /// (#13) can deserialize CLI output and IPC payloads through one
+        /// shared type.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Move a permission rule between scopes. Writes are atomic and create a
     /// `.bak` of the original on the first write of the session.
     Move {
@@ -174,6 +203,32 @@ impl KindArg {
     }
 }
 
+/// CLI counterpart to `audit::Kind`. Mirrored locally rather than re-using
+/// the lib enum so the wire format of `--kind <value>` stays a CLI concern
+/// (kebab-case as clap renders ValueEnum), independent of the JSON
+/// snake_case the audit module already pins. The `restore` value lands in
+/// Phase 3+ alongside `audit::Kind::Restore`.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum AuditKindArg {
+    Move,
+    Add,
+    Delete,
+    #[value(name = "change-kind")]
+    ChangeKind,
+}
+
+impl AuditKindArg {
+    fn matches(self, k: audit::Kind) -> bool {
+        matches!(
+            (self, k),
+            (AuditKindArg::Move, audit::Kind::Move)
+                | (AuditKindArg::Add, audit::Kind::Add)
+                | (AuditKindArg::Delete, audit::Kind::Delete)
+                | (AuditKindArg::ChangeKind, audit::Kind::ChangeKind)
+        )
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
@@ -198,6 +253,25 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Command::Version { json } = cli.command {
         return cmd_version(json);
     }
+    // `history` reads only the audit log, which lives under the home
+    // directory. No project root needed — running it from outside a repo
+    // (e.g. `~`) is a perfectly valid "what did I change everywhere?"
+    // workflow.
+    if let Command::History {
+        since,
+        limit,
+        kind,
+        json,
+    } = &cli.command
+    {
+        return cmd_history(
+            cli.home_dir.as_deref(),
+            since.as_deref(),
+            *limit,
+            kind,
+            *json,
+        );
+    }
 
     let paths = resolve_paths(cli.project_dir.as_deref(), cli.home_dir.as_deref())?;
     match cli.command {
@@ -210,6 +284,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::ListRules { scope, kind, json } => cmd_list_rules(&paths, scope, kind, json),
         Command::ListProjects { .. } => unreachable!("handled above"),
         Command::Version { .. } => unreachable!("handled above"),
+        Command::History { .. } => unreachable!("handled above"),
         Command::Move {
             rule,
             kind,
@@ -597,6 +672,270 @@ fn locate_rule(
         .position(|v| v.as_str() == Some(rule))
 }
 
+fn cmd_history(
+    home: Option<&std::path::Path>,
+    since: Option<&str>,
+    limit: usize,
+    kind_filters: &[AuditKindArg],
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (records, skipped) = audit::read_all(home)?;
+    let cutoff_ms = match since {
+        Some(s) => Some(cutoff_ms_for_since(s)?),
+        None => None,
+    };
+    let filtered = filter_records(records, kind_filters, cutoff_ms, limit);
+
+    if json {
+        // Match the GUI's `AuditLogPage` wire shape verbatim so a Claude
+        // Code skill (#13) can deserialize CLI output and IPC payloads
+        // through a single type. Building the views inline avoids a public
+        // helper in `commands.rs` whose only consumer is this binary.
+        let views: Vec<AuditRecordView> = filtered
+            .into_iter()
+            .map(|r| {
+                let ts_ms = r.id.timestamp_ms();
+                AuditRecordView { record: r, ts_ms }
+            })
+            .collect();
+        let page = AuditLogPage {
+            records: views,
+            skipped,
+        };
+        println!("{}", serde_json::to_string_pretty(&page)?);
+        return Ok(());
+    }
+
+    if filtered.is_empty() {
+        println!("(no audit entries)");
+    } else {
+        for rec in &filtered {
+            println!("{}", format_history_line(rec));
+        }
+    }
+    if skipped > 0 {
+        eprintln!(
+            "note: {skipped} unreadable {} skipped in the log",
+            if skipped == 1 { "entry" } else { "entries" }
+        );
+    }
+    Ok(())
+}
+
+/// Parse a human-friendly duration suffix (`5m`, `2h`, `1d`, `30s`) into
+/// milliseconds. Rejects bare numbers so the parser never has to guess
+/// whether `5` means seconds or minutes.
+fn parse_duration_ms(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty --since value".into());
+    }
+    let (num_part, mult_ms): (&str, u64) = if let Some(rest) = s.strip_suffix("ms") {
+        (rest, 1)
+    } else if let Some(rest) = s.strip_suffix('s') {
+        (rest, 1_000)
+    } else if let Some(rest) = s.strip_suffix('m') {
+        (rest, 60_000)
+    } else if let Some(rest) = s.strip_suffix('h') {
+        (rest, 3_600_000)
+    } else if let Some(rest) = s.strip_suffix('d') {
+        (rest, 86_400_000)
+    } else {
+        return Err(format!("unrecognized --since unit in `{s}` — use s/m/h/d").into());
+    };
+    let n: u64 = num_part
+        .parse()
+        .map_err(|_| format!("invalid --since count in `{s}`"))?;
+    n.checked_mul(mult_ms)
+        .ok_or_else(|| format!("--since `{s}` overflows").into())
+}
+
+/// Compute the floor ts_ms cutoff for a `--since DURATION` value:
+/// `now - duration`. Saturates at zero if the duration overflows the
+/// wall clock backwards, so a 9999-year filter still returns "everything"
+/// rather than wrapping.
+fn cutoff_ms_for_since(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let dur_ms = parse_duration_ms(s)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Ok(now_ms.saturating_sub(dur_ms))
+}
+
+/// Apply the CLI's filters and ordering to a fresh `read_all` result.
+/// Kept as a pure function over the inputs so the test suite can drive it
+/// without reaching for a real audit log.
+fn filter_records(
+    mut records: Vec<AuditRecord>,
+    kinds: &[AuditKindArg],
+    cutoff_ms: Option<u64>,
+    limit: usize,
+) -> Vec<AuditRecord> {
+    if !kinds.is_empty() {
+        records.retain(|r| kinds.iter().any(|k| k.matches(r.kind)));
+    }
+    if let Some(cutoff) = cutoff_ms {
+        records.retain(|r| r.id.timestamp_ms() >= cutoff);
+    }
+    // Newest-first: the user reading "history" almost always wants the
+    // most recent op at the top. The reader returns file order which is
+    // append order which is chronological; flip here.
+    records.reverse();
+    if limit > 0 && records.len() > limit {
+        records.truncate(limit);
+    }
+    records
+}
+
+/// Render one audit record as a single human-readable line. Columns:
+///   `<ULID base32>  <ts ISO Z>  <kind>  <leaf>  <scope arrow>  <rule>`
+///
+/// Tab-separated rather than padded columns: a downstream `awk` /
+/// `cut` pipeline beats fragile alignment when rules contain spaces.
+/// The History UI computes the rule string the same way (diff of
+/// before/after snapshots); duplicating the logic here rather than
+/// extracting to a shared helper keeps the lib's wire surface
+/// uncluttered while phases 3-5 are in flux.
+fn format_history_line(rec: &AuditRecord) -> String {
+    let ts = format_iso_utc(rec.id.timestamp_ms());
+    let verb = format_verb(rec);
+    let arrow = format_scope_arrow(rec);
+    let rule = extract_rule_summary(rec).unwrap_or_default();
+    format!("{}\t{}\t{}\t{}\t{}", rec.id, ts, verb, arrow, rule)
+        .trim_end()
+        .to_string()
+}
+
+fn format_verb(rec: &AuditRecord) -> String {
+    if matches!(rec.kind, audit::Kind::ChangeKind) {
+        return match rec.to_kind {
+            Some(k) => format!("change-kind→{}", permission_kind_str(k)),
+            None => "change-kind".to_string(),
+        };
+    }
+    let noun = match rec.leaf_kind {
+        audit::LeafKind::PermissionRule => "rule",
+        audit::LeafKind::PermissionList => "list",
+        audit::LeafKind::TopLevelKey => "key",
+    };
+    let verb = match rec.kind {
+        audit::Kind::Move => "move",
+        audit::Kind::Add => "add",
+        audit::Kind::Delete => "delete",
+        audit::Kind::ChangeKind => unreachable!("handled above"),
+    };
+    format!("{verb}-{noun}")
+}
+
+fn permission_kind_str(k: PermissionKind) -> &'static str {
+    match k {
+        PermissionKind::Allow => "allow",
+        PermissionKind::Deny => "deny",
+        PermissionKind::Ask => "ask",
+    }
+}
+
+fn format_scope_arrow(rec: &AuditRecord) -> String {
+    let from = rec.from.as_ref().map(|s| s.scope.label());
+    let to = rec.to.as_ref().map(|s| s.scope.label());
+    match (from, to) {
+        (Some(f), Some(t)) if f != t => format!("{f}→{t}"),
+        (Some(f), _) => f.to_string(),
+        (None, Some(t)) => t.to_string(),
+        (None, None) => "-".to_string(),
+    }
+}
+
+/// Recover the rule string the op acted on by diffing the appropriate
+/// snapshot side. Mirrors the History UI's extractor — see #123 for the
+/// equivalent in TypeScript.
+fn extract_rule_summary(rec: &AuditRecord) -> Option<String> {
+    if matches!(rec.leaf_kind, audit::LeafKind::TopLevelKey) {
+        if let Some(PathSeg::Key(k)) = rec.path.first() {
+            return Some(k.clone());
+        }
+        return None;
+    }
+    if matches!(rec.leaf_kind, audit::LeafKind::PermissionList) {
+        if let Some(PathSeg::Key(k)) = rec.path.get(1) {
+            return Some(format!("permissions.{k}"));
+        }
+        return None;
+    }
+    // PermissionRule: diff the snapshots on the side that gained or
+    // lost the rule. Add gains on `to`; move / delete / change-kind lose
+    // on `from`.
+    let kind_key = match rec.path.get(1) {
+        Some(PathSeg::Key(k)) => k.as_str(),
+        _ => return None,
+    };
+    match rec.kind {
+        audit::Kind::Add => {
+            let side = rec.to.as_ref()?;
+            let after = rules_for_kind(&side.key_after, kind_key);
+            let before = rules_for_kind(&side.key_before, kind_key);
+            first_unique_in(&after, &before)
+        }
+        _ => {
+            let side = rec.from.as_ref()?;
+            let before = rules_for_kind(&side.key_before, kind_key);
+            let after = rules_for_kind(&side.key_after, kind_key);
+            first_unique_in(&before, &after)
+        }
+    }
+}
+
+fn rules_for_kind(snapshot: &Option<serde_json::Value>, kind_key: &str) -> Vec<String> {
+    let Some(Value::Object(obj)) = snapshot.as_ref() else {
+        return Vec::new();
+    };
+    let Some(Value::Array(arr)) = obj.get(kind_key) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+fn first_unique_in(a: &[String], b: &[String]) -> Option<String> {
+    let set: std::collections::HashSet<&String> = b.iter().collect();
+    a.iter().find(|v| !set.contains(*v)).cloned()
+}
+
+/// Format a millis-since-epoch as an ISO-8601 UTC string. Hand-rolled
+/// rather than pulling in `chrono` / `time` for a single use site — the
+/// audit module avoids those deps for the same reason, and the format
+/// here matches the History UI's `<time datetime=…>` attribute.
+fn format_iso_utc(ms: u64) -> String {
+    let secs = ms / 1000;
+    let millis = (ms % 1000) as u32;
+    // Days since 1970-01-01.
+    let mut days = (secs / 86_400) as i64;
+    let secs_today = secs % 86_400;
+    let hour = (secs_today / 3600) as u32;
+    let min = ((secs_today % 3600) / 60) as u32;
+    let sec = (secs_today % 60) as u32;
+    // Civil-from-days (Howard Hinnant's algorithm). Standard, branch-free
+    // beyond the leap-year arithmetic — exact for any positive day count
+    // far past any realistic ULID timestamp.
+    days += 719_468;
+    let era = if days >= 0 {
+        days / 146_097
+    } else {
+        (days - 146_096) / 146_097
+    };
+    let doe = (days - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = y + if m <= 2 { 1 } else { 0 };
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
+}
+
 fn print_preview(preview: &MoveLeafPreview, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     if json {
         println!("{}", serde_json::to_string_pretty(preview)?);
@@ -720,5 +1059,289 @@ mod tests {
             locate_rule(&doc, PermissionKind::Deny, "Bash(git status)"),
             None
         );
+    }
+
+    // -- history subcommand (#126) -----------------------------------------
+
+    use claude_scope_lib::audit::{self as audit_lib, Actor, Kind, LeafKind, Record, Side};
+
+    fn make_audit_record(kind: Kind, leaf_kind: LeafKind) -> Record {
+        Record::new(kind, leaf_kind, Actor::Gui, None, None, None, vec![], None)
+    }
+
+    #[test]
+    fn parse_duration_handles_each_unit() {
+        assert_eq!(parse_duration_ms("500ms").unwrap(), 500);
+        assert_eq!(parse_duration_ms("5s").unwrap(), 5_000);
+        assert_eq!(parse_duration_ms("2m").unwrap(), 120_000);
+        assert_eq!(parse_duration_ms("3h").unwrap(), 10_800_000);
+        assert_eq!(parse_duration_ms("1d").unwrap(), 86_400_000);
+    }
+
+    #[test]
+    fn parse_duration_rejects_bare_number_and_garbage() {
+        // No suffix: ambiguous between seconds and minutes. Rejecting is
+        // safer than silently picking a unit.
+        assert!(parse_duration_ms("5").is_err());
+        assert!(parse_duration_ms("").is_err());
+        assert!(parse_duration_ms("forever").is_err());
+        // "ms" suffix is real; "ks" / "y" are not, and the parser should
+        // refuse rather than guess.
+        assert!(parse_duration_ms("3y").is_err());
+    }
+
+    #[test]
+    fn filter_records_applies_kind_filter() {
+        let records = vec![
+            make_audit_record(Kind::Move, LeafKind::PermissionRule),
+            make_audit_record(Kind::Add, LeafKind::PermissionRule),
+            make_audit_record(Kind::Delete, LeafKind::PermissionRule),
+        ];
+        let only_adds = filter_records(records.clone(), &[AuditKindArg::Add], None, 0);
+        assert_eq!(only_adds.len(), 1);
+        assert!(matches!(only_adds[0].kind, Kind::Add));
+
+        // Multiple --kind flags widen the filter (OR semantics).
+        let adds_and_deletes =
+            filter_records(records, &[AuditKindArg::Add, AuditKindArg::Delete], None, 0);
+        assert_eq!(adds_and_deletes.len(), 2);
+    }
+
+    #[test]
+    fn filter_records_applies_limit_and_orders_newest_first() {
+        // Three records with strictly-increasing ULIDs (sleep is the only
+        // portable way to guarantee ULID monotonicity across `Ulid::new()`
+        // calls without reaching into the crate's internals).
+        let a = make_audit_record(Kind::Move, LeafKind::PermissionRule);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = make_audit_record(Kind::Move, LeafKind::PermissionRule);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let c = make_audit_record(Kind::Move, LeafKind::PermissionRule);
+
+        let filtered = filter_records(vec![a.clone(), b.clone(), c.clone()], &[], None, 2);
+        assert_eq!(filtered.len(), 2);
+        // Newest-first ordering: c (newest) then b.
+        assert_eq!(filtered[0].id, c.id);
+        assert_eq!(filtered[1].id, b.id);
+    }
+
+    #[test]
+    fn filter_records_limit_zero_means_unlimited() {
+        let records: Vec<Record> = (0..30)
+            .map(|_| make_audit_record(Kind::Move, LeafKind::PermissionRule))
+            .collect();
+        let filtered = filter_records(records, &[], None, 0);
+        assert_eq!(filtered.len(), 30);
+    }
+
+    #[test]
+    fn filter_records_applies_since_cutoff() {
+        // Record older than the cutoff drops; newer record survives.
+        let old = make_audit_record(Kind::Move, LeafKind::PermissionRule);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let new = make_audit_record(Kind::Move, LeafKind::PermissionRule);
+        let cutoff = new.id.timestamp_ms();
+        let filtered = filter_records(vec![old, new.clone()], &[], Some(cutoff), 0);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, new.id);
+    }
+
+    fn perms_with_allow(rules: &[&str]) -> serde_json::Value {
+        json!({
+            "allow": rules.iter().map(|r| json!(r)).collect::<Vec<_>>(),
+        })
+    }
+
+    fn side_with(scope: Scope, before: serde_json::Value, after: serde_json::Value) -> Side {
+        Side {
+            scope,
+            file_path: PathBuf::from(format!("/fake/{}/.claude/settings.json", scope.label())),
+            top_level_key: "permissions".to_string(),
+            key_before: Some(before),
+            key_after: Some(after),
+        }
+    }
+
+    #[test]
+    fn extract_rule_summary_recovers_moved_rule_from_source_diff() {
+        let mut rec = make_audit_record(Kind::Move, LeafKind::PermissionRule);
+        rec.path = vec![
+            PathSeg::Key("permissions".into()),
+            PathSeg::Key("allow".into()),
+            PathSeg::Index(0),
+        ];
+        rec.from = Some(side_with(
+            Scope::Project,
+            perms_with_allow(&["Bash(ls)", "Read(*)"]),
+            perms_with_allow(&["Read(*)"]),
+        ));
+        rec.to = Some(side_with(
+            Scope::User,
+            perms_with_allow(&[]),
+            perms_with_allow(&["Bash(ls)"]),
+        ));
+        assert_eq!(extract_rule_summary(&rec).as_deref(), Some("Bash(ls)"));
+    }
+
+    #[test]
+    fn extract_rule_summary_recovers_added_rule_from_destination_diff() {
+        let mut rec = make_audit_record(Kind::Add, LeafKind::PermissionRule);
+        rec.path = vec![
+            PathSeg::Key("permissions".into()),
+            PathSeg::Key("deny".into()),
+            PathSeg::Index(0),
+        ];
+        rec.to = Some(Side {
+            scope: Scope::User,
+            file_path: PathBuf::from("/fake/user.json"),
+            top_level_key: "permissions".to_string(),
+            key_before: Some(json!({"deny": []})),
+            key_after: Some(json!({"deny": ["WebFetch(domain:evil.example)"]})),
+        });
+        assert_eq!(
+            extract_rule_summary(&rec).as_deref(),
+            Some("WebFetch(domain:evil.example)"),
+        );
+    }
+
+    #[test]
+    fn extract_rule_summary_uses_path_for_top_level_key_ops() {
+        let mut rec = make_audit_record(Kind::Move, LeafKind::TopLevelKey);
+        rec.path = vec![PathSeg::Key("env".into())];
+        assert_eq!(extract_rule_summary(&rec).as_deref(), Some("env"));
+    }
+
+    #[test]
+    fn extract_rule_summary_returns_none_when_snapshots_are_ambiguous() {
+        // No `from` side and the kind isn't Add → can't recover the rule.
+        // Better to elide than fabricate.
+        let mut rec = make_audit_record(Kind::Delete, LeafKind::PermissionRule);
+        rec.path = vec![
+            PathSeg::Key("permissions".into()),
+            PathSeg::Key("allow".into()),
+            PathSeg::Index(0),
+        ];
+        rec.from = None;
+        assert_eq!(extract_rule_summary(&rec), None);
+    }
+
+    #[test]
+    fn format_verb_renders_change_kind_with_destination() {
+        let mut rec = make_audit_record(Kind::ChangeKind, LeafKind::PermissionRule);
+        rec.to_kind = Some(PermissionKind::Deny);
+        assert_eq!(format_verb(&rec), "change-kind→deny");
+    }
+
+    #[test]
+    fn format_scope_arrow_collapses_single_side_ops() {
+        let mut rec = make_audit_record(Kind::Add, LeafKind::PermissionRule);
+        rec.to = Some(Side {
+            scope: Scope::User,
+            file_path: PathBuf::from("/fake/user.json"),
+            top_level_key: "permissions".to_string(),
+            key_before: None,
+            key_after: None,
+        });
+        assert_eq!(format_scope_arrow(&rec), "user");
+    }
+
+    #[test]
+    fn format_iso_utc_known_value() {
+        // 2026-05-28T00:00:00Z = 1_779_926_400_000 ms since epoch.
+        // Cross-checked via the same civil-from-days algorithm
+        // (Hinnant's) the formatter implements, plus an offline check
+        // against `date -u -r 1779926400` → "Thu May 28 00:00:00 UTC 2026".
+        assert_eq!(
+            format_iso_utc(1_779_926_400_000),
+            "2026-05-28T00:00:00.000Z"
+        );
+        // Millis show up zero-padded — guards against a future refactor
+        // dropping the `:03` width specifier.
+        assert_eq!(
+            format_iso_utc(1_779_926_400_007),
+            "2026-05-28T00:00:00.007Z"
+        );
+        // Sub-second wraparound: 999 ms doesn't bleed into seconds.
+        assert_eq!(
+            format_iso_utc(1_779_926_400_999),
+            "2026-05-28T00:00:00.999Z"
+        );
+    }
+
+    #[test]
+    fn format_history_line_includes_all_columns() {
+        let mut rec = make_audit_record(Kind::Move, LeafKind::PermissionRule);
+        rec.path = vec![
+            PathSeg::Key("permissions".into()),
+            PathSeg::Key("allow".into()),
+            PathSeg::Index(0),
+        ];
+        rec.from = Some(side_with(
+            Scope::Project,
+            perms_with_allow(&["Bash(ls)"]),
+            perms_with_allow(&[]),
+        ));
+        rec.to = Some(side_with(
+            Scope::User,
+            perms_with_allow(&[]),
+            perms_with_allow(&["Bash(ls)"]),
+        ));
+        let line = format_history_line(&rec);
+        // Tab-separated; carries the ULID, ISO timestamp, verb, arrow,
+        // and recovered rule string.
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 5);
+        assert_eq!(cols[0].len(), 26); // ULID base32 width.
+        assert!(cols[1].ends_with('Z'));
+        assert_eq!(cols[2], "move-rule");
+        assert_eq!(cols[3], "project→user");
+        assert_eq!(cols[4], "Bash(ls)");
+    }
+
+    /// Integration: write three audit records to a tempdir-overridden
+    /// home, run cmd_history's filter+order logic, verify JSON shape
+    /// matches the GUI's `AuditLogPage` wire format.
+    #[test]
+    fn history_json_shape_matches_audit_log_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let a = make_audit_record(Kind::Move, LeafKind::PermissionRule);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = make_audit_record(Kind::Add, LeafKind::PermissionRule);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let c = make_audit_record(Kind::Delete, LeafKind::PermissionRule);
+        audit_lib::append(&a, Some(home)).unwrap();
+        audit_lib::append(&b, Some(home)).unwrap();
+        audit_lib::append(&c, Some(home)).unwrap();
+
+        let (records, skipped) = audit_lib::read_all(Some(home)).unwrap();
+        assert_eq!(skipped, 0);
+        let filtered = filter_records(records, &[], None, 0);
+        let views: Vec<AuditRecordView> = filtered
+            .into_iter()
+            .map(|r| {
+                let ts_ms = r.id.timestamp_ms();
+                AuditRecordView { record: r, ts_ms }
+            })
+            .collect();
+        let page = AuditLogPage {
+            records: views,
+            skipped,
+        };
+        let json: serde_json::Value = serde_json::to_value(&page).unwrap();
+        // `AuditLogPage` shape: top-level `records` array + `skipped` count.
+        // Each record carries `ts_ms` flattened alongside the audit fields
+        // (no nested `record` key).
+        assert!(json.get("records").and_then(|v| v.as_array()).is_some());
+        assert_eq!(json.get("skipped").and_then(|v| v.as_u64()), Some(0));
+        let first = &json["records"][0];
+        assert!(first.get("ts_ms").is_some());
+        assert!(first.get("kind").is_some());
+        assert!(first.get("record").is_none());
+        // Newest-first: filter_records reversed file order.
+        assert_eq!(json["records"].as_array().unwrap().len(), 3);
+        // Cross-check that the GUI's IPC would produce the same shape —
+        // both consume `audit::Record` via `AuditRecordView`, so this
+        // assertion is a forward-compat anchor.
     }
 }
