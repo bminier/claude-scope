@@ -1579,3 +1579,177 @@ describe("keyboard drag-and-drop (#41)", () => {
     // which is the contract the screen reader binds to.
   });
 });
+
+describe("cross-pane rule highlight (#49)", () => {
+  let root: HTMLElement;
+
+  beforeEach(() => {
+    // Drain any leaked keystroke / pickup state from earlier suites so
+    // the first click here lands cleanly.
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    root = makeRoot();
+  });
+
+  afterEach(() => {
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    clearBody();
+  });
+
+  function scopesWithSharedRule(): ReturnType<typeof buildLoadedScopes> {
+    // Same rule string in Project allow AND User deny — exactly the
+    // cross-kind / cross-scope case the highlight is supposed to make
+    // visible.
+    return buildLoadedScopes({
+      project_dir: "/fake/highlight",
+      scopes: [
+        { scope: "project", permissions: { allow: ["Bash(ls)", "Read(*)"] } },
+        { scope: "user", permissions: { deny: ["Bash(ls)"] } },
+      ],
+    });
+  }
+
+  function projectRuleEl(text: string): HTMLElement {
+    const el = Array.from(root.querySelectorAll<HTMLElement>(".rule .rule-text")).find(
+      (e) => e.textContent === text,
+    );
+    if (!el) throw new Error(`expected per-scope rule chip for "${text}"`);
+    return el;
+  }
+
+  function combinedChipEl(text: string): HTMLElement {
+    const el = Array.from(root.querySelectorAll<HTMLElement>(".chip")).find(
+      (e) => e.textContent === text,
+    );
+    if (!el) throw new Error(`expected combined-panel chip for "${text}"`);
+    return el;
+  }
+
+  it("clicking a per-scope chip highlights every matching chip across panes", () => {
+    renderApp(root, makeProps({ scopes: scopesWithSharedRule() }));
+    projectRuleEl("Bash(ls)").click();
+    // Four matching chips total: Project-allow + User-deny per-scope
+    // chips, plus the combined panel's allow + deny chip variants. The
+    // combined panel renders the rule under each kind it appears in,
+    // which is exactly the cross-kind case #49 wants surfaced.
+    const highlighted = Array.from(root.querySelectorAll<HTMLElement>(".rule-highlight"));
+    const labels = highlighted.map((el) => el.textContent);
+    expect(labels.length).toBe(4);
+    expect(labels.every((l) => l === "Bash(ls)")).toBe(true);
+    // Other rules stay unhighlighted.
+    expect(projectRuleEl("Read(*)").classList.contains("rule-highlight")).toBe(false);
+  });
+
+  it("clicking the same chip a second time toggles the highlight off", () => {
+    renderApp(root, makeProps({ scopes: scopesWithSharedRule() }));
+    const chip = projectRuleEl("Bash(ls)");
+    chip.click();
+    expect(chip.classList.contains("rule-highlight")).toBe(true);
+    chip.click();
+    expect(root.querySelectorAll(".rule-highlight").length).toBe(0);
+  });
+
+  it("clicking a different chip swaps the highlight", () => {
+    renderApp(root, makeProps({ scopes: scopesWithSharedRule() }));
+    projectRuleEl("Bash(ls)").click();
+    projectRuleEl("Read(*)").click();
+    const highlighted = Array.from(root.querySelectorAll<HTMLElement>(".rule-highlight"));
+    expect(highlighted.every((el) => el.textContent === "Read(*)")).toBe(true);
+    expect(highlighted.length).toBeGreaterThan(0);
+  });
+
+  it("clicking the combined-panel chip highlights the same rule across panes", () => {
+    renderApp(root, makeProps({ scopes: scopesWithSharedRule() }));
+    combinedChipEl("Bash(ls)").click();
+    const labels = Array.from(root.querySelectorAll<HTMLElement>(".rule-highlight")).map(
+      (el) => el.textContent,
+    );
+    // Same count as the per-scope click: four matching chips.
+    expect(labels.length).toBe(4);
+    expect(labels.every((l) => l === "Bash(ls)")).toBe(true);
+  });
+
+  it("Escape clears an active highlight", () => {
+    renderApp(root, makeProps({ scopes: scopesWithSharedRule() }));
+    projectRuleEl("Bash(ls)").click();
+    expect(root.querySelector(".rule-highlight")).not.toBeNull();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    expect(root.querySelector(".rule-highlight")).toBeNull();
+  });
+
+  it("clicking truly outside any chip clears the highlight", () => {
+    renderApp(root, makeProps({ scopes: scopesWithSharedRule() }));
+    projectRuleEl("Bash(ls)").click();
+    // Click on the topbar — definitely not a chip or chip-neighbor.
+    const topbar = root.querySelector<HTMLElement>(".topbar");
+    expect(topbar).not.toBeNull();
+    topbar?.click();
+    expect(root.querySelector(".rule-highlight")).toBeNull();
+  });
+
+  it("'h' on a focused chip toggles the highlight without conflicting with #41 pickup", () => {
+    renderApp(root, makeProps({ scopes: scopesWithSharedRule() }));
+    const chip = projectRuleEl("Bash(ls)");
+    chip.focus();
+    chip.dispatchEvent(new KeyboardEvent("keydown", { key: "h", bubbles: true }));
+    expect(chip.classList.contains("rule-highlight")).toBe(true);
+    // 'h' again toggles off (independent of click toggle).
+    chip.dispatchEvent(new KeyboardEvent("keydown", { key: "h", bubbles: true }));
+    expect(chip.classList.contains("rule-highlight")).toBe(false);
+    // And pickup (Enter) still works as a separate gesture.
+    expect(chip.getAttribute("aria-pressed")).toBeNull();
+  });
+
+  it("highlight survives a re-render when the rule still exists", () => {
+    const scopes = scopesWithSharedRule();
+    renderApp(root, makeProps({ scopes }));
+    projectRuleEl("Bash(ls)").click();
+    // Re-render with the same data (simulates a watcher reload).
+    renderApp(root, makeProps({ scopes }));
+    const highlighted = Array.from(root.querySelectorAll<HTMLElement>(".rule-highlight"));
+    expect(highlighted.length).toBe(4);
+    expect(highlighted.every((el) => el.textContent === "Bash(ls)")).toBe(true);
+  });
+
+  it("highlight auto-clears when the rule disappears from the next render", () => {
+    renderApp(root, makeProps({ scopes: scopesWithSharedRule() }));
+    projectRuleEl("Bash(ls)").click();
+    // Re-render with the rule gone everywhere.
+    const without = buildLoadedScopes({
+      project_dir: "/fake/highlight",
+      scopes: [{ scope: "project", permissions: { allow: ["Read(*)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: without }));
+    expect(root.querySelectorAll(".rule-highlight").length).toBe(0);
+  });
+
+  it("highlight clears on project switch", () => {
+    renderApp(root, makeProps({ scopes: scopesWithSharedRule() }));
+    projectRuleEl("Bash(ls)").click();
+    // Same data but a different project_dir signals a project switch.
+    const switched = buildLoadedScopes({
+      project_dir: "/fake/other-project",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: switched }));
+    // Even though the rule string exists in the new project, the
+    // highlight cleared on switch — the context changed, the previous
+    // selection no longer reflects user intent.
+    expect(root.querySelectorAll(".rule-highlight").length).toBe(0);
+  });
+
+  it("'h' is ignored while a text input is focused (so typing 'h' works)", () => {
+    renderApp(root, makeProps({ scopes: scopesWithSharedRule() }));
+    const search = document.getElementById(SEARCH_INPUT_ID) as HTMLInputElement | null;
+    expect(search).not.toBeNull();
+    search?.focus();
+    search?.dispatchEvent(new KeyboardEvent("keydown", { key: "h", bubbles: true }));
+    // No chip is highlighted because the keystroke was for the text input.
+    expect(root.querySelectorAll(".rule-highlight").length).toBe(0);
+  });
+});

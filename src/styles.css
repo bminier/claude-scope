@@ -420,6 +420,22 @@ button:disabled {
   outline-offset: 2px;
 }
 
+/* Cross-pane rule highlight (#49). Click a chip; every chip with the
+   same string lights up across every pane that contains it. Visually
+   distinct from:
+     - `.col-drop-active` (solid accent border, drop target)
+     - `.col-drop-available` (dashed accent border, ambient target)
+     - `:focus-visible` (browser focus ring)
+     - `.lint-warn` `.is-open` (lint popover pin)
+   so the cues don't smear. Background tint + solid amber outline reads
+   as "selected" without claiming a button/drop semantics. */
+.rule-highlight {
+  background: var(--rule-highlight-bg, rgba(255, 200, 0, 0.18));
+  outline: 2px solid var(--rule-highlight-outline, #d4a017);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+
 /* Screen-reader-only live region for the keyboard DnD announcer (#41).
    Visible to assistive tech, not to sighted users. Classic clip-rect
    technique — `display: none` would also hide it from AT. */
