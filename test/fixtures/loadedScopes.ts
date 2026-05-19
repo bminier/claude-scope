@@ -156,6 +156,8 @@ export function buildPreferences(overrides: Partial<Preferences> = {}): Preferen
     theme: overrides.theme ?? "auto",
     backup_on_write: overrides.backup_on_write ?? true,
     recent_projects: overrides.recent_projects ?? [],
+    audit_log_rotate: overrides.audit_log_rotate ?? true,
+    audit_log_max_size_mb: overrides.audit_log_max_size_mb ?? 10,
   };
 }
 

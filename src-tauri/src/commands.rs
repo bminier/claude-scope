@@ -319,6 +319,19 @@ fn emit_audit(app: &AppHandle, overrides: &RuntimeOverrides, record: audit::Reco
     if overrides.home().is_some() {
         return;
     }
+    let prefs = preferences::load();
+    // Rotate before the append so the fresh entry lands in the new
+    // active file (#127). Rotation errors are fail-open: we surface
+    // them as a non-fatal event and proceed to append against the
+    // existing file rather than dropping the entry. The append itself
+    // would then write to an over-cap log, which is still better than
+    // losing the record.
+    if prefs.audit_log_rotate {
+        let cap_bytes = u64::from(prefs.audit_log_max_size_mb) * 1_000_000;
+        if let Err(err) = audit::rotate_if_needed(None, cap_bytes) {
+            let _ = app.emit("audit-error", format!("rotation: {err}"));
+        }
+    }
     if let Err(err) = audit::append(&record, None) {
         let _ = app.emit("audit-error", err.to_string());
     }

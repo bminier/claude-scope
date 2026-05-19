@@ -25,7 +25,7 @@ import type {
   ScopeView,
   Theme,
 } from "./types.ts";
-import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
+import { AUDIT_LOG_MAX_SIZE_MB, SCOPES, SEARCH_INPUT_ID } from "./types.ts";
 
 interface AppProps {
   scopes: LoadedScopes | null;
@@ -2841,6 +2841,14 @@ interface SettingsProps {
    *  as the other settings — the new pref hits the backend immediately so
    *  the very next move respects it without a dialog round-trip. */
   onToggleBackupOnWrite: (enabled: boolean) => void;
+  /** Toggle audit-log rotation (#127). When off, `audit.jsonl` grows
+   *  unbounded; when on, it rotates to a year-month archive once it
+   *  passes `audit_log_max_size_mb`. */
+  onToggleAuditLogRotate: (enabled: boolean) => void;
+  /** Change the rotation size threshold in MB (#127). The backend
+   *  clamps to `[1, 1000]`; the UI also enforces those bounds at the
+   *  input level so the user sees the limits inline. */
+  onChangeAuditLogMaxSizeMb: (mb: number) => void;
 }
 
 const THEME_OPTIONS: ReadonlyArray<{ value: Theme; label: string }> = [
@@ -2866,6 +2874,7 @@ export function openSettings(props: SettingsProps, trigger?: HTMLElement | null)
   body.appendChild(settingsThemeSection(props));
   body.appendChild(settingsColumnsSection(props));
   body.appendChild(settingsBackupSection(props));
+  body.appendChild(settingsAuditRotationSection(props));
 
   openModal({
     titleText: "Settings",
@@ -3014,6 +3023,88 @@ function settingsBackupSection(props: SettingsProps): HTMLElement {
   label.textContent = "Create `.bak` files on save";
   row.appendChild(label);
   list.appendChild(row);
+  section.appendChild(list);
+  return section;
+}
+
+/**
+ * Audit-log rotation controls (#127). A toggle for whether to rotate at
+ * all, and a number input for the cap in megabytes. Disabled state when
+ * the toggle is off — the number input is purely cosmetic when rotation
+ * is disabled, so the visual greys-out and the input goes read-only.
+ *
+ * The number input's `change` event is what fires the dispatch (not
+ * `input`), so the user isn't billed for every keystroke while they're
+ * typing "2", "20", "200". `change` fires on commit (blur or Enter),
+ * which lines up with how the rest of the settings dialog works.
+ */
+function settingsAuditRotationSection(props: SettingsProps): HTMLElement {
+  const section = document.createElement("section");
+  section.className = "settings-section";
+
+  const heading = document.createElement("h3");
+  heading.className = "settings-heading";
+  heading.textContent = "Audit log rotation";
+  section.appendChild(heading);
+
+  const hint = document.createElement("p");
+  hint.className = "settings-hint";
+  hint.textContent =
+    "When the audit log passes the size threshold, ClaudeScope renames it to a year-month archive and starts fresh. Archives stay on disk indefinitely — delete them by hand if you want. Turn rotation off to keep one growing file instead.";
+  section.appendChild(hint);
+
+  const list = document.createElement("div");
+  list.className = "settings-checklist";
+
+  const toggleRow = document.createElement("label");
+  toggleRow.className = "settings-check";
+  const toggle = document.createElement("input");
+  toggle.type = "checkbox";
+  toggle.checked = props.preferences.audit_log_rotate;
+  toggleRow.appendChild(toggle);
+  const toggleLabel = document.createElement("span");
+  toggleLabel.textContent = "Rotate audit log when it grows large";
+  toggleRow.appendChild(toggleLabel);
+  list.appendChild(toggleRow);
+
+  // Size-cap row reuses the .settings-check layout for vertical rhythm,
+  // but the actual input is a `<input type="number">` not a checkbox.
+  const sizeRow = document.createElement("label");
+  sizeRow.className = "settings-check settings-check-number";
+  const sizeInput = document.createElement("input");
+  sizeInput.type = "number";
+  sizeInput.className = "settings-number-input";
+  sizeInput.min = String(AUDIT_LOG_MAX_SIZE_MB.min);
+  sizeInput.max = String(AUDIT_LOG_MAX_SIZE_MB.max);
+  sizeInput.step = "1";
+  sizeInput.value = String(props.preferences.audit_log_max_size_mb);
+  sizeInput.disabled = !props.preferences.audit_log_rotate;
+  sizeRow.appendChild(sizeInput);
+  const sizeLabel = document.createElement("span");
+  sizeLabel.textContent = `Rotate at this many MB (${AUDIT_LOG_MAX_SIZE_MB.min}–${AUDIT_LOG_MAX_SIZE_MB.max})`;
+  sizeRow.appendChild(sizeLabel);
+  list.appendChild(sizeRow);
+
+  toggle.addEventListener("change", () => {
+    sizeInput.disabled = !toggle.checked;
+    props.onToggleAuditLogRotate(toggle.checked);
+  });
+  sizeInput.addEventListener("change", () => {
+    // Clamp to the same bounds the backend enforces — without this, the
+    // server would silently clamp out-of-range values to the default,
+    // which is a less observable result than the visible clamp here.
+    const raw = Number.parseInt(sizeInput.value, 10);
+    if (!Number.isFinite(raw)) {
+      sizeInput.value = String(props.preferences.audit_log_max_size_mb);
+      return;
+    }
+    const clamped = Math.min(AUDIT_LOG_MAX_SIZE_MB.max, Math.max(AUDIT_LOG_MAX_SIZE_MB.min, raw));
+    if (clamped !== raw) {
+      sizeInput.value = String(clamped);
+    }
+    props.onChangeAuditLogMaxSizeMb(clamped);
+  });
+
   section.appendChild(list);
   return section;
 }

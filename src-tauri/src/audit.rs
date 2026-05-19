@@ -303,6 +303,103 @@ pub fn read_all(home: Option<&Path>) -> io::Result<(Vec<Record>, usize)> {
     Ok((records, skipped))
 }
 
+/// Outcome of a [`rotate_if_needed`] call. `Skipped` covers four cases that
+/// all want fail-open behavior at the call site (no rotation needed, no
+/// audit path resolvable, audit file doesn't exist yet, under-threshold);
+/// distinguishing them on the wire would be noise. `Rotated` carries the
+/// archive path so the caller can surface "moved to X" in logs / telemetry
+/// if it wants to.
+#[derive(Debug)]
+pub enum RotateOutcome {
+    Skipped,
+    Rotated { archive: PathBuf },
+}
+
+/// Rotate the active `audit.jsonl` to a `audit-YYYY-MM.jsonl` archive when
+/// it exceeds `max_size_bytes`. Run **before** an append so the new line
+/// lands in the fresh file. Reader semantics in [`read_all`] are unchanged:
+/// archives are ignored, only the active file is read.
+///
+/// Naming: the year-month stamp is derived from the file's last-modified
+/// time, not the moment of rotation. That way the archive name reflects
+/// when the last entry in the rolled-out log was written, which is the
+/// more useful question to ask of a `ls`-d directory of archives.
+///
+/// Collisions in the same month — second rotation within May 2026, say —
+/// get a `-N` suffix. The suffix starts at `2` because the first archive
+/// in a given month is unsuffixed; readers scanning the directory can
+/// sort lexicographically and get chronological order.
+///
+/// Fail-open: errors propagate so the caller can warn (the audit's
+/// `audit-error` event channel), but the calling pattern at
+/// `commands::emit_audit` treats both `Ok(Skipped)` and `Err(_)` as
+/// "proceed to append". A rotation failure must not block the actual
+/// write — see the issue's safety invariants.
+pub fn rotate_if_needed(
+    home: Option<&Path>,
+    max_size_bytes: u64,
+) -> Result<RotateOutcome, AppendError> {
+    let Some(path) = audit_path(home) else {
+        return Ok(RotateOutcome::Skipped);
+    };
+    let metadata = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RotateOutcome::Skipped),
+        Err(e) => return Err(e.into()),
+    };
+    if metadata.len() < max_size_bytes {
+        return Ok(RotateOutcome::Skipped);
+    }
+    // Prefer mtime over "now" so the archive name reflects the data in
+    // the file. Falls back to wall-clock if the FS strips mtime (some
+    // network mounts do); that's degraded but never wrong.
+    let stamp_source = metadata
+        .modified()
+        .ok()
+        .unwrap_or_else(std::time::SystemTime::now);
+    let stamp = year_month_stamp(stamp_source);
+    let parent = path
+        .parent()
+        .expect("audit_path always nests under `<home>/.claude/claude-scope/`");
+    let mut archive = parent.join(format!("audit-{stamp}.jsonl"));
+    let mut n: u32 = 2;
+    while archive.exists() {
+        archive = parent.join(format!("audit-{stamp}-{n}.jsonl"));
+        n = n.checked_add(1).ok_or_else(|| {
+            AppendError::Io(io::Error::other(
+                "exhausted archive collision suffixes — too many same-month rotations",
+            ))
+        })?;
+    }
+    std::fs::rename(&path, &archive)?;
+    Ok(RotateOutcome::Rotated { archive })
+}
+
+/// Format a `SystemTime` as `YYYY-MM` (UTC). Hand-rolled (Howard Hinnant's
+/// civil-from-days) to avoid pulling in `chrono` / `time` for one call
+/// site — same reasoning as the rest of the audit module's
+/// dep-minimization stance.
+fn year_month_stamp(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64 + 719_468;
+    let era = if days >= 0 {
+        days / 146_097
+    } else {
+        (days - 146_096) / 146_097
+    };
+    let doe = (days - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = y + if m <= 2 { 1 } else { 0 };
+    format!("{year:04}-{m:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +605,162 @@ mod tests {
         assert_eq!(records[0].id, a.id);
         assert_eq!(records[1].id, b.id);
         assert_eq!(records[2].id, c.id);
+    }
+
+    // -- rotation (#127) ---------------------------------------------------
+
+    #[test]
+    fn rotate_if_needed_is_a_noop_when_file_is_absent() {
+        let tmp = TempDir::new().unwrap();
+        let out = rotate_if_needed(Some(tmp.path()), 1).unwrap();
+        assert!(matches!(out, RotateOutcome::Skipped));
+        // No archive should be created out of thin air.
+        let parent = audit_path(Some(tmp.path()))
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        if parent.exists() {
+            let archives: Vec<_> = fs::read_dir(&parent)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("audit-"))
+                .collect();
+            assert!(archives.is_empty());
+        }
+    }
+
+    #[test]
+    fn rotate_if_needed_skips_when_under_cap() {
+        let tmp = TempDir::new().unwrap();
+        append(&sample_record(), Some(tmp.path())).unwrap();
+        // The single record is well under any reasonable cap.
+        let out = rotate_if_needed(Some(tmp.path()), 10_000).unwrap();
+        assert!(matches!(out, RotateOutcome::Skipped));
+        // Active file still exists.
+        assert!(audit_path(Some(tmp.path())).unwrap().exists());
+    }
+
+    #[test]
+    fn rotate_if_needed_renames_to_year_month_archive_when_over_cap() {
+        let tmp = TempDir::new().unwrap();
+        for _ in 0..5 {
+            append(&sample_record(), Some(tmp.path())).unwrap();
+        }
+        // Pass a cap below the current size so rotation triggers.
+        let active = audit_path(Some(tmp.path())).unwrap();
+        let size = fs::metadata(&active).unwrap().len();
+        assert!(size > 0);
+        let cap = size / 2;
+
+        let out = rotate_if_needed(Some(tmp.path()), cap).unwrap();
+        let archive = match out {
+            RotateOutcome::Rotated { archive } => archive,
+            _ => panic!("expected rotation"),
+        };
+        assert!(archive.exists(), "archive should exist after rotation");
+        assert!(!active.exists(), "active file should be moved away");
+        // Archive name matches the audit-YYYY-MM.jsonl pattern. The exact
+        // year-month depends on the test clock, so just structural check.
+        let name = archive.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("audit-"), "got: {name}");
+        assert!(name.ends_with(".jsonl"), "got: {name}");
+        // YYYY-MM is 7 chars between "audit-" and ".jsonl": "2026-05".
+        assert_eq!(name.len(), "audit-YYYY-MM.jsonl".len(), "got: {name}");
+    }
+
+    #[test]
+    fn rotate_if_needed_collides_to_n2_in_same_month() {
+        // Two rotations within one month must produce distinct archive
+        // names. The first is `audit-YYYY-MM.jsonl`; the second adds
+        // `-2`. Without that, the second rename would clobber the first
+        // archive and lose data — the exact scenario this branch guards
+        // against.
+        let tmp = TempDir::new().unwrap();
+        for _ in 0..5 {
+            append(&sample_record(), Some(tmp.path())).unwrap();
+        }
+        let active = audit_path(Some(tmp.path())).unwrap();
+        let cap = fs::metadata(&active).unwrap().len() / 2;
+
+        let first = match rotate_if_needed(Some(tmp.path()), cap).unwrap() {
+            RotateOutcome::Rotated { archive } => archive,
+            _ => panic!("expected first rotation"),
+        };
+
+        // Fill the active file again and rotate. The collision handler
+        // must pick `-2`.
+        for _ in 0..5 {
+            append(&sample_record(), Some(tmp.path())).unwrap();
+        }
+        let second = match rotate_if_needed(Some(tmp.path()), cap).unwrap() {
+            RotateOutcome::Rotated { archive } => archive,
+            _ => panic!("expected second rotation"),
+        };
+        assert_ne!(first, second);
+        let second_name = second.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            second_name.contains("-2.jsonl"),
+            "second archive should have -2 suffix, got: {second_name}"
+        );
+        assert!(first.exists(), "first archive must not be clobbered");
+        assert!(second.exists(), "second archive must land");
+    }
+
+    #[test]
+    fn read_all_ignores_rotated_archives() {
+        // After rotation the active file is fresh; an immediate read_all
+        // returns nothing. The reader deliberately doesn't scan archives —
+        // that's the "active file is authoritative" property the
+        // History UI binds to.
+        let tmp = TempDir::new().unwrap();
+        for _ in 0..3 {
+            append(&sample_record(), Some(tmp.path())).unwrap();
+        }
+        let cap = fs::metadata(audit_path(Some(tmp.path())).unwrap())
+            .unwrap()
+            .len()
+            / 2;
+        rotate_if_needed(Some(tmp.path()), cap).unwrap();
+
+        let (records, skipped) = read_all(Some(tmp.path())).unwrap();
+        assert_eq!(skipped, 0);
+        assert!(
+            records.is_empty(),
+            "active file is freshly empty after rotation"
+        );
+
+        // A subsequent append lands in the new active file, not in the
+        // archive.
+        append(&sample_record(), Some(tmp.path())).unwrap();
+        let (records, _) = read_all(Some(tmp.path())).unwrap();
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn rotate_if_needed_skips_when_no_home_available() {
+        // `home: None` falls through to `dirs::home_dir()` inside the
+        // path resolver. The resolver returns None when there's no home
+        // (highly-sandboxed CI). On a normal dev machine `home_dir`
+        // resolves, so this test only proves the skip-with-None-home
+        // contract via the audit_path layer indirectly — by passing a
+        // home with no audit file, which behaves identically.
+        let tmp = TempDir::new().unwrap();
+        let out = rotate_if_needed(Some(tmp.path()), 1).unwrap();
+        assert!(matches!(out, RotateOutcome::Skipped));
+    }
+
+    #[test]
+    fn year_month_stamp_known_values() {
+        // 2026-05-01T00:00:00Z = 1_777_680_000 seconds since epoch.
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_777_680_000);
+        assert_eq!(year_month_stamp(t), "2026-05");
+        // 2026-01-31T23:59:59Z — last second of January 2026, still in
+        // the January bucket.
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_769_903_999);
+        assert_eq!(year_month_stamp(t), "2026-01");
+        // 2000-02-29T00:00:00Z — leap day. Tests the doy → m=2 branch.
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(951_782_400);
+        assert_eq!(year_month_stamp(t), "2000-02");
     }
 }

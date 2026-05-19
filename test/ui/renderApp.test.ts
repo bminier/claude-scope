@@ -6,6 +6,7 @@ import type {
   KnownProject,
   MoveLeafRequest,
   MoveOptions,
+  Preferences,
   Scope,
   Theme,
 } from "../../src/types.ts";
@@ -513,6 +514,8 @@ describe("openSettings – theme radios", () => {
       onToggleScopeVisibility: vi.fn(),
       onChangeTheme,
       onToggleBackupOnWrite: vi.fn(),
+      onToggleAuditLogRotate: vi.fn(),
+      onChangeAuditLogMaxSizeMb: vi.fn(),
     };
   }
 
@@ -582,6 +585,8 @@ describe("openSettings – backup toggle (#88)", () => {
         onToggleScopeVisibility: vi.fn(),
         onChangeTheme: vi.fn(),
         onToggleBackupOnWrite: vi.fn(),
+        onToggleAuditLogRotate: vi.fn(),
+        onChangeAuditLogMaxSizeMb: vi.fn(),
       });
       expect(backupCheckbox().checked).toBe(enabled);
     }
@@ -594,12 +599,157 @@ describe("openSettings – backup toggle (#88)", () => {
       onToggleScopeVisibility: vi.fn(),
       onChangeTheme: vi.fn(),
       onToggleBackupOnWrite,
+      onToggleAuditLogRotate: vi.fn(),
+      onChangeAuditLogMaxSizeMb: vi.fn(),
     });
     const cb = backupCheckbox();
     cb.checked = false;
     cb.dispatchEvent(new Event("change"));
     expect(onToggleBackupOnWrite).toHaveBeenCalledTimes(1);
     expect(onToggleBackupOnWrite).toHaveBeenCalledWith(false);
+  });
+});
+
+describe("openSettings – audit log rotation (#127)", () => {
+  beforeEach(() => {
+    // Drain any leaked modal Escape listeners from earlier suites so the
+    // first openSettings call here lands cleanly, mirroring the
+    // help-tooltips / History-dialog suites' prelude.
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    clearBody();
+  });
+
+  afterEach(() => {
+    for (const b of Array.from(document.querySelectorAll(".modal-backdrop"))) b.remove();
+    clearBody();
+  });
+
+  function rotationToggle(): HTMLInputElement {
+    const cb = Array.from(
+      document.querySelectorAll<HTMLInputElement>('.modal-settings input[type="checkbox"]'),
+    ).find((el) => el.nextElementSibling?.textContent?.startsWith("Rotate audit log"));
+    if (!cb) throw new Error("expected rotation toggle");
+    return cb;
+  }
+
+  function sizeInput(): HTMLInputElement {
+    const input = document.querySelector<HTMLInputElement>(
+      ".modal-settings .settings-number-input",
+    );
+    if (!input) throw new Error("expected rotation size input");
+    return input;
+  }
+
+  function makeProps(prefs: Partial<Preferences> = {}) {
+    return {
+      preferences: buildPreferences(prefs),
+      onToggleScopeVisibility: vi.fn(),
+      onChangeTheme: vi.fn(),
+      onToggleBackupOnWrite: vi.fn(),
+      onToggleAuditLogRotate: vi.fn(),
+      onChangeAuditLogMaxSizeMb: vi.fn(),
+    };
+  }
+
+  it("renders the rotation toggle reflecting the current preference", () => {
+    openSettings(makeProps({ audit_log_rotate: false }));
+    expect(rotationToggle().checked).toBe(false);
+    clearBody();
+    openSettings(makeProps({ audit_log_rotate: true }));
+    expect(rotationToggle().checked).toBe(true);
+  });
+
+  it("renders the size input reflecting the current preference", () => {
+    openSettings(makeProps({ audit_log_max_size_mb: 25 }));
+    expect(sizeInput().value).toBe("25");
+  });
+
+  it("size input is disabled when rotation is off", () => {
+    openSettings(makeProps({ audit_log_rotate: false }));
+    expect(sizeInput().disabled).toBe(true);
+  });
+
+  it("toggling rotation off disables the size input live", () => {
+    openSettings(makeProps({ audit_log_rotate: true }));
+    expect(sizeInput().disabled).toBe(false);
+    const toggle = rotationToggle();
+    toggle.checked = false;
+    toggle.dispatchEvent(new Event("change"));
+    expect(sizeInput().disabled).toBe(true);
+  });
+
+  it("invokes onToggleAuditLogRotate when the toggle is changed", () => {
+    const onToggleAuditLogRotate = vi.fn();
+    openSettings({
+      preferences: buildPreferences({ audit_log_rotate: true }),
+      onToggleScopeVisibility: vi.fn(),
+      onChangeTheme: vi.fn(),
+      onToggleBackupOnWrite: vi.fn(),
+      onToggleAuditLogRotate,
+      onChangeAuditLogMaxSizeMb: vi.fn(),
+    });
+    const t = rotationToggle();
+    t.checked = false;
+    t.dispatchEvent(new Event("change"));
+    expect(onToggleAuditLogRotate).toHaveBeenCalledWith(false);
+  });
+
+  it("invokes onChangeAuditLogMaxSizeMb on a valid in-range value", () => {
+    const onChangeAuditLogMaxSizeMb = vi.fn();
+    openSettings({
+      preferences: buildPreferences({ audit_log_max_size_mb: 10 }),
+      onToggleScopeVisibility: vi.fn(),
+      onChangeTheme: vi.fn(),
+      onToggleBackupOnWrite: vi.fn(),
+      onToggleAuditLogRotate: vi.fn(),
+      onChangeAuditLogMaxSizeMb,
+    });
+    const input = sizeInput();
+    input.value = "50";
+    input.dispatchEvent(new Event("change"));
+    expect(onChangeAuditLogMaxSizeMb).toHaveBeenCalledWith(50);
+  });
+
+  it("clamps an out-of-range size input to the bound and reflects it back", () => {
+    const onChangeAuditLogMaxSizeMb = vi.fn();
+    openSettings({
+      preferences: buildPreferences({ audit_log_max_size_mb: 10 }),
+      onToggleScopeVisibility: vi.fn(),
+      onChangeTheme: vi.fn(),
+      onToggleBackupOnWrite: vi.fn(),
+      onToggleAuditLogRotate: vi.fn(),
+      onChangeAuditLogMaxSizeMb,
+    });
+    const input = sizeInput();
+    input.value = "9999";
+    input.dispatchEvent(new Event("change"));
+    expect(onChangeAuditLogMaxSizeMb).toHaveBeenCalledWith(1000);
+    expect(input.value).toBe("1000");
+
+    onChangeAuditLogMaxSizeMb.mockClear();
+    input.value = "0";
+    input.dispatchEvent(new Event("change"));
+    expect(onChangeAuditLogMaxSizeMb).toHaveBeenCalledWith(1);
+    expect(input.value).toBe("1");
+  });
+
+  it("reverts a non-numeric size input back to the current preference value", () => {
+    const onChangeAuditLogMaxSizeMb = vi.fn();
+    openSettings({
+      preferences: buildPreferences({ audit_log_max_size_mb: 10 }),
+      onToggleScopeVisibility: vi.fn(),
+      onChangeTheme: vi.fn(),
+      onToggleBackupOnWrite: vi.fn(),
+      onToggleAuditLogRotate: vi.fn(),
+      onChangeAuditLogMaxSizeMb,
+    });
+    const input = sizeInput();
+    input.value = "";
+    input.dispatchEvent(new Event("change"));
+    expect(onChangeAuditLogMaxSizeMb).not.toHaveBeenCalled();
+    expect(input.value).toBe("10");
   });
 });
 
