@@ -158,6 +158,9 @@ export function buildPreferences(overrides: Partial<Preferences> = {}): Preferen
     recent_projects: overrides.recent_projects ?? [],
     audit_log_rotate: overrides.audit_log_rotate ?? true,
     audit_log_max_size_mb: overrides.audit_log_max_size_mb ?? 10,
+    // `??` instead of `||` so explicit `null` (= never group) is
+    // honored — `null || 2` would silently flip to 2.
+    group_rules_at: overrides.group_rules_at !== undefined ? overrides.group_rules_at : 2,
   };
 }
 

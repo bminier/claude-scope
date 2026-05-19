@@ -516,6 +516,7 @@ describe("openSettings – theme radios", () => {
       onToggleBackupOnWrite: vi.fn(),
       onToggleAuditLogRotate: vi.fn(),
       onChangeAuditLogMaxSizeMb: vi.fn(),
+      onChangeGroupRulesAt: vi.fn(),
     };
   }
 
@@ -587,6 +588,7 @@ describe("openSettings – backup toggle (#88)", () => {
         onToggleBackupOnWrite: vi.fn(),
         onToggleAuditLogRotate: vi.fn(),
         onChangeAuditLogMaxSizeMb: vi.fn(),
+        onChangeGroupRulesAt: vi.fn(),
       });
       expect(backupCheckbox().checked).toBe(enabled);
     }
@@ -601,6 +603,7 @@ describe("openSettings – backup toggle (#88)", () => {
       onToggleBackupOnWrite,
       onToggleAuditLogRotate: vi.fn(),
       onChangeAuditLogMaxSizeMb: vi.fn(),
+      onChangeGroupRulesAt: vi.fn(),
     });
     const cb = backupCheckbox();
     cb.checked = false;
@@ -650,6 +653,7 @@ describe("openSettings – audit log rotation (#127)", () => {
       onToggleBackupOnWrite: vi.fn(),
       onToggleAuditLogRotate: vi.fn(),
       onChangeAuditLogMaxSizeMb: vi.fn(),
+      onChangeGroupRulesAt: vi.fn(),
     };
   }
 
@@ -689,6 +693,7 @@ describe("openSettings – audit log rotation (#127)", () => {
       onToggleBackupOnWrite: vi.fn(),
       onToggleAuditLogRotate,
       onChangeAuditLogMaxSizeMb: vi.fn(),
+      onChangeGroupRulesAt: vi.fn(),
     });
     const t = rotationToggle();
     t.checked = false;
@@ -705,6 +710,7 @@ describe("openSettings – audit log rotation (#127)", () => {
       onToggleBackupOnWrite: vi.fn(),
       onToggleAuditLogRotate: vi.fn(),
       onChangeAuditLogMaxSizeMb,
+      onChangeGroupRulesAt: vi.fn(),
     });
     const input = sizeInput();
     input.value = "50";
@@ -721,6 +727,7 @@ describe("openSettings – audit log rotation (#127)", () => {
       onToggleBackupOnWrite: vi.fn(),
       onToggleAuditLogRotate: vi.fn(),
       onChangeAuditLogMaxSizeMb,
+      onChangeGroupRulesAt: vi.fn(),
     });
     const input = sizeInput();
     input.value = "9999";
@@ -744,6 +751,7 @@ describe("openSettings – audit log rotation (#127)", () => {
       onToggleBackupOnWrite: vi.fn(),
       onToggleAuditLogRotate: vi.fn(),
       onChangeAuditLogMaxSizeMb,
+      onChangeGroupRulesAt: vi.fn(),
     });
     const input = sizeInput();
     input.value = "";
@@ -1751,5 +1759,164 @@ describe("cross-pane rule highlight (#49)", () => {
     search?.dispatchEvent(new KeyboardEvent("keydown", { key: "h", bubbles: true }));
     // No chip is highlighted because the keystroke was for the text input.
     expect(root.querySelectorAll(".rule-highlight").length).toBe(0);
+  });
+});
+
+describe("settings: rule grouping (#115)", () => {
+  beforeEach(() => {
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+  });
+
+  afterEach(() => {
+    for (const b of Array.from(document.querySelectorAll(".modal-backdrop"))) b.remove();
+    clearBody();
+  });
+
+  function makeProps(prefs: Partial<Preferences> = {}) {
+    return {
+      preferences: buildPreferences(prefs),
+      onToggleScopeVisibility: vi.fn(),
+      onChangeTheme: vi.fn(),
+      onToggleBackupOnWrite: vi.fn(),
+      onToggleAuditLogRotate: vi.fn(),
+      onChangeAuditLogMaxSizeMb: vi.fn(),
+      onChangeGroupRulesAt: vi.fn(),
+    };
+  }
+
+  function getRadios(): HTMLInputElement[] {
+    return Array.from(
+      document.querySelectorAll<HTMLInputElement>('input[name="settings-group-rules"]'),
+    );
+  }
+
+  it("renders three radios in the grouping section", () => {
+    openSettings(makeProps());
+    const radios = getRadios();
+    expect(radios).toHaveLength(3);
+    expect(radios.map((r) => r.value)).toEqual(["2", "3", "never"]);
+  });
+
+  it("checks the radio matching the current preference", () => {
+    for (const value of [2, 3, null] as Array<number | null>) {
+      clearBody();
+      openSettings(makeProps({ group_rules_at: value }));
+      const checked = getRadios().find((r) => r.checked);
+      expect(checked?.value).toBe(value === null ? "never" : String(value));
+    }
+  });
+
+  it("clicking 'Never' invokes onChangeGroupRulesAt with null", () => {
+    const onChangeGroupRulesAt = vi.fn();
+    openSettings({
+      preferences: buildPreferences({ group_rules_at: 2 }),
+      onToggleScopeVisibility: vi.fn(),
+      onChangeTheme: vi.fn(),
+      onToggleBackupOnWrite: vi.fn(),
+      onToggleAuditLogRotate: vi.fn(),
+      onChangeAuditLogMaxSizeMb: vi.fn(),
+      onChangeGroupRulesAt,
+    });
+    const never = getRadios().find((r) => r.value === "never");
+    expect(never).toBeDefined();
+    if (!never) return;
+    never.checked = true;
+    never.dispatchEvent(new Event("change"));
+    expect(onChangeGroupRulesAt).toHaveBeenCalledWith(null);
+  });
+
+  it("clicking 'Group at 3' invokes onChangeGroupRulesAt with 3", () => {
+    const onChangeGroupRulesAt = vi.fn();
+    openSettings({
+      preferences: buildPreferences({ group_rules_at: 2 }),
+      onToggleScopeVisibility: vi.fn(),
+      onChangeTheme: vi.fn(),
+      onToggleBackupOnWrite: vi.fn(),
+      onToggleAuditLogRotate: vi.fn(),
+      onChangeAuditLogMaxSizeMb: vi.fn(),
+      onChangeGroupRulesAt,
+    });
+    const at3 = getRadios().find((r) => r.value === "3");
+    expect(at3).toBeDefined();
+    if (!at3) return;
+    at3.checked = true;
+    at3.dispatchEvent(new Event("change"));
+    expect(onChangeGroupRulesAt).toHaveBeenCalledWith(3);
+  });
+});
+
+describe("grouping threshold drives tree rendering (#115)", () => {
+  let root: HTMLElement;
+
+  beforeEach(() => {
+    root = makeRoot();
+  });
+
+  afterEach(() => {
+    clearBody();
+  });
+
+  function scopesWithTwoBashRules(): ReturnType<typeof buildLoadedScopes> {
+    return buildLoadedScopes({
+      project_dir: "/fake/group-threshold",
+      scopes: [
+        {
+          scope: "project",
+          permissions: { allow: ["Bash(git status)", "Bash(npm test)", "Read(**)"] },
+        },
+      ],
+    });
+  }
+
+  function bashGroupCount(): number {
+    // Synthetic tool-group nodes carry `.tree-tool-group` on the
+    // `<details>` element. The summary's `.tree-key` holds the bare
+    // tool name without a separator, so filter by both class and
+    // tool name to distinguish from any future non-Bash group.
+    return Array.from(root.querySelectorAll<HTMLElement>(".tree-tool-group")).filter(
+      (el) => (el.querySelector(":scope > summary .tree-key")?.textContent ?? "") === "Bash",
+    ).length;
+  }
+
+  it("group_rules_at=2 folds the two Bash rules into a group", () => {
+    renderApp(
+      root,
+      makeProps({
+        scopes: scopesWithTwoBashRules(),
+        preferences: buildPreferences({ group_rules_at: 2 }),
+      }),
+    );
+    expect(bashGroupCount()).toBe(1);
+  });
+
+  it("group_rules_at=3 keeps two Bash rules flat (below threshold)", () => {
+    renderApp(
+      root,
+      makeProps({
+        scopes: scopesWithTwoBashRules(),
+        preferences: buildPreferences({ group_rules_at: 3 }),
+      }),
+    );
+    expect(bashGroupCount()).toBe(0);
+    // Both rules still render — they just sit at the top level of the
+    // allow branch without a synthetic Bash group wrapper.
+    const ruleLabels = Array.from(root.querySelectorAll<HTMLElement>(".rule .rule-text"))
+      .map((el) => el.textContent)
+      .filter((s): s is string => s !== null);
+    expect(ruleLabels).toContain("Bash(git status)");
+    expect(ruleLabels).toContain("Bash(npm test)");
+  });
+
+  it("group_rules_at=null disables grouping entirely", () => {
+    renderApp(
+      root,
+      makeProps({
+        scopes: scopesWithTwoBashRules(),
+        preferences: buildPreferences({ group_rules_at: null }),
+      }),
+    );
+    expect(bashGroupCount()).toBe(0);
   });
 });

@@ -44,6 +44,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   recent_projects: [],
   audit_log_rotate: true,
   audit_log_max_size_mb: 10,
+  group_rules_at: 2,
 };
 
 const state: {
@@ -442,6 +443,11 @@ function onChangeAuditLogMaxSizeMb(mb: number): void {
   void persistPreferences({ ...state.preferences, audit_log_max_size_mb: mb });
 }
 
+function onChangeGroupRulesAt(value: number | null): void {
+  if (state.preferences.group_rules_at === value) return;
+  void persistPreferences({ ...state.preferences, group_rules_at: value });
+}
+
 function onOpenSettings(trigger?: HTMLElement): void {
   void openSettings(
     {
@@ -451,6 +457,7 @@ function onOpenSettings(trigger?: HTMLElement): void {
       onToggleBackupOnWrite,
       onToggleAuditLogRotate,
       onChangeAuditLogMaxSizeMb,
+      onChangeGroupRulesAt,
     },
     trigger,
   );

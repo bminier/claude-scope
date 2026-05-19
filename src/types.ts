@@ -191,6 +191,11 @@ export interface Preferences {
    *  server-side to `[1, 1000]`; out-of-range values fall back to the
    *  default rather than the nearest boundary. */
   audit_log_max_size_mb: number;
+  /** Tool-grouping threshold (#115). `null` = never group; otherwise
+   *  group when this many rules share a tool prefix. Backend coerces
+   *  `Some(n < 2)` back to the default, so anything the frontend reads
+   *  is either `null` or `>= 2`. */
+  group_rules_at: number | null;
 }
 
 /** Bounds on `Preferences.audit_log_max_size_mb`. Mirrors Rust's
