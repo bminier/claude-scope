@@ -1762,6 +1762,233 @@ describe("cross-pane rule highlight (#49)", () => {
   });
 });
 
+describe("modified-entry highlight (#50)", () => {
+  let root: HTMLElement;
+
+  beforeEach(() => {
+    // Drain any leaked keystroke / pickup state from earlier suites so
+    // a stray Escape / pickup doesn't poison the first render here.
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    root = makeRoot();
+  });
+
+  afterEach(() => {
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+    clearBody();
+  });
+
+  function scopeRuleEl(text: string): HTMLElement | null {
+    return (
+      Array.from(root.querySelectorAll<HTMLElement>(".rule .rule-text")).find(
+        (e) => e.textContent === text,
+      ) ?? null
+    );
+  }
+
+  function comboChipEl(text: string): HTMLElement | null {
+    return (
+      Array.from(root.querySelectorAll<HTMLElement>(".combo-group .chip")).find(
+        (e) => e.textContent === text,
+      ) ?? null
+    );
+  }
+
+  function topLevelKeyEl(scope: Scope, key: string): HTMLElement | null {
+    const col = root.querySelector<HTMLElement>(`.col[data-scope="${scope}"]`);
+    if (!col) return null;
+    return (
+      Array.from(col.querySelectorAll<HTMLElement>(".scope-tree > * .tree-key")).find(
+        (e) => e.textContent === key,
+      ) ?? null
+    );
+  }
+
+  it("first load draws no modified highlights — no prior snapshot to diff against", () => {
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes }));
+    expect(root.querySelectorAll(".rule-modified, .tree-modified").length).toBe(0);
+  });
+
+  it("a rule newly present in a scope+kind gets .rule-modified", () => {
+    const before = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: before }));
+
+    const after = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)", "Read(*)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: after }));
+
+    expect(scopeRuleEl("Read(*)")?.classList.contains("rule-modified")).toBe(true);
+    expect(scopeRuleEl("Bash(ls)")?.classList.contains("rule-modified")).toBe(false);
+  });
+
+  it("a rule moved between scopes highlights only the destination chip", () => {
+    const before = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "user", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: before }));
+
+    const after = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: after }));
+
+    // Destination chip lit up — confidence cue for "the move landed here".
+    const destChips = Array.from(root.querySelectorAll<HTMLElement>(".rule .rule-text")).filter(
+      (e) => e.textContent === "Bash(ls)",
+    );
+    expect(destChips.length).toBe(1);
+    expect(destChips[0].classList.contains("rule-modified")).toBe(true);
+  });
+
+  it("a top-level non-permissions key value change tags the key with .tree-modified", () => {
+    const before = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "project", other_values: { env: { FOO: "bar" } } }],
+    });
+    renderApp(root, makeProps({ scopes: before }));
+
+    const after = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "project", other_values: { env: { FOO: "baz" } } }],
+    });
+    renderApp(root, makeProps({ scopes: after }));
+
+    expect(topLevelKeyEl("project", "env")?.classList.contains("tree-modified")).toBe(true);
+  });
+
+  it("a brand-new top-level key tags the key with .tree-modified", () => {
+    const before = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: before }));
+
+    const after = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [
+        { scope: "project", permissions: { allow: ["Bash(ls)"] }, other_values: { theme: "dark" } },
+      ],
+    });
+    renderApp(root, makeProps({ scopes: after }));
+
+    expect(topLevelKeyEl("project", "theme")?.classList.contains("tree-modified")).toBe(true);
+  });
+
+  it("a rule newly entering the combined union highlights the combined chip", () => {
+    const before = buildLoadedScopes({ project_dir: "/fake/mod" });
+    renderApp(root, makeProps({ scopes: before }));
+
+    const after = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: after }));
+
+    expect(comboChipEl("Bash(ls)")?.classList.contains("rule-modified")).toBe(true);
+  });
+
+  it("project switch wipes the baseline — no false positives on the first render of the new project", () => {
+    const a = buildLoadedScopes({
+      project_dir: "/fake/projectA",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: a }));
+
+    const b = buildLoadedScopes({
+      project_dir: "/fake/projectB",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)", "Read(*)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: b }));
+
+    // Rule string `Read(*)` is "new" relative to project A but irrelevant
+    // here — project B is a fresh context, so nothing should be flagged
+    // as "just modified".
+    expect(root.querySelectorAll(".rule-modified, .tree-modified").length).toBe(0);
+  });
+
+  it("removed entries don't get a phantom highlight on what's left", () => {
+    const before = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)", "Read(*)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: before }));
+
+    const after = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: after }));
+
+    expect(root.querySelectorAll(".rule-modified, .tree-modified").length).toBe(0);
+  });
+
+  it("re-rendering with the same snapshot reference does not retrigger the diff", () => {
+    const before = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: before }));
+
+    // New reference, one rule added → highlight applied.
+    const after = buildLoadedScopes({
+      project_dir: "/fake/mod",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)", "Read(*)"] } }],
+    });
+    renderApp(root, makeProps({ scopes: after }));
+    expect(scopeRuleEl("Read(*)")?.classList.contains("rule-modified")).toBe(true);
+
+    // Same reference (simulates a search-keystroke re-render): the
+    // highlight survives onto the rebuilt DOM, but the underlying diff
+    // didn't re-fire. A *new* identical snapshot here would re-flag
+    // everything as added — the reference check is the guard.
+    renderApp(root, makeProps({ scopes: after, query: "Read" }));
+    expect(scopeRuleEl("Read(*)")?.classList.contains("rule-modified")).toBe(true);
+  });
+
+  it("highlight tears down after the fade duration elapses", () => {
+    vi.useFakeTimers();
+    try {
+      const before = buildLoadedScopes({
+        project_dir: "/fake/mod",
+        scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+      });
+      renderApp(root, makeProps({ scopes: before }));
+
+      const after = buildLoadedScopes({
+        project_dir: "/fake/mod",
+        scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)", "Read(*)"] } }],
+      });
+      renderApp(root, makeProps({ scopes: after }));
+      expect(scopeRuleEl("Read(*)")?.classList.contains("rule-modified")).toBe(true);
+
+      // Past the 2.5s fade window: the timer clears classes off the
+      // current DOM and forgets the modified set, so a re-render with
+      // the same snapshot reference picks up no highlight on rebuild.
+      vi.advanceTimersByTime(3000);
+      expect(scopeRuleEl("Read(*)")?.classList.contains("rule-modified")).toBe(false);
+
+      renderApp(root, makeProps({ scopes: after, query: "" }));
+      expect(scopeRuleEl("Read(*)")?.classList.contains("rule-modified")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("settings: rule grouping (#115)", () => {
   beforeEach(() => {
     document.dispatchEvent(
