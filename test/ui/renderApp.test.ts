@@ -12,6 +12,7 @@ import type {
 } from "../../src/types.ts";
 import { SEARCH_INPUT_ID } from "../../src/types.ts";
 import {
+  _resetMoveToProjectFilterForTesting,
   attachHelpTooltip,
   groupByToolPrefix,
   lookupKeyHelp,
@@ -417,6 +418,204 @@ describe("context menu (#8)", () => {
       document.querySelectorAll<HTMLButtonElement>(".context-menu-item"),
     ).map((b) => b.textContent?.replace(/\s*▸$/, "").trim() ?? "");
     expect(labels).toContain("Paste as");
+  });
+
+  // -- #111 Move-to project filter ----------------------------------------
+
+  /** Build N synthetic known projects with predictable names + roots so
+   *  the threshold and substring filter can be exercised in isolation
+   *  from any real disk discovery. */
+  function syntheticProjects(n: number): KnownProject[] {
+    return Array.from({ length: n }, (_, i) => ({
+      name: `proj-${String.fromCharCode(97 + i)}`,
+      root: `/tmp/parent-${String.fromCharCode(97 + i)}/proj-${String.fromCharCode(97 + i)}`,
+    }));
+  }
+
+  function openMoveToSubmenu(): HTMLElement {
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
+      project_dir: "/tmp/loaded",
+    });
+    renderApp(
+      root,
+      makeProps({
+        scopes,
+        // 8 synthetic projects + the loaded "/tmp/loaded" current
+        // project — comfortably above the v1 threshold of 5.
+        knownProjects: syntheticProjects(8),
+      }),
+    );
+    const ruleRow = root.querySelector<HTMLElement>(".rule.rule-allow");
+    if (!ruleRow) throw new Error("expected rule row");
+    rightClick(ruleRow);
+    findMenuItem("Move to")?.click();
+    const menus = document.querySelectorAll<HTMLElement>(".context-menu");
+    if (menus.length < 2) throw new Error("expected Move-to submenu to open");
+    return menus[1];
+  }
+
+  it("hides the project filter input when project count is at or below the threshold", () => {
+    _resetMoveToProjectFilterForTesting();
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
+      project_dir: "/tmp/loaded",
+    });
+    renderApp(
+      root,
+      makeProps({
+        scopes,
+        // 4 backend + 1 current = 5, exactly at threshold — still no input.
+        knownProjects: syntheticProjects(4),
+      }),
+    );
+    const ruleRow = root.querySelector<HTMLElement>(".rule.rule-allow");
+    if (!ruleRow) throw new Error("expected rule row");
+    rightClick(ruleRow);
+    findMenuItem("Move to")?.click();
+    const submenu = document.querySelectorAll<HTMLElement>(".context-menu")[1];
+    expect(submenu).toBeTruthy();
+    expect(submenu.querySelector(".context-menu-input")).toBeNull();
+  });
+
+  it("renders the project filter input as the first item after the separator above the threshold", () => {
+    _resetMoveToProjectFilterForTesting();
+    const submenu = openMoveToSubmenu();
+    const input = submenu.querySelector<HTMLInputElement>(".context-menu-input");
+    expect(input).not.toBeNull();
+    expect(input?.placeholder).toBe("Filter projects…");
+
+    // Verify the input sits between the separator and the first project
+    // item — User / User-Local must remain ABOVE it so they stay
+    // unaffected by the keyword.
+    const order: string[] = [];
+    for (const child of Array.from(submenu.children)) {
+      if (child.classList.contains("context-menu-input-row")) order.push("INPUT");
+      else if (child.classList.contains("context-menu-sep")) order.push("SEP");
+      else if (child.classList.contains("context-menu-item")) {
+        order.push(child.textContent?.replace(/\s*▸$/, "").trim() ?? "");
+      }
+    }
+    const sepIdx = order.indexOf("SEP");
+    const inputIdx = order.indexOf("INPUT");
+    expect(sepIdx).toBeGreaterThan(-1);
+    expect(inputIdx).toBe(sepIdx + 1);
+    // User / User-Local are above the separator (and therefore above the input).
+    expect(order.slice(0, sepIdx)).toEqual(expect.arrayContaining(["User", "User-Local"]));
+  });
+
+  it("typing in the filter input hides projects that don't match name or path substring", () => {
+    _resetMoveToProjectFilterForTesting();
+    const submenu = openMoveToSubmenu();
+    const input = submenu.querySelector<HTMLInputElement>(".context-menu-input");
+    if (!input) throw new Error("expected filter input");
+
+    input.value = "proj-a";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+
+    const visibleProjectLabels = Array.from(
+      submenu.querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    )
+      .filter((b) => !b.classList.contains("context-menu-hidden"))
+      .map((b) => b.textContent?.replace(/\s*▸$/, "").trim() ?? "");
+    // proj-a matches; proj-b..h have a different basename. User /
+    // User-Local stay visible because they sit above the input and
+    // never carry `data-match-text`.
+    expect(visibleProjectLabels).toContain("proj-a");
+    expect(visibleProjectLabels).not.toContain("proj-b");
+    expect(visibleProjectLabels).toContain("User");
+    expect(visibleProjectLabels).toContain("User-Local");
+  });
+
+  it("filter substring also matches the project's parent path", () => {
+    _resetMoveToProjectFilterForTesting();
+    const submenu = openMoveToSubmenu();
+    const input = submenu.querySelector<HTMLInputElement>(".context-menu-input");
+    if (!input) throw new Error("expected filter input");
+
+    // "parent-c" is in the synthetic root for proj-c only; the
+    // basename is proj-c. Matching on the parent dir validates the
+    // "name + root" join in `searchText`.
+    input.value = "parent-c";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+
+    const visibleProjectLabels = Array.from(
+      submenu.querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    )
+      .filter((b) => !b.classList.contains("context-menu-hidden") && b.dataset.matchText)
+      .map((b) => b.textContent?.replace(/\s*▸$/, "").trim() ?? "");
+    expect(visibleProjectLabels).toEqual(["proj-c"]);
+  });
+
+  it("filter is case-insensitive", () => {
+    _resetMoveToProjectFilterForTesting();
+    const submenu = openMoveToSubmenu();
+    const input = submenu.querySelector<HTMLInputElement>(".context-menu-input");
+    if (!input) throw new Error("expected filter input");
+
+    input.value = "PROJ-D";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+
+    const visibleProjectLabels = Array.from(
+      submenu.querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    )
+      .filter((b) => !b.classList.contains("context-menu-hidden") && b.dataset.matchText)
+      .map((b) => b.textContent?.replace(/\s*▸$/, "").trim() ?? "");
+    expect(visibleProjectLabels).toEqual(["proj-d"]);
+  });
+
+  it("clearing the input restores every project", () => {
+    _resetMoveToProjectFilterForTesting();
+    const submenu = openMoveToSubmenu();
+    const input = submenu.querySelector<HTMLInputElement>(".context-menu-input");
+    if (!input) throw new Error("expected filter input");
+
+    input.value = "proj-a";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+
+    const hidden = submenu.querySelectorAll<HTMLButtonElement>(".context-menu-hidden");
+    expect(hidden.length).toBe(0);
+  });
+
+  it("filter query persists across menu closes within a session", () => {
+    _resetMoveToProjectFilterForTesting();
+    // First open: type a query, close.
+    let submenu = openMoveToSubmenu();
+    let input = submenu.querySelector<HTMLInputElement>(".context-menu-input");
+    if (!input) throw new Error("expected filter input");
+    input.value = "proj-b";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+
+    // Second open: the input should be pre-populated and the filter
+    // should already be applied on initial render (no flash of full list).
+    submenu = openMoveToSubmenu();
+    input = submenu.querySelector<HTMLInputElement>(".context-menu-input");
+    if (!input) throw new Error("expected filter input on reopen");
+    expect(input.value).toBe("proj-b");
+    const visibleProjectLabels = Array.from(
+      submenu.querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    )
+      .filter((b) => !b.classList.contains("context-menu-hidden") && b.dataset.matchText)
+      .map((b) => b.textContent?.replace(/\s*▸$/, "").trim() ?? "");
+    expect(visibleProjectLabels).toEqual(["proj-b"]);
+  });
+
+  it("ArrowDown from the filter input moves focus to the first visible project", () => {
+    _resetMoveToProjectFilterForTesting();
+    const submenu = openMoveToSubmenu();
+    const input = submenu.querySelector<HTMLInputElement>(".context-menu-input");
+    if (!input) throw new Error("expected filter input");
+
+    input.focus();
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }),
+    );
+    const focused = document.activeElement as HTMLElement | null;
+    expect(focused?.tagName).toBe("BUTTON");
+    expect(focused?.dataset.matchText).toBeDefined();
   });
 });
 

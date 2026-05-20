@@ -520,7 +520,11 @@ fn cmd_list_projects(
     home: Option<&std::path::Path>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let entries = projects::list_known_projects(home)?;
+    // CLI doesn't surface the Move-to filter (#111) — `list-projects` is
+    // meant as a discovery / scripting hook, where any silent filter would
+    // surprise the caller. Pass the no-op default so the output matches
+    // what was on disk.
+    let entries = projects::list_known_projects(home, &projects::ProjectsFilter::default())?;
     if json {
         // Wrap in `KnownProjectOut` so the wire format is stable even if
         // the lib struct grows new fields. `serde_json::to_value` on

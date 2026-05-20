@@ -2886,11 +2886,32 @@ function formatValue(v: JsonValue | undefined): string {
 
 // -- Context menu primitive (#8) ---------------------------------------------
 
-/** One item in a context menu — leaf, separator, or nested submenu. */
+/** One item in a context menu — leaf, separator, nested submenu, or
+ *  filter input (#111). The optional `searchText` lets a leaf or
+ *  submenu opt into the input row's substring filter; items without
+ *  `searchText` are never hidden by the filter and stay visible
+ *  regardless of query (used for User / User-Local in the Move-to
+ *  submenu, which sit above the input and shouldn't be filterable). */
 type MenuItem =
-  | { label: string; onClick: () => void; disabled?: boolean }
-  | { label: string; submenu: MenuItem[]; disabled?: boolean }
-  | { separator: true };
+  | { label: string; onClick: () => void; disabled?: boolean; searchText?: string }
+  | { label: string; submenu: MenuItem[]; disabled?: boolean; searchText?: string }
+  | { separator: true }
+  | { input: MenuInputConfig };
+
+/** Configuration for an in-menu filter input (#111). The input row is
+ *  rendered like any other menu item but doesn't dismiss the menu on
+ *  click, and live-filters every subsequent sibling item with a
+ *  `searchText` field. `onChange` fires on every keystroke so the
+ *  caller can persist the value for the next time the menu opens; the
+ *  filter itself is applied by the menu primitive against
+ *  `data-match-text` attributes set during render — the caller doesn't
+ *  need to walk the DOM. */
+interface MenuInputConfig {
+  placeholder: string;
+  value: string;
+  onChange: (query: string) => void;
+  autofocus?: true;
+}
 
 let openContextMenuClose: (() => void) | null = null;
 
@@ -2930,8 +2951,32 @@ function openContextMenu(items: MenuItem[], x: number, y: number, trigger?: HTML
 
   function buttonsIn(menu: HTMLElement): HTMLButtonElement[] {
     return Array.from(
-      menu.querySelectorAll<HTMLButtonElement>("button.context-menu-item:not(:disabled)"),
+      menu.querySelectorAll<HTMLButtonElement>(
+        "button.context-menu-item:not(:disabled):not(.context-menu-hidden)",
+      ),
     );
+  }
+
+  /**
+   * Apply an input row's query to every subsequent sibling item that
+   * opted into filtering via `data-match-text` (#111). Items above the
+   * input or without a match text are untouched — that's how Move-to's
+   * User / User-Local rows stay always-visible while the project list
+   * below the input filters live.
+   */
+  function applyMenuFilter(input: HTMLInputElement, query: string): void {
+    const needle = query.toLowerCase();
+    let sibling = input.parentElement?.nextElementSibling;
+    while (sibling) {
+      if (sibling instanceof HTMLElement) {
+        const matchText = sibling.dataset.matchText;
+        if (matchText !== undefined) {
+          const hit = needle === "" || matchText.includes(needle);
+          sibling.classList.toggle("context-menu-hidden", !hit);
+        }
+      }
+      sibling = sibling.nextElementSibling;
+    }
   }
 
   function closeSubmenusBelow(depth: number): void {
@@ -2945,6 +2990,11 @@ function openContextMenu(items: MenuItem[], x: number, y: number, trigger?: HTML
     const menu = document.createElement("div");
     menu.className = "context-menu";
     menu.setAttribute("role", "menu");
+    // Capture the autofocus input — if any — so we can focus it after
+    // the menu lands in the DOM (focus before insertion is silently
+    // dropped). At most one input per menu in v1 (#111 only adds it to
+    // Move-to), but the code is shaped to tolerate a future second.
+    let autofocusInput: HTMLInputElement | null = null;
     for (const item of items) {
       if ("separator" in item) {
         const sep = document.createElement("div");
@@ -2953,11 +3003,70 @@ function openContextMenu(items: MenuItem[], x: number, y: number, trigger?: HTML
         menu.appendChild(sep);
         continue;
       }
+      if ("input" in item) {
+        // Input row (#111). Lives in its own non-button container so
+        // `buttonsIn` doesn't include it, drop-target highlighting
+        // doesn't fire on hover, and the outside-click handler still
+        // treats clicks here as "inside the menu" because of the
+        // `stack.some((m) => m.contains(target))` check.
+        const row = document.createElement("div");
+        row.className = "context-menu-input-row";
+        row.setAttribute("role", "presentation");
+        const input = document.createElement("input");
+        input.type = "search";
+        input.className = "context-menu-input";
+        input.placeholder = item.input.placeholder;
+        input.value = item.input.value;
+        input.setAttribute("aria-label", item.input.placeholder);
+        // Stop arrow-key bubbling on keys that *don't* belong to menu
+        // nav so the input still handles text-editing keystrokes
+        // (Home / End / Backspace) normally. The menu's onKey handler
+        // owns ArrowUp / ArrowDown / Escape / ArrowLeft / ArrowRight
+        // when focus is on a button, but ArrowUp/Down should *also*
+        // move focus from the input into the filtered list. Those two
+        // keys propagate; everything else (typing, caret movement) is
+        // local to the input.
+        input.addEventListener("input", () => {
+          item.input.onChange(input.value);
+          applyMenuFilter(input, input.value);
+        });
+        // ArrowDown from the input drops focus into the first visible
+        // sibling button *below* the row — not the first button in the
+        // menu, which would skip back to User / User-Local rows that
+        // sit above the input. ArrowUp does nothing (no buttons above
+        // an input in the v1 layout, and wrapping would surprise).
+        input.addEventListener("keydown", (e) => {
+          if (e.key !== "ArrowDown") return;
+          e.preventDefault();
+          let sibling = row.nextElementSibling;
+          while (sibling) {
+            if (
+              sibling instanceof HTMLButtonElement &&
+              !sibling.disabled &&
+              !sibling.classList.contains("context-menu-hidden")
+            ) {
+              sibling.focus();
+              return;
+            }
+            sibling = sibling.nextElementSibling;
+          }
+        });
+        row.appendChild(input);
+        menu.appendChild(row);
+        if (item.input.autofocus) autofocusInput = input;
+        continue;
+      }
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "context-menu-item";
       btn.setAttribute("role", "menuitem");
       btn.textContent = item.label;
+      // Opt-in to the input-row filter. Lowercased once at render time
+      // so live keystroke filtering only compares pre-normalized
+      // strings on each pass.
+      if (item.searchText !== undefined) {
+        btn.dataset.matchText = item.searchText.toLowerCase();
+      }
       if ("submenu" in item) {
         btn.classList.add("context-menu-submenu-trigger");
         const arrow = document.createElement("span");
@@ -2993,6 +3102,12 @@ function openContextMenu(items: MenuItem[], x: number, y: number, trigger?: HTML
     }
 
     document.body.appendChild(menu);
+    // Re-apply the persisted filter on render so reopening a menu with
+    // a previous query landed in the input shows the matching subset
+    // immediately, not the full list flashed then hidden.
+    if (autofocusInput && autofocusInput.value !== "") {
+      applyMenuFilter(autofocusInput, autofocusInput.value);
+    }
     const rect = menu.getBoundingClientRect();
     let left: number;
     let top: number;
@@ -3014,7 +3129,17 @@ function openContextMenu(items: MenuItem[], x: number, y: number, trigger?: HTML
     }
     menu.style.left = `${left}px`;
     menu.style.top = `${top}px`;
-    buttonsIn(menu)[0]?.focus();
+    // Input wins focus over the first button when present and
+    // autofocus is set — that's the whole point of an in-menu filter.
+    if (autofocusInput) {
+      autofocusInput.focus();
+      // Pre-select so a fresh keystroke replaces the persisted query
+      // (typical "search box on open" behavior) without forcing the
+      // user to Cmd+A first.
+      autofocusInput.select();
+    } else {
+      buttonsIn(menu)[0]?.focus();
+    }
     return menu;
   }
 
@@ -3061,6 +3186,17 @@ function openContextMenu(items: MenuItem[], x: number, y: number, trigger?: HTML
       btns[(idx + 1 + btns.length) % btns.length]?.focus();
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
+      // ArrowUp on the first visible button hops into the menu's
+      // input row if one exists (#111) — Tab order is too narrow for
+      // a hidden filter input that the user has to remember exists.
+      if (idx === 0) {
+        const input = menu.querySelector<HTMLInputElement>(".context-menu-input");
+        if (input) {
+          input.focus();
+          input.select();
+          return;
+        }
+      }
       btns[(idx - 1 + btns.length) % btns.length]?.focus();
     } else if (e.key === "ArrowRight") {
       if (active?.classList.contains("context-menu-submenu-trigger")) {
@@ -3124,6 +3260,37 @@ function attachContextMenu(el: HTMLElement, build: () => MenuItem[]): void {
 }
 
 /**
+ * Threshold above which the Move-to submenu shows an inline keyword
+ * filter input (#111). Below this number every project fits in a
+ * single glance and the input is more friction than help; above it,
+ * the menu can get unwieldy on machines with a long project history.
+ * Picked low rather than high so users with a handful of projects
+ * still benefit from the filter — bump it later if user reports say
+ * the input feels intrusive in the small-project case.
+ */
+const MOVE_TO_PROJECT_FILTER_THRESHOLD = 5;
+
+/**
+ * Session-scoped filter query for the Move-to submenu's project list
+ * (#111). Lives at module scope so it survives across context menu
+ * opens within a session — typing once and re-opening the menu shows
+ * the same filtered list — but resets to empty on page reload, by
+ * design. Persisting to user preferences is in #136.
+ */
+let moveToProjectFilter = "";
+
+/**
+ * Test-only reset for the Move-to filter (#111). Tests that exercise
+ * the "input renders empty on open" path or share `describe` state need
+ * a clean slate; production code never calls this. The underscore
+ * prefix is the convention for "this is here for tests; please don't
+ * reach for it from other production code."
+ */
+export function _resetMoveToProjectFilterForTesting(): void {
+  moveToProjectFilter = "";
+}
+
+/**
  * Build the Move-to submenu structure (#8): User / User-Local at top,
  * then a separator, then each known project as a nested submenu of its
  * Local / Project scopes. `from` (and optional `fromProject`) drive the
@@ -3135,6 +3302,15 @@ function attachContextMenu(el: HTMLElement, build: () => MenuItem[]): void {
  * but #106 will give us the choice of multiple projects and the source-
  * skip will need the project identity to disambiguate Local-of-A from
  * Local-of-B.
+ *
+ * When the discovered project count exceeds
+ * [[MOVE_TO_PROJECT_FILTER_THRESHOLD]], an inline filter input (#111)
+ * is inserted between the separator and the first project — User /
+ * User-Local stay above it and aren't affected by the keyword. The
+ * filter runs client-side against name + root substring so keystrokes
+ * are instant (no IPC round-trip); the backend-side `keyword` filter
+ * is plumbed but currently used only by the CLI and as a hook for the
+ * eventual content-scan in #136.
  */
 function buildMoveToSubmenu(
   props: AppProps,
@@ -3152,6 +3328,22 @@ function buildMoveToSubmenu(
   if (projects.length > 0 && items.length > 0) {
     items.push({ separator: true });
   }
+  // Inline filter input (#111) — only renders above the threshold so
+  // small project lists stay clean. The filter is applied at the DOM
+  // layer by the menu primitive; each project item carries a
+  // `searchText` that matches against name and full root path.
+  if (projects.length > MOVE_TO_PROJECT_FILTER_THRESHOLD) {
+    items.push({
+      input: {
+        placeholder: "Filter projects…",
+        value: moveToProjectFilter,
+        autofocus: true,
+        onChange: (query) => {
+          moveToProjectFilter = query;
+        },
+      },
+    });
+  }
   for (const project of projects) {
     const inner: MenuItem[] = [];
     for (const target of ["local", "project"] as Scope[]) {
@@ -3160,7 +3352,15 @@ function buildMoveToSubmenu(
       inner.push({ label: SCOPE_LABELS[target], onClick: () => onPick(target) });
     }
     if (inner.length === 0) continue;
-    items.push({ label: project.name, submenu: inner });
+    items.push({
+      label: project.name,
+      submenu: inner,
+      // Match against display name + full root path so users typing
+      // either "auth-team" (parent dir) or "service" (basename) find
+      // the project. Joined with `\n` so a substring can't span the
+      // boundary and produce a false positive.
+      searchText: `${project.name}\n${project.root}`,
+    });
   }
   return items;
 }
