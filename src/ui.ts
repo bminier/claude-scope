@@ -746,15 +746,19 @@ function header(props: AppProps): HTMLElement {
   const bar = document.createElement("header");
   bar.className = "topbar";
 
+  // Row 1: title + search + actions. The project path used to be wedged
+  // in here between the title and the buttons, where it read as an
+  // afterthought (#40); it now gets its own row below.
+  const mainRow = document.createElement("div");
+  mainRow.className = "topbar-row";
+
   const title = document.createElement("div");
   title.className = "title";
   title.innerHTML =
     "<strong>ClaudeScope</strong><span class='subtitle'>Promote Claude Code settings between scopes</span>";
-  bar.appendChild(title);
+  mainRow.appendChild(title);
 
-  bar.appendChild(projectDirDropdown(props));
-
-  bar.appendChild(searchBox(props));
+  mainRow.appendChild(searchBox(props));
 
   const actions = document.createElement("div");
   actions.className = "actions";
@@ -789,7 +793,16 @@ function header(props: AppProps): HTMLElement {
   about.onclick = (e) => props.onOpenAbout(e.currentTarget as HTMLElement);
   actions.appendChild(about);
 
-  bar.appendChild(actions);
+  mainRow.appendChild(actions);
+  bar.appendChild(mainRow);
+
+  // Row 2: the project path dropdown, full-width on its own line so it
+  // reads as "you are here" rather than an afterthought (#40).
+  const projectRow = document.createElement("div");
+  projectRow.className = "topbar-project";
+  projectRow.appendChild(projectDirDropdown(props));
+  bar.appendChild(projectRow);
+
   return bar;
 }
 

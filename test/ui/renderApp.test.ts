@@ -1415,6 +1415,54 @@ describe("project-dir dropdown (#47)", () => {
   });
 });
 
+describe("header layout (#40)", () => {
+  let root: HTMLElement;
+
+  beforeEach(() => {
+    root = makeRoot();
+  });
+
+  afterEach(() => {
+    clearBody();
+  });
+
+  it("puts the project path on its own row, below the title/search/actions row", () => {
+    renderApp(root, makeProps({ scopes: buildLoadedScopes({ project_dir: "/work/here" }) }));
+    const topbar = root.querySelector<HTMLElement>(".topbar");
+    if (!topbar) throw new Error("expected .topbar");
+
+    const mainRow = topbar.querySelector<HTMLElement>(".topbar-row");
+    const projectRow = topbar.querySelector<HTMLElement>(".topbar-project");
+    expect(mainRow).not.toBeNull();
+    expect(projectRow).not.toBeNull();
+
+    // Project row comes after the main row in document order — "under
+    // the title" per the issue.
+    const children = Array.from(topbar.children);
+    expect(children.indexOf(mainRow as HTMLElement)).toBeLessThan(
+      children.indexOf(projectRow as HTMLElement),
+    );
+  });
+
+  it("keeps title, search, and actions in the main row — not the project row", () => {
+    renderApp(root, makeProps({ scopes: buildLoadedScopes({ project_dir: "/work/here" }) }));
+    const mainRow = root.querySelector<HTMLElement>(".topbar-row");
+    if (!mainRow) throw new Error("expected .topbar-row");
+    expect(mainRow.querySelector(".title")).not.toBeNull();
+    expect(mainRow.querySelector(".search")).not.toBeNull();
+    expect(mainRow.querySelector(".actions")).not.toBeNull();
+    // The project dropdown is NOT in the main row anymore.
+    expect(mainRow.querySelector(".project-dir-trigger")).toBeNull();
+  });
+
+  it("nests the project dropdown inside the dedicated project row", () => {
+    renderApp(root, makeProps({ scopes: buildLoadedScopes({ project_dir: "/work/here" }) }));
+    const projectRow = root.querySelector<HTMLElement>(".topbar-project");
+    if (!projectRow) throw new Error("expected .topbar-project");
+    expect(projectRow.querySelector(".project-dir-trigger")).not.toBeNull();
+  });
+});
+
 describe("History dialog (#19 phase 2)", () => {
   beforeEach(() => {
     // Drain any leaked modal Escape listeners from earlier tests in the
