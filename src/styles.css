@@ -1407,6 +1407,38 @@ button:disabled {
   margin: 4px 0;
 }
 
+/* In-menu filter input row (#111). Wraps a `<input type="search">` in
+   a non-interactive row so clicks on the row don't dismiss the menu
+   and hover doesn't trigger drop-target highlighting. Padding matches
+   `.context-menu-item` so the input lines up vertically with the
+   button column above and below. */
+.context-menu-input-row {
+  padding: 4px 8px;
+}
+.context-menu-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 8px;
+  font: inherit;
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  outline: none;
+}
+.context-menu-input:focus {
+  border-color: var(--accent);
+}
+
+/* Filter hits walk the input row's subsequent siblings and toggle
+   this class on the ones whose `data-match-text` doesn't contain the
+   needle (#111). `display: none` rather than `visibility` so hidden
+   items don't reserve space in the menu's height — a list of 80
+   filtered-out projects shouldn't leave a tall blank menu. */
+.context-menu-hidden {
+  display: none;
+}
+
 /* When the diff modal is rendering only one side (delete, paste, same-scope
    change-kind), drop the two-column grid so the side fills the dialog width
    instead of leaving an empty column. */

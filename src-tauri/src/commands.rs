@@ -14,7 +14,7 @@ use crate::model::{
     PermissionKind, PermissionRules, SettingsDoc,
 };
 use crate::preferences::{self, Preferences};
-use crate::projects::{self, KnownProject};
+use crate::projects::{self, KnownProject, ProjectsFilter};
 use crate::runtime::{RuntimeInfo, RuntimeOverrides};
 use crate::scope::{self, Scope, ScopePaths};
 use crate::watcher::WatchState;
@@ -519,14 +519,52 @@ pub fn load_runtime_info(overrides: State<'_, RuntimeOverrides>) -> RuntimeInfo 
     RuntimeInfo::from_overrides(&overrides)
 }
 
+/// Hardcoded recency window for the Move-to submenu filter (#111). 90 days
+/// is a generous cutoff — the user's "I came back to this project last
+/// quarter" case still makes the list, but a one-off exploration from
+/// six months ago drops out. Lives in `commands.rs` rather than
+/// `projects.rs` so the pure discovery function stays policy-free and
+/// the default policy is one obvious place to revisit.
+const DEFAULT_PROJECT_RECENCY_DAYS: u32 = 90;
+
+/// Hardcoded minimum session count for the Move-to submenu filter
+/// (#111). `2` drops projects that have exactly one transcript — usually
+/// a one-shot "let me ask Claude something" exploration — without
+/// affecting any project the user has actually returned to.
+const DEFAULT_PROJECT_MIN_SESSIONS: u32 = 2;
+
+/// Build the effective filter for `list_known_projects`. Any field the
+/// frontend left unset (or set to an empty keyword) falls back to the
+/// hardcoded default for that dimension, so the silent baseline applies
+/// to every call but the user's typed keyword still composes on top.
+fn project_filter_with_defaults(req: Option<ProjectsFilter>) -> ProjectsFilter {
+    let req = req.unwrap_or_default();
+    ProjectsFilter {
+        recency_days: req.recency_days.or(Some(DEFAULT_PROJECT_RECENCY_DAYS)),
+        min_sessions: req.min_sessions.or(Some(DEFAULT_PROJECT_MIN_SESSIONS)),
+        // Normalize an empty keyword to `None` — the projects-layer
+        // filter already treats `Some("")` as a no-op, but normalizing
+        // here keeps the wire / logs cleaner and gives the frontend a
+        // single shape to send ("" when no input).
+        keyword: req.keyword.filter(|k| !k.is_empty()),
+    }
+}
+
 /// Enumerate every Claude project on this machine for the Move-to submenu
 /// (#106). Routes through `RuntimeOverrides::home` so sandbox mode (#66)
 /// reads from the scratch home instead of the real `~/.claude/projects/`.
+///
+/// `filter` (#111) narrows the list. Defaults apply per-field — the
+/// frontend can leave any dimension unset and the silent baseline
+/// (`DEFAULT_PROJECT_RECENCY_DAYS` / `DEFAULT_PROJECT_MIN_SESSIONS`)
+/// takes over, while a typed keyword still composes on top.
 #[tauri::command]
 pub fn list_known_projects(
     overrides: State<'_, RuntimeOverrides>,
+    filter: Option<ProjectsFilter>,
 ) -> Result<Vec<KnownProject>, String> {
-    projects::list_known_projects(overrides.home()).map_err(|e| e.to_string())
+    let effective = project_filter_with_defaults(filter);
+    projects::list_known_projects(overrides.home(), &effective).map_err(|e| e.to_string())
 }
 
 /// One row in the History view's audit-log list (#19 phase 2). Wraps an

@@ -13,9 +13,11 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
+
+const SECS_PER_DAY: u64 = 24 * 60 * 60;
 
 /// Bounded scan over each transcript looking for the first `cwd`. The first
 /// few records are session-metadata wrappers (`type: "last-prompt"`,
@@ -35,6 +37,44 @@ pub struct KnownProject {
     pub root: PathBuf,
 }
 
+/// Optional per-dimension filter applied after discovery (#111). Default
+/// (every field `None` / empty) is the no-op: every loadable project is
+/// returned. The command layer fills in any user-configured or
+/// hardcoded defaults before calling — the pure discovery function
+/// itself stays policy-free so the unit tests can pin each dimension
+/// independently.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ProjectsFilter {
+    /// Hide projects whose newest `.jsonl` is older than this many days.
+    /// `None` disables the cutoff.
+    pub recency_days: Option<u32>,
+    /// Hide projects with fewer than this many `.jsonl` files in their
+    /// transcript directory. Drops single-session experiments when set
+    /// to `2`. `None` disables the floor.
+    pub min_sessions: Option<u32>,
+    /// Case-insensitive substring match against the project's display
+    /// name and full root path. `None` or `Some("")` disables — the
+    /// command layer normalizes empty strings on input so callers don't
+    /// have to distinguish "no filter" from "match anything".
+    pub keyword: Option<String>,
+}
+
+/// Per-project scan metadata collected during discovery. Used for
+/// filtering (#111) and then dropped — callers see only `KnownProject`.
+/// Folded into the same readdir pass that already finds the newest
+/// transcript so adding it costs no extra IO.
+#[derive(Debug)]
+struct ProjectScan {
+    cwd: PathBuf,
+    /// Modification time of the newest `.jsonl` in this project's
+    /// transcript directory. Used by the recency filter.
+    newest_mtime: SystemTime,
+    /// Count of `.jsonl` files in the transcript directory. Used by
+    /// the `min_sessions` filter.
+    session_count: u32,
+}
+
 /// Minimal shape we need from each transcript line. `serde` ignores the
 /// dozens of other fields each record carries, so a single struct works for
 /// both session-metadata and prompt/response records — only the ones with a
@@ -48,7 +88,15 @@ struct TranscriptLine {
 /// `dirs::home_dir()` for sandboxed tests (and the runtime `--home`
 /// override). Missing `~/.claude/projects/` is not an error — fresh
 /// installs simply return an empty list.
-pub fn list_known_projects(home: Option<&Path>) -> io::Result<Vec<KnownProject>> {
+///
+/// `filter` shrinks the list dimension-by-dimension (#111). The default
+/// (`ProjectsFilter::default()`) preserves today's behavior — every
+/// loadable project is returned. The command layer applies any
+/// hardcoded defaults before calling.
+pub fn list_known_projects(
+    home: Option<&Path>,
+    filter: &ProjectsFilter,
+) -> io::Result<Vec<KnownProject>> {
     let Some(projects_dir) = projects_dir(home) else {
         return Ok(Vec::new());
     };
@@ -59,23 +107,75 @@ pub fn list_known_projects(home: Option<&Path>) -> io::Result<Vec<KnownProject>>
         Err(e) => return Err(e),
     };
 
+    // Snapshot once so every recency comparison in this call sees the
+    // same "now" — otherwise a slow scan over many project dirs could
+    // produce subtly different cutoffs per project.
+    let now = SystemTime::now();
+
     let mut found: Vec<KnownProject> = Vec::new();
     for entry in entries.flatten() {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        let Some(cwd) = latest_cwd_in(&entry.path())? else {
+        let Some(scan) = scan_project_dir(&entry.path())? else {
             continue;
         };
-        if !is_loadable_project(&cwd) {
+        if !is_loadable_project(&scan.cwd) {
             continue;
         }
-        let name = display_name_for(&cwd);
-        found.push(KnownProject { name, root: cwd });
+        let project = KnownProject {
+            name: display_name_for(&scan.cwd),
+            root: scan.cwd.clone(),
+        };
+        if !passes_filter(&scan, &project, filter, now) {
+            continue;
+        }
+        found.push(project);
     }
 
     dedupe_and_sort(&mut found);
     Ok(found)
+}
+
+/// Apply the per-dimension filter to a single scanned project. Each
+/// dimension is independent and short-circuits — the first failing
+/// check rejects the project. A `None` (or empty keyword) field is a
+/// no-op for that dimension, which lets the command layer leave
+/// individual filters off without having to construct sentinel values.
+fn passes_filter(
+    scan: &ProjectScan,
+    project: &KnownProject,
+    filter: &ProjectsFilter,
+    now: SystemTime,
+) -> bool {
+    if let Some(days) = filter.recency_days {
+        let cutoff = Duration::from_secs(u64::from(days) * SECS_PER_DAY);
+        // `duration_since` errors when the mtime is *after* `now` (clock
+        // skew, or a filesystem touched from a host with a fast clock).
+        // Treat that as "very recent" rather than rejecting — punishing
+        // a project for a future timestamp would surprise the user.
+        if let Ok(age) = now.duration_since(scan.newest_mtime) {
+            if age > cutoff {
+                return false;
+            }
+        }
+    }
+    if let Some(min) = filter.min_sessions {
+        if scan.session_count < min {
+            return false;
+        }
+    }
+    if let Some(kw) = filter.keyword.as_deref() {
+        if !kw.is_empty() {
+            let needle = kw.to_lowercase();
+            let name = project.name.to_lowercase();
+            let path = project.root.to_string_lossy().to_lowercase();
+            if !name.contains(&needle) && !path.contains(&needle) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn projects_dir(home: Option<&Path>) -> Option<PathBuf> {
@@ -83,12 +183,15 @@ fn projects_dir(home: Option<&Path>) -> Option<PathBuf> {
     Some(base.join(".claude").join("projects"))
 }
 
-/// Pick the newest transcript file in `dir` and extract its first `cwd`.
-/// Newest-wins because a project the user has come back to most recently
-/// has the truest current path: an old transcript could reference a path
-/// from before a directory rename.
-fn latest_cwd_in(dir: &Path) -> io::Result<Option<PathBuf>> {
+/// Walk a project's transcript directory in a single readdir pass and
+/// pull out everything the filter pipeline needs: the newest
+/// transcript's `cwd`, that transcript's mtime, and the total session
+/// count. Newest-wins because a project the user has come back to most
+/// recently has the truest current path — an old transcript could
+/// reference a path from before a directory rename.
+fn scan_project_dir(dir: &Path) -> io::Result<Option<ProjectScan>> {
     let mut newest: Option<(SystemTime, PathBuf)> = None;
+    let mut session_count: u32 = 0;
     for entry in fs::read_dir(dir)?.flatten() {
         let file_type = match entry.file_type() {
             Ok(t) => t,
@@ -101,6 +204,7 @@ fn latest_cwd_in(dir: &Path) -> io::Result<Option<PathBuf>> {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
+        session_count = session_count.saturating_add(1);
         // mtime fallback to UNIX_EPOCH keeps ordering stable on filesystems
         // that fail to report a modified time (rare, but seen on some
         // Windows network shares); the comparison still yields *some* total
@@ -115,10 +219,17 @@ fn latest_cwd_in(dir: &Path) -> io::Result<Option<PathBuf>> {
         }
     }
 
-    let Some((_, path)) = newest else {
+    let Some((newest_mtime, path)) = newest else {
         return Ok(None);
     };
-    Ok(extract_first_cwd(&path)?.map(PathBuf::from))
+    let Some(cwd) = extract_first_cwd(&path)? else {
+        return Ok(None);
+    };
+    Ok(Some(ProjectScan {
+        cwd: PathBuf::from(cwd),
+        newest_mtime,
+        session_count,
+    }))
 }
 
 fn extract_first_cwd(path: &Path) -> io::Result<Option<String>> {
@@ -215,7 +326,7 @@ mod tests {
     fn returns_empty_when_projects_dir_missing() {
         let tmp = tempfile::tempdir().unwrap();
         // No `~/.claude/projects/` at all.
-        let got = list_known_projects(Some(tmp.path())).unwrap();
+        let got = list_known_projects(Some(tmp.path()), &ProjectsFilter::default()).unwrap();
         assert!(got.is_empty());
     }
 
@@ -226,7 +337,7 @@ mod tests {
         let project = make_loadable_project(tmp.path(), "alpha");
         seed_project(&home, "D--alpha", &project);
 
-        let got = list_known_projects(Some(&home)).unwrap();
+        let got = list_known_projects(Some(&home), &ProjectsFilter::default()).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "alpha");
         assert_eq!(canonical_key(&got[0].root), canonical_key(&project));
@@ -240,7 +351,7 @@ mod tests {
         let bogus = tmp.path().join("deleted-project");
         seed_project(&home, "D--gone", &bogus);
 
-        let got = list_known_projects(Some(&home)).unwrap();
+        let got = list_known_projects(Some(&home), &ProjectsFilter::default()).unwrap();
         assert!(got.is_empty(), "expected stale project to be filtered out");
     }
 
@@ -254,7 +365,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         seed_project(&home, "D--bare", &project);
 
-        let got = list_known_projects(Some(&home)).unwrap();
+        let got = list_known_projects(Some(&home), &ProjectsFilter::default()).unwrap();
         assert!(got.is_empty());
     }
 
@@ -272,7 +383,7 @@ mod tests {
             ],
         );
 
-        let got = list_known_projects(Some(&home)).unwrap();
+        let got = list_known_projects(Some(&home), &ProjectsFilter::default()).unwrap();
         assert!(got.is_empty());
     }
 
@@ -287,7 +398,7 @@ mod tests {
         seed_project(&home, "p-alpha", &alpha);
         seed_project(&home, "p-Beta", &beta);
 
-        let got = list_known_projects(Some(&home)).unwrap();
+        let got = list_known_projects(Some(&home), &ProjectsFilter::default()).unwrap();
         let names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "Beta", "gamma"]);
     }
@@ -303,7 +414,7 @@ mod tests {
         seed_project(&home, "D--SHARED", &project);
         seed_project(&home, "D--shared", &project);
 
-        let got = list_known_projects(Some(&home)).unwrap();
+        let got = list_known_projects(Some(&home), &ProjectsFilter::default()).unwrap();
         assert_eq!(got.len(), 1);
     }
 
@@ -326,7 +437,7 @@ mod tests {
         // this. Must not be opened as a transcript.
         fs::create_dir_all(dir.join("1fad75bd-3add-4aba-85d6-9ac4b8369d34")).unwrap();
 
-        let got = list_known_projects(Some(&home)).unwrap();
+        let got = list_known_projects(Some(&home), &ProjectsFilter::default()).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "mixed");
     }
@@ -359,8 +470,241 @@ mod tests {
         let f = fs::OpenOptions::new().write(true).open(&newer).unwrap();
         f.set_modified(later).unwrap();
 
-        let got = list_known_projects(Some(&home)).unwrap();
+        let got = list_known_projects(Some(&home), &ProjectsFilter::default()).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "new-name");
+    }
+
+    // -- #111 filter tests ---------------------------------------------------
+
+    /// Bump a transcript file's mtime to a specific offset from now. Used
+    /// by the recency tests to age a session past a cutoff without
+    /// sleeping. `f.set_modified` is stable since Rust 1.75 and our MSRV
+    /// is 1.88.
+    fn set_mtime_offset(path: &Path, offset_from_now: std::time::Duration, past: bool) {
+        let mtime = if past {
+            SystemTime::now() - offset_from_now
+        } else {
+            SystemTime::now() + offset_from_now
+        };
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(mtime).unwrap();
+    }
+
+    #[test]
+    fn recency_cutoff_hides_projects_older_than_the_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let fresh = make_loadable_project(tmp.path(), "fresh");
+        let stale = make_loadable_project(tmp.path(), "stale");
+        seed_project(&home, "p-fresh", &fresh);
+        seed_project(&home, "p-stale", &stale);
+
+        // Age the `stale` transcript 100 days into the past — well past
+        // any sane cutoff. `fresh` keeps its just-written mtime.
+        let stale_jsonl = home
+            .join(".claude")
+            .join("projects")
+            .join("p-stale")
+            .join("0001-session.jsonl");
+        set_mtime_offset(&stale_jsonl, Duration::from_secs(100 * SECS_PER_DAY), true);
+
+        let filter = ProjectsFilter {
+            recency_days: Some(30),
+            ..ProjectsFilter::default()
+        };
+        let got = list_known_projects(Some(&home), &filter).unwrap();
+        let names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["fresh"]);
+    }
+
+    #[test]
+    fn recency_cutoff_keeps_future_mtimes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = make_loadable_project(tmp.path(), "future-clock");
+        seed_project(&home, "p-future", &project);
+
+        // mtime way in the future — clock skew between machines, or a
+        // filesystem that surfaces a remote host's clock. Treat as
+        // recent, not as "older than cutoff".
+        let jsonl = home
+            .join(".claude")
+            .join("projects")
+            .join("p-future")
+            .join("0001-session.jsonl");
+        set_mtime_offset(&jsonl, Duration::from_secs(365 * SECS_PER_DAY), false);
+
+        let filter = ProjectsFilter {
+            recency_days: Some(1),
+            ..ProjectsFilter::default()
+        };
+        let got = list_known_projects(Some(&home), &filter).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn min_sessions_hides_single_session_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let busy = make_loadable_project(tmp.path(), "busy");
+        let oneoff = make_loadable_project(tmp.path(), "oneoff");
+
+        // `busy` gets two transcripts, `oneoff` gets just the one seed
+        // file. Both seed files carry a cwd record.
+        seed_project(&home, "p-busy", &busy);
+        let busy_dir = home.join(".claude").join("projects").join("p-busy");
+        let cwd_str = busy.to_string_lossy().replace('\\', "\\\\");
+        write_jsonl(
+            &busy_dir.join("0002-session.jsonl"),
+            &[&format!(r#"{{"sessionId":"t","cwd":"{cwd_str}"}}"#)],
+        );
+        seed_project(&home, "p-oneoff", &oneoff);
+
+        let filter = ProjectsFilter {
+            min_sessions: Some(2),
+            ..ProjectsFilter::default()
+        };
+        let got = list_known_projects(Some(&home), &filter).unwrap();
+        let names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["busy"]);
+    }
+
+    #[test]
+    fn keyword_filter_matches_name_substring_case_insensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let scope = make_loadable_project(tmp.path(), "claude-scope");
+        let other = make_loadable_project(tmp.path(), "unrelated");
+        seed_project(&home, "p-scope", &scope);
+        seed_project(&home, "p-other", &other);
+
+        let filter = ProjectsFilter {
+            keyword: Some("SCOPE".to_string()),
+            ..ProjectsFilter::default()
+        };
+        let got = list_known_projects(Some(&home), &filter).unwrap();
+        let names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["claude-scope"]);
+    }
+
+    #[test]
+    fn keyword_filter_matches_path_substring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        // Project basename doesn't carry the needle, but the parent path
+        // does — the filter searches the full root, not just the name.
+        let parent = tmp.path().join("workspaces").join("auth-team");
+        fs::create_dir_all(&parent).unwrap();
+        let project = make_loadable_project(&parent, "service");
+        let other = make_loadable_project(tmp.path(), "elsewhere");
+        seed_project(&home, "p-deep", &project);
+        seed_project(&home, "p-other", &other);
+
+        let filter = ProjectsFilter {
+            keyword: Some("auth-team".to_string()),
+            ..ProjectsFilter::default()
+        };
+        let got = list_known_projects(Some(&home), &filter).unwrap();
+        let names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["service"]);
+    }
+
+    #[test]
+    fn empty_keyword_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = make_loadable_project(tmp.path(), "anything");
+        seed_project(&home, "p-any", &project);
+
+        let filter = ProjectsFilter {
+            keyword: Some(String::new()),
+            ..ProjectsFilter::default()
+        };
+        let got = list_known_projects(Some(&home), &filter).unwrap();
+        assert_eq!(got.len(), 1, "empty keyword must not hide anything");
+    }
+
+    #[test]
+    fn filters_compose_recency_min_sessions_and_keyword() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+
+        // The keep-it project hits every dimension: fresh, two sessions,
+        // keyword in name.
+        let keep = make_loadable_project(tmp.path(), "auth-keep");
+        seed_project(&home, "p-keep", &keep);
+        let keep_dir = home.join(".claude").join("projects").join("p-keep");
+        let keep_cwd = keep.to_string_lossy().replace('\\', "\\\\");
+        write_jsonl(
+            &keep_dir.join("0002-session.jsonl"),
+            &[&format!(r#"{{"sessionId":"t","cwd":"{keep_cwd}"}}"#)],
+        );
+
+        // Fails on keyword: name doesn't match.
+        let no_match = make_loadable_project(tmp.path(), "unrelated");
+        seed_project(&home, "p-no-match", &no_match);
+        let no_match_dir = home.join(".claude").join("projects").join("p-no-match");
+        let no_match_cwd = no_match.to_string_lossy().replace('\\', "\\\\");
+        write_jsonl(
+            &no_match_dir.join("0002-session.jsonl"),
+            &[&format!(r#"{{"sessionId":"t","cwd":"{no_match_cwd}"}}"#)],
+        );
+
+        // Fails on min_sessions: only one transcript.
+        let single = make_loadable_project(tmp.path(), "auth-single");
+        seed_project(&home, "p-single", &single);
+
+        // Fails on recency: aged out.
+        let old = make_loadable_project(tmp.path(), "auth-old");
+        seed_project(&home, "p-old", &old);
+        let old_dir = home.join(".claude").join("projects").join("p-old");
+        let old_cwd = old.to_string_lossy().replace('\\', "\\\\");
+        write_jsonl(
+            &old_dir.join("0002-session.jsonl"),
+            &[&format!(r#"{{"sessionId":"t","cwd":"{old_cwd}"}}"#)],
+        );
+        // Age every .jsonl in p-old past the recency cutoff. Touching
+        // only the newest file is enough since the filter uses the
+        // newest mtime as the project's recency proxy, but bump both
+        // for clarity.
+        for jsonl in ["0001-session.jsonl", "0002-session.jsonl"] {
+            set_mtime_offset(
+                &old_dir.join(jsonl),
+                Duration::from_secs(100 * SECS_PER_DAY),
+                true,
+            );
+        }
+
+        let filter = ProjectsFilter {
+            recency_days: Some(30),
+            min_sessions: Some(2),
+            keyword: Some("auth".to_string()),
+        };
+        let got = list_known_projects(Some(&home), &filter).unwrap();
+        let names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["auth-keep"]);
+    }
+
+    #[test]
+    fn default_filter_preserves_all_loadable_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let a = make_loadable_project(tmp.path(), "a");
+        let b = make_loadable_project(tmp.path(), "b");
+        seed_project(&home, "p-a", &a);
+        seed_project(&home, "p-b", &b);
+        // Age `a` past any conceivable cutoff — the default filter
+        // shouldn't notice.
+        let a_jsonl = home
+            .join(".claude")
+            .join("projects")
+            .join("p-a")
+            .join("0001-session.jsonl");
+        set_mtime_offset(&a_jsonl, Duration::from_secs(365 * SECS_PER_DAY), true);
+
+        let got = list_known_projects(Some(&home), &ProjectsFilter::default()).unwrap();
+        let names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
     }
 }
