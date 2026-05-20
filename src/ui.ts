@@ -537,7 +537,32 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
     // project. Clear to avoid surprising the user with a highlight
     // they didn't request in the new context.
     highlightedRule = null;
+    // Same reasoning for the modified-entry highlight (#50): diffing
+    // an old project's snapshot against a new one would flag every
+    // rule as "modified", which is meaningless on a project switch.
+    // The new snapshot itself becomes the baseline below.
+    lastDiffedScopes = null;
+    if (modifiedClearTimer !== null) {
+      clearTimeout(modifiedClearTimer);
+      modifiedClearTimer = null;
+    }
+    clearModifiedHighlight();
     lastRenderedProjectDir = props.projectDir;
+  }
+
+  // Modified-entry highlight (#50). Reference inequality is the
+  // "new snapshot arrived" signal — main.ts allocates a fresh
+  // `LoadedScopes` after every successful `load_scopes`, so search-
+  // keystroke re-renders that pass the same object skip the diff and
+  // just re-apply existing highlights below. Same-project required:
+  // the project-switch guard above already wiped `lastDiffedScopes`
+  // in that case.
+  if (props.scopes !== null && props.scopes !== lastDiffedScopes) {
+    if (lastDiffedScopes !== null && lastDiffedScopes.project_dir === props.scopes.project_dir) {
+      computeModifiedSnapshot(lastDiffedScopes, props.scopes);
+      scheduleModifiedClear();
+    }
+    lastDiffedScopes = props.scopes;
   }
   // Wire the document-level click/keydown handlers exactly once. The
   // handlers themselves survive `innerHTML = ""` rebuilds; this just
@@ -580,6 +605,10 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   // in the DOM. Self-heals if the previously-highlighted rule no
   // longer appears anywhere (e.g. just-moved last copy).
   applyRuleHighlight();
+  // Modified-entry highlight (#50). Runs after the tree is built so
+  // both fresh diffs and in-window re-renders (e.g. a keystroke
+  // mid-fade) re-decorate the new DOM nodes the renderer just built.
+  applyModifiedHighlight();
 }
 
 function restoreSearchFocus(
@@ -1180,6 +1209,228 @@ function clearRuleHighlight(): void {
   if (highlightedRule === null) return;
   highlightedRule = null;
   applyRuleHighlight();
+}
+
+// Modified-entry highlight state (#50). Distinct from the click-driven
+// cross-pane highlight (#49): this one fires automatically on every
+// successful reload that changes the in-memory snapshot, fades after a
+// few seconds via CSS keyframe, and answers the question "what just
+// changed?" without the user having to compare from memory.
+//
+// `lastDiffedScopes` is a reference-identity sentinel — main.ts assigns
+// a fresh `LoadedScopes` object on every successful `load_scopes` IPC,
+// so reference inequality is exactly the "new snapshot arrived" signal.
+// Search-keystroke re-renders pass the same reference and skip the diff.
+const MODIFIED_HIGHLIGHT_DURATION_MS = 2500;
+let lastDiffedScopes: LoadedScopes | null = null;
+// `${scope}:${kind}:${rule}` for per-scope rule chips newly present in
+// that (scope, kind) since the previous snapshot.
+const modifiedScopeRules = new Set<string>();
+// `${kind}:${rule}` for combined-panel chips newly in that kind's union
+// across all scopes.
+const modifiedCombinedRules = new Set<string>();
+// `${scope}:${key}` for top-level keys (anything except `permissions`,
+// whose changes are already captured rule-by-rule above) whose value
+// appeared or changed in this scope's file.
+const modifiedTopLevelKeys = new Set<string>();
+let modifiedClearTimer: number | null = null;
+
+/**
+ * Diff two `LoadedScopes` snapshots to find entries the next snapshot
+ * contains that the previous did not (or had a different value for).
+ * Removed entries are intentionally ignored — they have no chip in the
+ * new render to attach a highlight to, and a "ghost strikethrough"
+ * affordance is explicitly deferred per the issue's open questions.
+ *
+ * Updates the module-level modified sets in place rather than returning
+ * a value — `applyModifiedHighlight` reads from the same sets, so
+ * shipping them through the AppProps closure would just be ceremony.
+ */
+function computeModifiedSnapshot(prev: LoadedScopes, next: LoadedScopes): void {
+  modifiedScopeRules.clear();
+  modifiedCombinedRules.clear();
+  modifiedTopLevelKeys.clear();
+
+  // Index previous per-scope rules and top-level values once so the
+  // diff loop is O(n) in the size of the new snapshot.
+  const prevRulesByScopeKind = new Map<string, Set<string>>();
+  const prevValuesByScope = new Map<Scope, { [key: string]: JsonValue }>();
+  for (const view of prev.scopes) {
+    prevValuesByScope.set(view.scope, view.values);
+    const perms = view.values.permissions;
+    if (!perms || typeof perms !== "object" || Array.isArray(perms)) continue;
+    const permsObj = perms as { [k: string]: JsonValue };
+    for (const kind of PERMISSION_KINDS) {
+      const list = permsObj[kind];
+      if (!Array.isArray(list)) continue;
+      const ruleSet = new Set<string>();
+      for (const r of list) if (typeof r === "string") ruleSet.add(r);
+      prevRulesByScopeKind.set(`${view.scope}:${kind}`, ruleSet);
+    }
+  }
+
+  for (const view of next.scopes) {
+    const perms = view.values.permissions;
+    if (perms && typeof perms === "object" && !Array.isArray(perms)) {
+      const permsObj = perms as { [k: string]: JsonValue };
+      for (const kind of PERMISSION_KINDS) {
+        const list = permsObj[kind];
+        if (!Array.isArray(list)) continue;
+        const prevSet = prevRulesByScopeKind.get(`${view.scope}:${kind}`) ?? new Set<string>();
+        for (const r of list) {
+          if (typeof r !== "string") continue;
+          if (!prevSet.has(r)) modifiedScopeRules.add(`${view.scope}:${kind}:${r}`);
+        }
+      }
+    }
+    // Top-level keys other than `permissions` — diff by structural
+    // equality so a re-ordered array doesn't count as changed but an
+    // actual value change does. JSON.stringify is sufficient here:
+    // keys come from a `serde_json::Value` round-trip on the Rust side,
+    // so there are no functions / symbols / cycles to trip it up.
+    const prevValues = prevValuesByScope.get(view.scope) ?? {};
+    for (const [key, val] of Object.entries(view.values)) {
+      if (key === "permissions") continue;
+      const before = prevValues[key];
+      if (before === undefined || JSON.stringify(before) !== JSON.stringify(val)) {
+        modifiedTopLevelKeys.add(`${view.scope}:${key}`);
+      }
+    }
+  }
+
+  // Combined-panel diff: union-level membership change, keyed by
+  // `(kind, rule)`. A cross-scope move where the rule was already in
+  // the same union kind produces no combined highlight — the per-scope
+  // chip on the destination side carries that signal instead.
+  for (const kind of PERMISSION_KINDS) {
+    const prevUnion = new Set<string>(prev.combined_permissions[kind]);
+    for (const r of next.combined_permissions[kind]) {
+      if (!prevUnion.has(r)) modifiedCombinedRules.add(`${kind}:${r}`);
+    }
+  }
+}
+
+/**
+ * Walk the just-rendered DOM and tag chips / tree nodes that appear in
+ * the modified sets with `.rule-modified` / `.tree-modified`. Called at
+ * the end of `renderApp` so it runs *after* the new DOM is built — both
+ * on the render that triggered the diff and on subsequent renders
+ * within the fade window (e.g. a search keystroke that re-paints the
+ * tree). The CSS keyframe restarts on the new nodes in that case,
+ * which is acceptable: the timer below will tear everything down in
+ * lockstep with the original diff anyway.
+ *
+ * Top-level keys are identified by `path.length === 1` indirectly:
+ * only the `.tree-key` elements that are children of a `.scope-tree`'s
+ * first-depth `.tree-branch > summary` or `.tree-leaf` count. The
+ * walker keys off DOM structure rather than carrying a path attribute
+ * around, to stay consistent with how `.rule-highlight` works.
+ */
+function applyModifiedHighlight(): void {
+  if (
+    modifiedScopeRules.size === 0 &&
+    modifiedCombinedRules.size === 0 &&
+    modifiedTopLevelKeys.size === 0
+  ) {
+    return;
+  }
+
+  // Per-scope rule chips. `.rule.rule-${kind}` carries the kind, and
+  // the column ancestor's `data-scope` carries the scope.
+  for (const el of document.querySelectorAll<HTMLElement>(".rule .rule-text")) {
+    const rule = el.textContent ?? "";
+    const ruleRow = el.closest<HTMLElement>(".rule");
+    const col = el.closest<HTMLElement>(".col");
+    if (!ruleRow || !col) continue;
+    const scope = col.dataset.scope as Scope | undefined;
+    if (!scope) continue;
+    let kind: PermissionKind | null = null;
+    if (ruleRow.classList.contains("rule-allow")) kind = "allow";
+    else if (ruleRow.classList.contains("rule-deny")) kind = "deny";
+    else if (ruleRow.classList.contains("rule-ask")) kind = "ask";
+    if (!kind) continue;
+    if (modifiedScopeRules.has(`${scope}:${kind}:${rule}`)) {
+      el.classList.add("rule-modified");
+    }
+  }
+
+  // Combined-panel chips. `.combo-group.combo-${kind}` carries the kind.
+  for (const chip of document.querySelectorAll<HTMLElement>(".combo-group .chip")) {
+    const rule = chip.textContent ?? "";
+    const group = chip.closest<HTMLElement>(".combo-group");
+    if (!group) continue;
+    let kind: PermissionKind | null = null;
+    if (group.classList.contains("combo-allow")) kind = "allow";
+    else if (group.classList.contains("combo-deny")) kind = "deny";
+    else if (group.classList.contains("combo-ask")) kind = "ask";
+    if (!kind) continue;
+    if (modifiedCombinedRules.has(`${kind}:${rule}`)) {
+      chip.classList.add("rule-modified");
+    }
+  }
+
+  // Top-level keys. Each scope column's `.scope-tree` holds the first-
+  // depth nodes; descend exactly one level to pick those out without
+  // touching nested-object keys (which can have arbitrary user names
+  // that would collide with top-level keys otherwise).
+  for (const tree of document.querySelectorAll<HTMLElement>(".scope-tree")) {
+    const col = tree.closest<HTMLElement>(".col");
+    if (!col) continue;
+    const scope = col.dataset.scope as Scope | undefined;
+    if (!scope) continue;
+    for (const node of Array.from(tree.children) as HTMLElement[]) {
+      // First-depth nodes are either `<details class="tree-branch">`
+      // or `<div class="tree-leaf">`. The key span lives inside
+      // `<summary>` for branches and directly inside the row for
+      // leaves. Branches with recognized help (`env`, `permissions`,
+      // etc.) wrap the key in a `.popover-wrap` so the direct-child
+      // selector misses it — descend through summary, but stay shallow
+      // (.tree-children for any populated branch is a sibling of
+      // summary, not inside it, so we can't accidentally pick up a
+      // nested key from there).
+      let keyEl: HTMLElement | null = null;
+      if (node.tagName === "DETAILS") {
+        keyEl = node.querySelector<HTMLElement>(":scope > summary .tree-key");
+      } else if (node.classList.contains("tree-leaf")) {
+        keyEl = node.querySelector<HTMLElement>(":scope > .tree-key");
+      }
+      if (!keyEl) continue;
+      const key = keyEl.textContent ?? "";
+      if (modifiedTopLevelKeys.has(`${scope}:${key}`)) {
+        keyEl.classList.add("tree-modified");
+      }
+    }
+  }
+}
+
+/**
+ * Tear down all `.rule-modified` / `.tree-modified` classes live on the
+ * current DOM and forget the modified sets so subsequent renders don't
+ * re-decorate. Driven by the timer scheduled at the end of the diff —
+ * the CSS keyframe also fades to transparent on its own, so the user
+ * doesn't see the tear-down; it just keeps the next snapshot's diff
+ * clean.
+ */
+function clearModifiedHighlight(): void {
+  modifiedScopeRules.clear();
+  modifiedCombinedRules.clear();
+  modifiedTopLevelKeys.clear();
+  for (const el of document.querySelectorAll<HTMLElement>(".rule-modified")) {
+    el.classList.remove("rule-modified");
+  }
+  for (const el of document.querySelectorAll<HTMLElement>(".tree-modified")) {
+    el.classList.remove("tree-modified");
+  }
+}
+
+function scheduleModifiedClear(): void {
+  if (modifiedClearTimer !== null) {
+    clearTimeout(modifiedClearTimer);
+  }
+  modifiedClearTimer = window.setTimeout(() => {
+    modifiedClearTimer = null;
+    clearModifiedHighlight();
+  }, MODIFIED_HIGHLIGHT_DURATION_MS);
 }
 
 /**

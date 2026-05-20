@@ -436,6 +436,39 @@ button:disabled {
   border-radius: 3px;
 }
 
+/* Modified-entry highlight (#50). Tinted background that fades to
+   transparent over ~2.5s after a reload diff. Distinct vocabulary
+   from `.rule-highlight` (amber outline, persistent until dismissed):
+   no outline, blue-green tint, transient. Cyan reads as "fresh /
+   recently changed" without colliding with the allow/deny/ask kind
+   colors or the amber selection cue.
+
+   `animation-fill-mode: forwards` keeps the element transparent after
+   the keyframe completes, so a class that lingers on the DOM after
+   the timer-driven sweep finishes is visually inert. `@media
+   (prefers-reduced-motion)` collapses the animation to an instant
+   solid → transparent flash so motion-sensitive users still get a
+   visual cue without the fade. */
+@keyframes rule-modified-fade {
+  from {
+    background: var(--rule-modified-bg, rgba(64, 192, 192, 0.35));
+  }
+  to {
+    background: transparent;
+  }
+}
+.rule-modified,
+.tree-modified {
+  border-radius: 3px;
+  animation: rule-modified-fade 2.5s ease-out forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .rule-modified,
+  .tree-modified {
+    animation-duration: 0.01s;
+  }
+}
+
 /* Screen-reader-only live region for the keyboard DnD announcer (#41).
    Visible to assistive tech, not to sighted users. Classic clip-rect
    technique — `display: none` would also hide it from AT. */
