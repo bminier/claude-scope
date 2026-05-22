@@ -3226,7 +3226,7 @@ mod tests {
             side_at(Scope::Project, &project, perms(&["A"]), perms(&[])),
             side_at(Scope::User, &user, perms(&[]), perms(&["A"])),
         );
-        let plan = plan_restore_to(&[m1.clone()], m1.id).unwrap();
+        let plan = plan_restore_to(std::slice::from_ref(&m1), m1.id).unwrap();
         assert_eq!(plan.ops_spanned, 1);
         apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
         assert_eq!(
