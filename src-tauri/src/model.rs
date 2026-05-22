@@ -272,6 +272,15 @@ impl SettingsDoc {
         }
     }
 
+    /// Unconditionally set a top-level key to `value`, bypassing the per-key
+    /// merge policy that [`merge_top_level`](Self::merge_top_level) applies.
+    /// The restore path (#124) writes verbatim snapshots back to disk rather
+    /// than merging — an exact assignment a policy-aware merge (which
+    /// deep-merges `env`, array-unions list keys, …) can't express.
+    pub fn set_top_level(&mut self, key: &str, value: Value) {
+        ensure_object(&mut self.root).insert(key.to_string(), value);
+    }
+
     /// Read the JSON value at `path` if every segment resolves. Object keys
     /// are matched verbatim; array indices must be in-bounds. Returns `None`
     /// when any segment misses, which the move flow distinguishes from

@@ -1473,6 +1473,51 @@ button:disabled {
   grid-template-columns: 1fr;
 }
 
+/* Restore-confirm modal: undo / redo / restore-to-point (#124 / #125). */
+.modal-restore-span {
+  margin: 0 0 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.modal-warning-band {
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--ask);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--ask);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* One file per row — a restore can touch up to four. */
+.modal-diff-restore {
+  grid-template-columns: 1fr;
+}
+
+.modal-side-restore {
+  border-left: 3px solid var(--accent);
+}
+
+.modal-side-note-warn {
+  color: var(--ask);
+  font-weight: 600;
+}
+
+.modal-restore-block {
+  margin-top: 8px;
+}
+
+.modal-restore-block-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 3px;
+}
+
 /* History dialog (#19 phase 2). Wider than About so long paths and rule
    strings have room without wrapping into hard-to-scan multi-line blocks. */
 .modal-history {
@@ -1538,6 +1583,19 @@ button:disabled {
 
 .history-verb-change_kind {
   color: var(--warn, #b88216);
+}
+
+.history-verb-restore {
+  color: var(--accent);
+}
+
+/* The "· Move permission rule" reference a restore row shows for the entry
+   it acted on. `margin-right: auto` keeps it grouped with the verb on the
+   left while the timestamp stays pinned right. */
+.history-restore-ref {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .history-ts {

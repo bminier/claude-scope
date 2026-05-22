@@ -9,6 +9,7 @@ import type {
   Preferences,
   Scope,
   Theme,
+  UndoRedoStatus,
 } from "../../src/types.ts";
 import { SEARCH_INPUT_ID } from "../../src/types.ts";
 import {
@@ -54,6 +55,7 @@ interface PropsOverrides {
   preferences?: ReturnType<typeof buildPreferences>;
   runtime?: ReturnType<typeof buildRuntimeInfo>;
   knownProjects?: KnownProject[];
+  undoStatus?: UndoRedoStatus | null;
   onMoveLeaf?: (req: MoveLeafRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
   onPickProject?: () => void;
   onPickRecentProject?: (projectDir: string) => void;
@@ -76,10 +78,13 @@ function makeProps(overrides: PropsOverrides = {}) {
     preferences: overrides.preferences ?? buildPreferences(),
     runtime: overrides.runtime ?? buildRuntimeInfo(),
     knownProjects: overrides.knownProjects ?? [],
+    undoStatus: overrides.undoStatus ?? null,
     onPickProject: overrides.onPickProject ?? vi.fn(),
     onPickRecentProject: overrides.onPickRecentProject ?? vi.fn(),
     onOpenHistory: vi.fn(),
     onReload: vi.fn(),
+    onUndo: vi.fn(),
+    onRedo: vi.fn(),
     onMoveLeaf: overrides.onMoveLeaf ?? vi.fn(),
     onChangeKind: vi.fn(),
     onDeleteLeaf: vi.fn(),

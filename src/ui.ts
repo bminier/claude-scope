@@ -20,10 +20,13 @@ import type {
   PathSeg,
   PermissionKind,
   Preferences,
+  RestorePreview,
+  RestoreSidePreview,
   RuntimeInfo,
   Scope,
   ScopeView,
   Theme,
+  UndoRedoStatus,
 } from "./types.ts";
 import { AUDIT_LOG_MAX_SIZE_MB, SCOPES, SEARCH_INPUT_ID } from "./types.ts";
 
@@ -46,6 +49,14 @@ interface AppProps {
    *  the picked path equals the currently-loaded project. */
   onPickRecentProject: (projectDir: string) => void;
   onReload: () => void;
+  /** Undo/redo availability for the topbar buttons (#124). `null` until the
+   *  first `audit_undo_status` IPC resolves; the buttons render disabled
+   *  until then. */
+  undoStatus: UndoRedoStatus | null;
+  /** Apply the next undo / redo (#124). main.ts fetches the preview,
+   *  routes it through the restore-confirm modal, then applies. */
+  onUndo: (trigger?: HTMLElement) => void;
+  onRedo: (trigger?: HTMLElement) => void;
   onMoveLeaf: (req: MoveLeafRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
   /** Reclassify a permission rule between allow / deny / ask within the
    *  same scope (#8). Routes through the move-leaf primitive on the
@@ -742,6 +753,56 @@ function buildRecentProjectMenuItems(props: AppProps): MenuItem[] {
   return items;
 }
 
+/** Coarse "3 min ago" relative time for the undo/redo button tooltips. */
+function relativeTime(tsMs: number): string {
+  const deltaSec = Math.round((Date.now() - tsMs) / 1000);
+  if (deltaSec < 45) return "just now";
+  const min = Math.round(deltaSec / 60);
+  if (min < 60) return `${min} min ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr} hr ago`;
+  const days = Math.round(hr / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+/** One-line description of an audit entry for a button tooltip, e.g.
+ *  "Move permission rule Bash(ls) (3 min ago)". */
+function recordTooltip(rec: AuditRecordView): string {
+  const rule = historyRuleText(rec);
+  const when = relativeTime(rec.ts_ms);
+  return rule ? `${historyVerbLabel(rec)} ${rule} (${when})` : `${historyVerbLabel(rec)} (${when})`;
+}
+
+function undoButton(props: AppProps): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.textContent = "Undo";
+  const target = props.undoStatus?.undo;
+  btn.disabled = props.busy || !props.scopes || !target;
+  btn.title = target ? `Undo: ${recordTooltip(target)}` : "Nothing to undo";
+  btn.setAttribute("aria-label", btn.title);
+  btn.onclick = (e) => props.onUndo(e.currentTarget as HTMLElement);
+  return btn;
+}
+
+function redoButton(props: AppProps): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.textContent = "Redo";
+  const status = props.undoStatus;
+  const target = status?.redo;
+  btn.disabled = props.busy || !props.scopes || !target;
+  if (target) {
+    btn.title = `Redo: ${recordTooltip(target)}`;
+  } else if (status?.sequence_break) {
+    // The forward stack is stranded — explain rather than just greying out.
+    btn.title = "Redo unavailable — a change was made after the last undo";
+  } else {
+    btn.title = "Nothing to redo";
+  }
+  btn.setAttribute("aria-label", btn.title);
+  btn.onclick = (e) => props.onRedo(e.currentTarget as HTMLElement);
+  return btn;
+}
+
 function header(props: AppProps): HTMLElement {
   const bar = document.createElement("header");
   bar.className = "topbar";
@@ -774,6 +835,9 @@ function header(props: AppProps): HTMLElement {
   reload.onclick = props.onReload;
   reload.disabled = props.busy || !props.scopes;
   actions.appendChild(reload);
+
+  actions.appendChild(undoButton(props));
+  actions.appendChild(redoButton(props));
 
   const history = document.createElement("button");
   history.textContent = "History";
@@ -2698,6 +2762,9 @@ function openConfirmModal(opts: {
   subtitle: Node;
   body: HTMLElement;
   trigger?: HTMLElement | null;
+  /** Label for the confirm button. Defaults to "Apply"; the restore modal
+   *  passes "Undo" / "Redo" / "Restore" so the button names the action. */
+  confirmLabel?: string;
 }): Promise<boolean> {
   return new Promise((resolve) => {
     let resolved = false;
@@ -2721,7 +2788,7 @@ function openConfirmModal(opts: {
           },
         },
         {
-          label: "Apply",
+          label: opts.confirmLabel ?? "Apply",
           className: "btn-apply",
           focus: true,
           activate: (close) => {
@@ -3463,6 +3530,158 @@ export function confirmAddLeaf(
     subtitle,
     body: diff,
     trigger,
+  });
+}
+
+// -- restore-confirm modal: undo / redo / restore-to-point (#124 / #125) -----
+
+function restoreModalTitle(direction: RestorePreview["direction"]): string {
+  switch (direction) {
+    case "undo":
+      return "Undo change";
+    case "redo":
+      return "Redo change";
+    case "to_point":
+      return "Restore to before this entry";
+  }
+}
+
+function restoreConfirmLabel(direction: RestorePreview["direction"]): string {
+  switch (direction) {
+    case "undo":
+      return "Undo";
+    case "redo":
+      return "Redo";
+    case "to_point":
+      return "Restore";
+  }
+}
+
+/** One labelled JSON block (Currently / After …) inside a restore side. */
+function restoreValueBlock(label: string, value: JsonValue | undefined): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-restore-block";
+  const head = document.createElement("div");
+  head.className = "modal-restore-block-label";
+  head.textContent = label;
+  wrap.appendChild(head);
+  const pre = document.createElement("pre");
+  pre.className = "modal-side-json";
+  pre.textContent = formatValue(value);
+  wrap.appendChild(pre);
+  return wrap;
+}
+
+/**
+ * One affected file in the restore modal. Snapshot-restore rewrites whole
+ * top-level keys, so this shows the key's current value vs. the value the
+ * restore will write — a JSON before/after rather than the chip-list diff
+ * the move/add/delete modals use, since a single restore can touch any key
+ * (and even multiple permission kinds at once).
+ */
+function restoreDiffSide(side: RestoreSidePreview): HTMLElement {
+  const col = document.createElement("div");
+  col.className = "modal-side modal-side-restore";
+
+  const head = document.createElement("div");
+  head.className = "modal-side-head";
+  const label = document.createElement("h3");
+  label.textContent = scopeLabel(side.scope);
+  head.appendChild(label);
+
+  const filePath = document.createElement("div");
+  filePath.className = "modal-side-path";
+  filePath.textContent = side.file_path;
+  head.appendChild(filePath);
+
+  const verdict = document.createElement("div");
+  verdict.className = "modal-side-verdict";
+  if (side.will_write) {
+    verdict.textContent = `${side.top_level_key} restored`;
+    verdict.classList.add("removed");
+  } else {
+    verdict.textContent = "(no change)";
+    verdict.classList.add("muted");
+  }
+  head.appendChild(verdict);
+  col.appendChild(head);
+
+  if (side.state_mismatch) {
+    const note = document.createElement("div");
+    note.className = "modal-side-note modal-side-note-warn";
+    note.textContent =
+      "This file was changed outside ClaudeScope since the logged entry — confirming overwrites that edit.";
+    col.appendChild(note);
+  }
+
+  if (side.will_write) {
+    col.appendChild(restoreValueBlock("Currently", side.key_current));
+    col.appendChild(restoreValueBlock("After", side.key_target));
+  } else {
+    col.appendChild(restoreValueBlock("Unchanged", side.key_current));
+  }
+  return col;
+}
+
+/**
+ * Confirm modal for an undo / redo / restore-to-point (#124 / #125).
+ * Resolves to whether the user applied the restore. Reuses the shared
+ * confirm-modal shell; the confirm button is labelled with the action
+ * ("Undo" / "Redo" / "Restore").
+ */
+export function confirmRestore(
+  preview: RestorePreview,
+  trigger?: HTMLElement | null,
+): Promise<boolean> {
+  // Subtitle: describe the targeted entry with the History view's helpers
+  // so the wording matches what the user sees in the History dialog.
+  const subtitle = document.createDocumentFragment();
+  subtitle.appendChild(document.createTextNode(historyVerbLabel(preview.target)));
+  const ruleText = historyRuleText(preview.target);
+  if (ruleText) {
+    subtitle.appendChild(document.createTextNode(" "));
+    const chip = document.createElement("code");
+    chip.className = "chip";
+    chip.textContent = ruleText;
+    subtitle.appendChild(chip);
+  }
+
+  const body = document.createElement("div");
+  body.className = "modal-restore";
+
+  if (preview.direction === "to_point") {
+    const span = document.createElement("p");
+    span.className = "modal-restore-span";
+    span.textContent =
+      preview.ops_spanned === 1
+        ? "Restoring to 1 op back."
+        : `Restoring to ${preview.ops_spanned} ops back.`;
+    body.appendChild(span);
+  }
+
+  // One warning band for the whole modal when any file drifted from what
+  // the log expected.
+  if (preview.sides.some((s) => s.state_mismatch)) {
+    const warn = document.createElement("div");
+    warn.className = "modal-warning-band";
+    warn.textContent =
+      "One or more files were changed outside ClaudeScope since this entry was logged. Confirming will overwrite those external edits.";
+    body.appendChild(warn);
+  }
+
+  const diff = document.createElement("div");
+  diff.className = "modal-diff modal-diff-restore";
+  for (const side of preview.sides) {
+    diff.appendChild(restoreDiffSide(side));
+  }
+  body.appendChild(diff);
+
+  return openConfirmModal({
+    titleText: restoreModalTitle(preview.direction),
+    subtitle,
+    body,
+    trigger,
+    confirmLabel: restoreConfirmLabel(preview.direction),
   });
 }
 
@@ -4227,15 +4446,17 @@ export function openHistory(page: AuditLogPage | null, trigger?: HTMLElement | n
 function historyList(records: AuditRecordView[]): HTMLElement {
   const ul = document.createElement("ul");
   ul.className = "history-list";
+  // Index by id so a restore row can name the entry it acted on.
+  const byId = new Map(records.map((r) => [r.id, r]));
   // Slice before reverse so we don't mutate the caller's array — the
   // History dialog is intentionally side-effect-free.
   for (const rec of records.slice().reverse()) {
-    ul.appendChild(historyRow(rec));
+    ul.appendChild(historyRow(rec, byId));
   }
   return ul;
 }
 
-function historyRow(rec: AuditRecordView): HTMLElement {
+function historyRow(rec: AuditRecordView, byId: Map<string, AuditRecordView>): HTMLElement {
   const li = document.createElement("li");
   li.className = "history-row";
 
@@ -4246,6 +4467,19 @@ function historyRow(rec: AuditRecordView): HTMLElement {
   verb.className = `history-verb history-verb-${rec.kind}`;
   verb.textContent = historyVerbLabel(rec);
   head.appendChild(verb);
+
+  // A restore row names the entry it inverted / re-applied, when that
+  // entry is still in the visible log.
+  if (rec.kind === "restore" && rec.restore) {
+    const target = byId.get(rec.restore.target_id);
+    if (target) {
+      const ref = document.createElement("span");
+      ref.className = "history-restore-ref";
+      const targetRule = historyRuleText(target);
+      ref.textContent = `· ${historyVerbLabel(target)}${targetRule ? ` ${targetRule}` : ""}`;
+      head.appendChild(ref);
+    }
+  }
 
   const ts = document.createElement("time");
   ts.className = "history-ts";
@@ -4285,6 +4519,21 @@ function historyRow(rec: AuditRecordView): HTMLElement {
  * fields visually.
  */
 function historyVerbLabel(rec: AuditRecordView): string {
+  if (rec.kind === "restore") {
+    // A restore meta-entry (#124): name the direction. The payload lives
+    // in `rec.restore`; a record missing it is malformed but shouldn't
+    // crash the row renderer.
+    switch (rec.restore?.direction) {
+      case "undo":
+        return "Undo";
+      case "redo":
+        return "Redo";
+      case "to_point":
+        return "Restore to point";
+      default:
+        return "Restore";
+    }
+  }
   if (rec.kind === "change_kind") {
     // Same-scope reclassification: name the destination kind explicitly
     // so the user sees the "what changed" at a glance.
@@ -4312,10 +4561,19 @@ function historyLeafNoun(leafKind: AuditRecordView["leaf_kind"]): string {
   }
 }
 
-/** "Project → User" arrow for moves, single-scope label for adds/deletes. */
+/** "Project → User" arrow for moves, single-scope label for adds/deletes,
+ *  the affected-scope list for a restore (which has no from/to sides). */
 function historyScopeArrow(rec: AuditRecordView): HTMLElement {
   const span = document.createElement("span");
   span.className = "history-scopes";
+  if (rec.kind === "restore") {
+    // A restore touches the files in `restore.files`; show their distinct
+    // scopes rather than the empty from/to arrow.
+    const scopes = rec.restore?.files.map((f) => f.scope) ?? [];
+    const distinct = scopes.filter((s, i) => scopes.indexOf(s) === i);
+    span.textContent = distinct.length > 0 ? distinct.map(scopeLabel).join(", ") : "—";
+    return span;
+  }
   const from = rec.from?.scope;
   const to = rec.to?.scope;
   if (from && to && from !== to) {
@@ -4355,20 +4613,27 @@ function scopeLabel(scope: Scope): string {
  * lie about what changed.
  */
 function historyRuleSummary(rec: AuditRecordView): HTMLElement | null {
+  const text = historyRuleText(rec);
+  return text ? makeRuleSpan(text) : null;
+}
+
+/**
+ * The rule string / key name an op touched, as plain text — the string
+ * form of [[historyRuleSummary]], also used for the undo/redo button
+ * tooltips. Returns `null` when no single identifier can be recovered.
+ */
+function historyRuleText(rec: AuditRecordView): string | null {
   if (rec.leaf_kind === "top_level_key") {
-    const key = typeof rec.path[0] === "string" ? rec.path[0] : null;
-    if (!key) return null;
-    return makeRuleSpan(key);
+    return typeof rec.path[0] === "string" ? rec.path[0] : null;
   }
-  // Permission rule or list. For a list op, the path[1] is the kind
+  // Permission rule or list. For a list op, path[1] is the kind
   // (allow/deny/ask) and that's the most informative summary.
   if (rec.leaf_kind === "permission_list") {
     const kind = typeof rec.path[1] === "string" ? rec.path[1] : null;
-    return kind ? makeRuleSpan(`permissions.${kind}`) : null;
+    return kind ? `permissions.${kind}` : null;
   }
   // PermissionRule: diff the snapshots to recover the rule string.
-  const rule = extractRuleFromDiff(rec);
-  return rule ? makeRuleSpan(rule) : null;
+  return extractRuleFromDiff(rec);
 }
 
 function makeRuleSpan(text: string): HTMLElement {
