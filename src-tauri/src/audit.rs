@@ -824,7 +824,10 @@ mod tests {
         // A restore record carries it.
         let json = serde_json::to_value(sample_restore_record(RestoreDirection::Undo)).unwrap();
         assert!(json.get("restore").is_some());
-        assert!(json.get("from").is_none(), "restore records leave from/to unset");
+        assert!(
+            json.get("from").is_none(),
+            "restore records leave from/to unset"
+        );
         assert!(json.get("to").is_none());
     }
 
@@ -891,7 +894,12 @@ mod tests {
     #[test]
     fn undo_redo_state_after_one_undo() {
         let (a, b, c) = (op_record(), op_record(), op_record());
-        let log = [a.clone(), b.clone(), c.clone(), restore_of(&c, RestoreDirection::Undo)];
+        let log = [
+            a.clone(),
+            b.clone(),
+            c.clone(),
+            restore_of(&c, RestoreDirection::Undo),
+        ];
         let state = undo_redo_state(&log);
         // C is undone, so the next undo targets B and the next redo C.
         assert_eq!(state.undoable.unwrap().id, b.id);
@@ -976,7 +984,11 @@ mod tests {
         let mut malformed = restore_of(&a, RestoreDirection::Undo);
         malformed.restore = None;
         let state = undo_redo_state(&[a.clone(), malformed]);
-        assert_eq!(state.undoable.unwrap().id, a.id, "malformed restore left A applied");
+        assert_eq!(
+            state.undoable.unwrap().id,
+            a.id,
+            "malformed restore left A applied"
+        );
     }
 
     #[test]

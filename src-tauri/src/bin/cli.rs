@@ -16,9 +16,9 @@ use ulid::Ulid;
 use claude_scope_lib::app_info::AppInfo;
 use claude_scope_lib::audit::{self, Record as AuditRecord};
 use claude_scope_lib::commands::{
-    apply_move_leaf_impl, apply_restore_plan, build_loaded, build_restore_plan, diff_move_leaf_impl,
-    plan_restore_to, preview_restore_plan, restore_record, AuditLogPage, AuditRecordView,
-    MoveLeafPreview, MoveLeafRequest, RestorePlan, RestorePreview,
+    apply_move_leaf_impl, apply_restore_plan, build_loaded, build_restore_plan,
+    diff_move_leaf_impl, plan_restore_to, preview_restore_plan, restore_record, AuditLogPage,
+    AuditRecordView, MoveLeafPreview, MoveLeafRequest, RestorePlan, RestorePreview,
 };
 use claude_scope_lib::io_atomic::{self, BackupTracker};
 use claude_scope_lib::model::{PathSeg, PermissionKind};
@@ -327,20 +327,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // `undo` / `redo` / `restore` operate purely off the audit log and the
     // absolute file paths recorded in it — like `history`, they need no
     // project root, so dispatch before `resolve_paths`.
-    if let Command::Undo {
-        dry_run,
-        yes,
-        json,
-    } = cli.command
-    {
+    if let Command::Undo { dry_run, yes, json } = cli.command {
         return cmd_undo(cli.home_dir.as_deref(), dry_run, yes, json);
     }
-    if let Command::Redo {
-        dry_run,
-        yes,
-        json,
-    } = cli.command
-    {
+    if let Command::Redo { dry_run, yes, json } = cli.command {
         return cmd_redo(cli.home_dir.as_deref(), dry_run, yes, json);
     }
     if let Command::Restore {
@@ -1724,7 +1714,11 @@ mod tests {
         // Files untouched, no restore entry appended.
         assert!(rules_at(&io_atomic::load(&project).unwrap().unwrap(), "allow").is_empty());
         let (records, _) = audit_lib::read_all(Some(home)).unwrap();
-        assert_eq!(records.len(), 1, "a dry run must not append a restore entry");
+        assert_eq!(
+            records.len(),
+            1,
+            "a dry run must not append a restore entry"
+        );
     }
 
     #[test]
