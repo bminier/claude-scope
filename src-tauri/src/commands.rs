@@ -626,9 +626,7 @@ pub struct UndoRedoStatus {
 /// (writes there are never logged), so undo / redo are simply unavailable
 /// in scratch mode — `.bak` remains the recovery path there.
 #[tauri::command]
-pub fn audit_undo_status(
-    overrides: State<'_, RuntimeOverrides>,
-) -> Result<UndoRedoStatus, String> {
+pub fn audit_undo_status(overrides: State<'_, RuntimeOverrides>) -> Result<UndoRedoStatus, String> {
     let (records, _) = audit::read_all(overrides.home()).map_err(|e| e.to_string())?;
     let state = audit::undo_redo_state(&records);
     Ok(UndoRedoStatus {
@@ -651,9 +649,7 @@ fn undo_redo_target(
         audit::RestoreDirection::Undo => state.undoable,
         audit::RestoreDirection::Redo => {
             if state.sequence_break {
-                return Err(
-                    "redo is unavailable: a change was made after the last undo".into(),
-                );
+                return Err("redo is unavailable: a change was made after the last undo".into());
             }
             state.redoable
         }
@@ -707,13 +703,15 @@ fn apply_undo_redo(
     // log moved under us (a concurrent CLI write, an external rotation)
     // refuse rather than silently acting on a different op.
     if target.id.to_string() != expected_id {
-        return Err(
-            "the audit log changed since the preview — reload and try again".into(),
-        );
+        return Err("the audit log changed since the preview — reload and try again".into());
     }
     let plan = build_restore_plan(&target, direction)?;
     let files = apply_restore_plan(&plan, backups_for_session(), watch)?;
-    emit_audit(app, overrides, restore_record(&plan, audit::Actor::Gui, files));
+    emit_audit(
+        app,
+        overrides,
+        restore_record(&plan, audit::Actor::Gui, files),
+    );
     Ok(())
 }
 
@@ -798,12 +796,14 @@ fn apply_restore_to_point(
     // a write landed since (a concurrent CLI op) the window has grown —
     // refuse rather than reverting more than the preview showed.
     if plan.ops_spanned != expected_ops_spanned {
-        return Err(
-            "the audit log changed since the preview — reload and try again".into(),
-        );
+        return Err("the audit log changed since the preview — reload and try again".into());
     }
     let files = apply_restore_plan(&plan, backups_for_session(), watch)?;
-    emit_audit(app, overrides, restore_record(&plan, audit::Actor::Gui, files));
+    emit_audit(
+        app,
+        overrides,
+        restore_record(&plan, audit::Actor::Gui, files),
+    );
     Ok(())
 }
 
@@ -3030,7 +3030,11 @@ mod tests {
         let plan = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
         let sides = apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
         assert_eq!(
-            io_atomic::load(&project).unwrap().unwrap().permissions().allow,
+            io_atomic::load(&project)
+                .unwrap()
+                .unwrap()
+                .permissions()
+                .allow,
             vec!["A".to_string(), "B".to_string()],
         );
         assert_eq!(
@@ -3060,7 +3064,11 @@ mod tests {
         let plan = build_restore_plan(&rec, audit::RestoreDirection::Redo).unwrap();
         apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
         assert_eq!(
-            io_atomic::load(&project).unwrap().unwrap().permissions().allow,
+            io_atomic::load(&project)
+                .unwrap()
+                .unwrap()
+                .permissions()
+                .allow,
             vec!["B".to_string()],
         );
         assert_eq!(
@@ -3166,7 +3174,12 @@ mod tests {
             audit::Actor::Gui,
             None,
             None,
-            Some(side_at(Scope::User, &user, perms(&["C"]), perms(&["C", "A"]))),
+            Some(side_at(
+                Scope::User,
+                &user,
+                perms(&["C"]),
+                perms(&["C", "A"]),
+            )),
             vec![key("permissions"), key("allow"), idx(0)],
             None,
         );
@@ -3190,7 +3203,12 @@ mod tests {
         write(&project, r#"{"permissions":{"allow":["C"]}}"#);
         write(&user, r#"{"permissions":{"allow":["A","B"]}}"#);
         let m1 = move_record(
-            side_at(Scope::Project, &project, perms(&["A", "B", "C"]), perms(&["B", "C"])),
+            side_at(
+                Scope::Project,
+                &project,
+                perms(&["A", "B", "C"]),
+                perms(&["B", "C"]),
+            ),
             side_at(Scope::User, &user, perms(&[]), perms(&["A"])),
         );
         let m2 = move_record(
@@ -3203,7 +3221,11 @@ mod tests {
         apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
         // Both files are back to the pre-m1 state.
         assert_eq!(
-            io_atomic::load(&project).unwrap().unwrap().permissions().allow,
+            io_atomic::load(&project)
+                .unwrap()
+                .unwrap()
+                .permissions()
+                .allow,
             vec!["A".to_string(), "B".to_string(), "C".to_string()],
         );
         assert!(io_atomic::load(&user)
@@ -3230,7 +3252,11 @@ mod tests {
         assert_eq!(plan.ops_spanned, 1);
         apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
         assert_eq!(
-            io_atomic::load(&project).unwrap().unwrap().permissions().allow,
+            io_atomic::load(&project)
+                .unwrap()
+                .unwrap()
+                .permissions()
+                .allow,
             vec!["A".to_string()],
         );
         assert!(io_atomic::load(&user)
@@ -3292,7 +3318,11 @@ mod tests {
         let plan = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
         apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
         assert_eq!(
-            io_atomic::load(&project).unwrap().unwrap().permissions().allow,
+            io_atomic::load(&project)
+                .unwrap()
+                .unwrap()
+                .permissions()
+                .allow,
             vec!["OLD".to_string()],
         );
     }
