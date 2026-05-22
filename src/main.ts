@@ -8,6 +8,7 @@ import type {
   AddLeafRequest,
   AppInfo,
   AuditLogPage,
+  AuditRecordView,
   DeleteLeafPreview,
   DeleteLeafRequest,
   KnownProject,
@@ -357,21 +358,27 @@ async function addLeaf(req: AddLeafRequest, trigger?: HTMLElement): Promise<void
 }
 
 /**
- * Drive an undo or redo (#124): fetch the preview, route it through the
- * restore-confirm modal, and on confirm apply it and reload. Shares the
- * `moveInFlight` guard and deferred-reload drain with the move/add/delete
- * flows so a write can't start mid-restore.
+ * Drive an undo / redo / restore-to-point (#124 / #125): fetch the preview,
+ * route it through the restore-confirm modal, and on confirm apply it and
+ * reload. Shares the `moveInFlight` guard and deferred-reload drain with the
+ * move/add/delete flows so a write can't start mid-restore.
+ *
+ * `fetchPreview` / `applyRestore` are passed in because the three flows hit
+ * different IPC commands; everything else — the guard, modal, busy state,
+ * reload — is identical.
  */
-async function runRestore(direction: "undo" | "redo", trigger?: HTMLElement): Promise<void> {
+async function runRestoreFlow(
+  label: string,
+  fetchPreview: () => Promise<RestorePreview>,
+  applyRestore: (preview: RestorePreview) => Promise<void>,
+  trigger?: HTMLElement,
+): Promise<void> {
   if (moveInFlight) return;
   moveInFlight = true;
-  const label = direction === "undo" ? "Undo" : "Redo";
   try {
     let preview: RestorePreview;
     try {
-      preview = await invoke<RestorePreview>(
-        direction === "undo" ? "audit_undo_preview" : "audit_redo_preview",
-      );
+      preview = await fetchPreview();
     } catch (err) {
       alert(`${label} failed: ${err}`);
       return;
@@ -383,12 +390,7 @@ async function runRestore(direction: "undo" | "redo", trigger?: HTMLElement): Pr
     state.busy = true;
     render();
     try {
-      // `expected_id` lets the backend refuse if the audit log moved since
-      // the preview (a concurrent CLI write) rather than acting on a
-      // different entry than the one the user just confirmed.
-      await invoke(direction === "undo" ? "audit_apply_undo" : "audit_apply_redo", {
-        expected_id: preview.target.id,
-      });
+      await applyRestore(preview);
       await load(state.projectDir);
     } catch (err) {
       alert(`${label} failed: ${err}`);
@@ -405,11 +407,43 @@ async function runRestore(direction: "undo" | "redo", trigger?: HTMLElement): Pr
 }
 
 function handleUndo(trigger?: HTMLElement): void {
-  void runRestore("undo", trigger);
+  // `expected_id` lets the backend refuse if the audit log moved since the
+  // preview (a concurrent CLI write) rather than acting on a different
+  // entry than the one the user just confirmed.
+  void runRestoreFlow(
+    "Undo",
+    () => invoke<RestorePreview>("audit_undo_preview"),
+    (preview) => invoke("audit_apply_undo", { expected_id: preview.target.id }),
+    trigger,
+  );
 }
 
 function handleRedo(trigger?: HTMLElement): void {
-  void runRestore("redo", trigger);
+  void runRestoreFlow(
+    "Redo",
+    () => invoke<RestorePreview>("audit_redo_preview"),
+    (preview) => invoke("audit_apply_redo", { expected_id: preview.target.id }),
+    trigger,
+  );
+}
+
+/**
+ * Restore every file affected by `rec` (and the entries after it) back to
+ * its pre-`rec` state (#125). Invoked from a History-row "Restore" button;
+ * the History dialog closes itself first so the confirm modal opens clean.
+ */
+function handleRestoreToPoint(rec: AuditRecordView): void {
+  // `expected_ops_spanned` guards against the log growing between preview
+  // and apply — the backend reverts only the span the user confirmed.
+  void runRestoreFlow(
+    "Restore",
+    () => invoke<RestorePreview>("audit_restore_to_point_preview", { target_id: rec.id }),
+    (preview) =>
+      invoke("audit_apply_restore_to_point", {
+        target_id: rec.id,
+        expected_ops_spanned: preview.ops_spanned,
+      }),
+  );
 }
 
 function setQuery(next: string): void {
@@ -591,7 +625,7 @@ async function handleOpenHistory(trigger?: HTMLElement): Promise<void> {
   } catch (err) {
     console.warn("failed to read audit log:", err);
   }
-  openHistory(page, trigger ?? null);
+  openHistory(page, { trigger: trigger ?? null, onRestoreToPoint: handleRestoreToPoint });
 }
 
 // Pressing "/" anywhere focuses the rule-search input, GitHub / Gmail style —

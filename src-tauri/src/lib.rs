@@ -62,6 +62,8 @@ pub fn run(context: tauri::Context) {
             commands::audit_redo_preview,
             commands::audit_apply_undo,
             commands::audit_apply_redo,
+            commands::audit_restore_to_point_preview,
+            commands::audit_apply_restore_to_point,
             commands::get_app_info,
         ])
         .run(context)

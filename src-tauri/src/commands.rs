@@ -675,7 +675,7 @@ fn undo_redo_preview(
 ) -> Result<RestorePreview, Box<dyn std::error::Error>> {
     let target = undo_redo_target(direction, overrides)?;
     let plan = build_restore_plan(&target, direction)?;
-    preview_restore_plan(&plan, &target, 1)
+    preview_restore_plan(&plan, &target)
 }
 
 /// Diff preview for the next undo (#19 Phase 3) — same modal the move /
@@ -752,6 +752,73 @@ pub fn audit_apply_redo(
         &overrides,
     )
     .map_err(|e| e.to_string())
+}
+
+/// Parse a ULID string from the frontend, mapping a decode failure to a
+/// readable error rather than the `ulid` crate's terse one.
+fn parse_audit_id(s: &str) -> Result<Ulid, Box<dyn std::error::Error>> {
+    Ulid::from_string(s).map_err(|e| format!("invalid audit entry id `{s}`: {e}").into())
+}
+
+fn restore_to_point_preview(
+    target_id: &str,
+    overrides: &RuntimeOverrides,
+) -> Result<RestorePreview, Box<dyn std::error::Error>> {
+    let id = parse_audit_id(target_id)?;
+    let (records, _) = audit::read_all(overrides.home())?;
+    let plan = plan_restore_to(&records, id)?;
+    let target = records
+        .iter()
+        .find(|r| r.id == id)
+        .expect("plan_restore_to already verified the id is in the log");
+    preview_restore_plan(&plan, target)
+}
+
+/// Diff preview for a restore-to-point (#19 Phase 4) — rolls the affected
+/// files back to their state before `target_id` was written.
+#[tauri::command]
+pub fn audit_restore_to_point_preview(
+    target_id: String,
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<RestorePreview, String> {
+    restore_to_point_preview(&target_id, &overrides).map_err(|e| e.to_string())
+}
+
+fn apply_restore_to_point(
+    target_id: &str,
+    expected_ops_spanned: usize,
+    app: &AppHandle,
+    watch: &WatchState,
+    overrides: &RuntimeOverrides,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let id = parse_audit_id(target_id)?;
+    let (records, _) = audit::read_all(overrides.home())?;
+    let plan = plan_restore_to(&records, id)?;
+    // The window the user confirmed had `expected_ops_spanned` entries; if
+    // a write landed since (a concurrent CLI op) the window has grown —
+    // refuse rather than reverting more than the preview showed.
+    if plan.ops_spanned != expected_ops_spanned {
+        return Err(
+            "the audit log changed since the preview — reload and try again".into(),
+        );
+    }
+    let files = apply_restore_plan(&plan, backups_for_session(), watch)?;
+    emit_audit(app, overrides, restore_record(&plan, audit::Actor::Gui, files));
+    Ok(())
+}
+
+/// Apply a restore-to-point (#19 Phase 4). `expected_ops_spanned` is the
+/// span the confirmed preview reported — see [`apply_restore_to_point`].
+#[tauri::command]
+pub fn audit_apply_restore_to_point(
+    target_id: String,
+    expected_ops_spanned: usize,
+    app: AppHandle,
+    watch: State<'_, WatchState>,
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<(), String> {
+    apply_restore_to_point(&target_id, expected_ops_spanned, &app, &watch, &overrides)
+        .map_err(|e| e.to_string())
 }
 
 /// Build- and runtime-time diagnostic block for the About dialog (#21).
@@ -1677,6 +1744,9 @@ pub struct RestorePlan {
     leaf_kind: audit::LeafKind,
     project_dir: Option<PathBuf>,
     path: Vec<PathSeg>,
+    /// How many logged entries this plan reverts: 1 for an undo / redo, the
+    /// count of spanned entries for a restore-to-point.
+    ops_spanned: usize,
     targets: Vec<RestoreTarget>,
 }
 
@@ -1787,6 +1857,79 @@ pub fn build_restore_plan(
         leaf_kind: rec.leaf_kind,
         project_dir: rec.project_dir.clone(),
         path: rec.path.clone(),
+        ops_spanned: 1,
+        targets,
+    })
+}
+
+/// Build the plan for a restore-to-point (#125): roll the affected files
+/// back to the state they were in immediately before `target_id` was
+/// written, reverting that entry and every entry logged after it.
+///
+/// The forward walk from the target to HEAD aggregates a per-file delta:
+/// the value to write back is the *first* `key_before` seen for that file
+/// in the window (its state when the window began — i.e. before the target),
+/// and the expected-current value is the *last* `key_after` seen (what the
+/// log believes the file holds now). `restore` entries inside the window
+/// count too — their `restore.files` snapshots are walked like any other.
+pub fn plan_restore_to(
+    records: &[audit::Record],
+    target_id: Ulid,
+) -> Result<RestorePlan, Box<dyn std::error::Error>> {
+    let target_idx = records
+        .iter()
+        .position(|r| r.id == target_id)
+        .ok_or("target audit entry not found in the log")?;
+    let target = &records[target_idx];
+    if target.kind == audit::Kind::Restore {
+        return Err(
+            "that entry is itself a restore — pick an original move / add / delete to restore before"
+                .into(),
+        );
+    }
+    let window = &records[target_idx..];
+    // Preserve first-seen file order so the plan (and the modal) list files
+    // in a stable, log-driven order rather than hash order.
+    let mut order: Vec<PathBuf> = Vec::new();
+    let mut by_path: std::collections::HashMap<PathBuf, RestoreTarget> =
+        std::collections::HashMap::new();
+    for entry in window {
+        for s in record_sides(entry) {
+            match by_path.get_mut(&s.file_path) {
+                // Already seen: keep the first `key_before` (window-start
+                // state) and advance `expected_current` to this later
+                // `key_after`.
+                Some(existing) => existing.expected_current = s.key_after.clone(),
+                None => {
+                    order.push(s.file_path.clone());
+                    by_path.insert(
+                        s.file_path.clone(),
+                        RestoreTarget {
+                            scope: s.scope,
+                            file_path: s.file_path.clone(),
+                            top_level_key: s.top_level_key.clone(),
+                            target_value: s.key_before.clone(),
+                            expected_current: s.key_after.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    let targets: Vec<RestoreTarget> = order
+        .into_iter()
+        .map(|p| by_path.remove(&p).expect("path inserted above"))
+        .collect();
+    if targets.is_empty() {
+        return Err("nothing to restore — the spanned entries touched no files".into());
+    }
+    Ok(RestorePlan {
+        direction: audit::RestoreDirection::ToPoint,
+        target_id,
+        leaf_kind: target.leaf_kind,
+        project_dir: target.project_dir.clone(),
+        path: target.path.clone(),
+        ops_spanned: window.len(),
         targets,
     })
 }
@@ -1806,12 +1949,10 @@ fn current_top_level(
 }
 
 /// Compute the diff preview for a restore plan without writing anything.
-/// `target` is the audit entry being acted on; `ops_spanned` is 1 for an
-/// undo / redo and the spanned-entry count for a restore-to-point.
+/// `target` is the audit entry being acted on.
 pub fn preview_restore_plan(
     plan: &RestorePlan,
     target: &audit::Record,
-    ops_spanned: usize,
 ) -> Result<RestorePreview, Box<dyn std::error::Error>> {
     let mut sides = Vec::with_capacity(plan.targets.len());
     for t in &plan.targets {
@@ -1831,7 +1972,7 @@ pub fn preview_restore_plan(
         direction: plan.direction,
         target: record_view(target.clone()),
         sides,
-        ops_spanned,
+        ops_spanned: plan.ops_spanned,
     })
 }
 
@@ -2992,7 +3133,7 @@ mod tests {
             side_at(Scope::User, &user, perms(&["C"]), perms(&["C", "A"])),
         );
         let plan = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
-        let preview = preview_restore_plan(&plan, &rec, 1).unwrap();
+        let preview = preview_restore_plan(&plan, &rec).unwrap();
         let project_side = preview
             .sides
             .iter()
@@ -3034,6 +3175,166 @@ mod tests {
         assert_eq!(
             io_atomic::load(&user).unwrap().unwrap().permissions().allow,
             vec!["C".to_string()],
+        );
+    }
+
+    // -- restore-to-point (#125) -------------------------------------------
+
+    #[test]
+    fn restore_to_point_reverts_the_target_and_everything_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = paths.project.clone().unwrap();
+        let user = paths.user.clone().unwrap();
+        // Disk reflects the state after two moves: A then B, Project → User.
+        write(&project, r#"{"permissions":{"allow":["C"]}}"#);
+        write(&user, r#"{"permissions":{"allow":["A","B"]}}"#);
+        let m1 = move_record(
+            side_at(Scope::Project, &project, perms(&["A", "B", "C"]), perms(&["B", "C"])),
+            side_at(Scope::User, &user, perms(&[]), perms(&["A"])),
+        );
+        let m2 = move_record(
+            side_at(Scope::Project, &project, perms(&["B", "C"]), perms(&["C"])),
+            side_at(Scope::User, &user, perms(&["A"]), perms(&["A", "B"])),
+        );
+        let records = vec![m1.clone(), m2];
+        let plan = plan_restore_to(&records, m1.id).unwrap();
+        assert_eq!(plan.ops_spanned, 2, "two entries spanned");
+        apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
+        // Both files are back to the pre-m1 state.
+        assert_eq!(
+            io_atomic::load(&project).unwrap().unwrap().permissions().allow,
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+        );
+        assert!(io_atomic::load(&user)
+            .unwrap()
+            .unwrap()
+            .permissions()
+            .allow
+            .is_empty());
+    }
+
+    #[test]
+    fn restore_to_point_on_the_last_entry_reverts_just_that_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = paths.project.clone().unwrap();
+        let user = paths.user.clone().unwrap();
+        write(&project, r#"{"permissions":{"allow":[]}}"#);
+        write(&user, r#"{"permissions":{"allow":["A"]}}"#);
+        let m1 = move_record(
+            side_at(Scope::Project, &project, perms(&["A"]), perms(&[])),
+            side_at(Scope::User, &user, perms(&[]), perms(&["A"])),
+        );
+        let plan = plan_restore_to(&[m1.clone()], m1.id).unwrap();
+        assert_eq!(plan.ops_spanned, 1);
+        apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
+        assert_eq!(
+            io_atomic::load(&project).unwrap().unwrap().permissions().allow,
+            vec!["A".to_string()],
+        );
+        assert!(io_atomic::load(&user)
+            .unwrap()
+            .unwrap()
+            .permissions()
+            .allow
+            .is_empty());
+    }
+
+    #[test]
+    fn restore_to_point_rejects_a_restore_entry_as_target() {
+        // Restoring to before an undo is confusing — the user should target
+        // an original write instead.
+        let restore = audit::Record::new_restore(
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            vec![],
+            audit::RestoreMeta {
+                target_id: Ulid::new(),
+                direction: audit::RestoreDirection::Undo,
+                files: vec![],
+            },
+        );
+        let err = plan_restore_to(std::slice::from_ref(&restore), restore.id).unwrap_err();
+        assert!(err.to_string().contains("itself a restore"));
+    }
+
+    #[test]
+    fn restore_to_point_rejects_an_unknown_target() {
+        let err = plan_restore_to(&[], Ulid::new()).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn a_restore_to_point_entry_is_itself_undoable() {
+        // A restore-to-point lands a `Kind::Restore` record; undoing it
+        // walks `restore.files` and puts the file back.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = paths_in(tmp.path()).project.clone().unwrap();
+        write(&project, r#"{"permissions":{"allow":["NEW"]}}"#);
+        let rec = audit::Record::new_restore(
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            vec![key("permissions"), key("allow"), idx(0)],
+            audit::RestoreMeta {
+                target_id: Ulid::new(),
+                direction: audit::RestoreDirection::ToPoint,
+                files: vec![side_at(
+                    Scope::Project,
+                    &project,
+                    perms(&["OLD"]),
+                    perms(&["NEW"]),
+                )],
+            },
+        );
+        let plan = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
+        apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
+        assert_eq!(
+            io_atomic::load(&project).unwrap().unwrap().permissions().allow,
+            vec!["OLD".to_string()],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_restore_plan_rolls_back_an_earlier_file_when_a_later_one_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let good_dir = tmp.path().join("good");
+        let bad_dir = tmp.path().join("bad");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        let good = good_dir.join("settings.json");
+        let bad = bad_dir.join("settings.json");
+        write(&good, r#"{"permissions":{"allow":["POST"]}}"#);
+        write(&bad, r#"{"permissions":{"allow":["POST"]}}"#);
+        // An undo plan targets `good` then `bad` (record_sides order).
+        let rec = move_record(
+            side_at(Scope::Project, &good, perms(&["PRE"]), perms(&["POST"])),
+            side_at(Scope::User, &bad, perms(&["PRE"]), perms(&["POST"])),
+        );
+        // Lock the bad file's directory so its atomic write can't create a
+        // tempfile — phase 2 fails on the second target.
+        let mut ro = std::fs::metadata(&bad_dir).unwrap().permissions();
+        ro.set_mode(0o555);
+        std::fs::set_permissions(&bad_dir, ro).unwrap();
+
+        let plan = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
+        let result = apply_restore_plan(&plan, None, &WatchState::default());
+
+        // Re-grant write so TempDir cleanup and the load below can proceed.
+        let mut rw = std::fs::metadata(&bad_dir).unwrap().permissions();
+        rw.set_mode(0o755);
+        std::fs::set_permissions(&bad_dir, rw).unwrap();
+
+        assert!(result.is_err(), "the locked file should fail the batch");
+        // `good` was written, then rolled back to its pre-restore content.
+        assert_eq!(
+            io_atomic::load(&good).unwrap().unwrap().permissions().allow,
+            vec!["POST".to_string()],
+            "the earlier file must be rolled back, not left half-restored",
         );
     }
 
