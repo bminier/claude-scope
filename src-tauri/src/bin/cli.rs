@@ -11,12 +11,14 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::{json, Value};
+use ulid::Ulid;
 
 use claude_scope_lib::app_info::AppInfo;
 use claude_scope_lib::audit::{self, Record as AuditRecord};
 use claude_scope_lib::commands::{
-    apply_move_leaf_impl, build_loaded, diff_move_leaf_impl, AuditLogPage, AuditRecordView,
-    MoveLeafPreview, MoveLeafRequest,
+    apply_move_leaf_impl, apply_restore_plan, build_loaded, build_restore_plan, diff_move_leaf_impl,
+    plan_restore_to, preview_restore_plan, restore_record, AuditLogPage, AuditRecordView,
+    MoveLeafPreview, MoveLeafRequest, RestorePlan, RestorePreview,
 };
 use claude_scope_lib::io_atomic::{self, BackupTracker};
 use claude_scope_lib::model::{PathSeg, PermissionKind};
@@ -129,6 +131,55 @@ enum Command {
         json: bool,
     },
 
+    /// Undo the most recent change in the audit log (#19 phase 5). Reverts
+    /// a move / add / delete / change-kind / restore-to-point by writing
+    /// the affected files back to their pre-op snapshots, then logs a
+    /// `restore` entry (actor `cli`) so a GUI session sees it in History.
+    Undo {
+        /// Print the planned restore as a diff and exit without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive `Apply? [y/N]` prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Emit machine-readable JSON: the `RestorePreview` for `--dry-run`,
+        /// otherwise the `restore` entry as an `AuditRecordView`.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Redo the most recently undone change (#19 phase 5). Refuses with a
+    /// non-zero exit when a change was made after the last undo (the
+    /// forward stack is then ambiguous — same rule as the GUI).
+    Redo {
+        /// Print the planned restore as a diff and exit without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive `Apply? [y/N]` prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Restore every file affected by an audit entry — and the entries
+    /// after it — back to its state before that entry (#19 phase 5).
+    Restore {
+        /// Audit entry id: a full ULID or any unique prefix (ULIDs
+        /// lex-sort, so prefix matching is cheap and unambiguous).
+        id: String,
+        /// Print the planned restore as a diff and exit without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive `Apply? [y/N]` prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Move a permission rule between scopes. Writes are atomic and create a
     /// `.bak` of the original on the first write of the session.
     Move {
@@ -206,8 +257,7 @@ impl KindArg {
 /// CLI counterpart to `audit::Kind`. Mirrored locally rather than re-using
 /// the lib enum so the wire format of `--kind <value>` stays a CLI concern
 /// (kebab-case as clap renders ValueEnum), independent of the JSON
-/// snake_case the audit module already pins. The `restore` value lands in
-/// Phase 3+ alongside `audit::Kind::Restore`.
+/// snake_case the audit module already pins.
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum AuditKindArg {
     Move,
@@ -215,6 +265,7 @@ enum AuditKindArg {
     Delete,
     #[value(name = "change-kind")]
     ChangeKind,
+    Restore,
 }
 
 impl AuditKindArg {
@@ -225,6 +276,7 @@ impl AuditKindArg {
                 | (AuditKindArg::Add, audit::Kind::Add)
                 | (AuditKindArg::Delete, audit::Kind::Delete)
                 | (AuditKindArg::ChangeKind, audit::Kind::ChangeKind)
+                | (AuditKindArg::Restore, audit::Kind::Restore)
         )
     }
 }
@@ -272,6 +324,34 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             *json,
         );
     }
+    // `undo` / `redo` / `restore` operate purely off the audit log and the
+    // absolute file paths recorded in it — like `history`, they need no
+    // project root, so dispatch before `resolve_paths`.
+    if let Command::Undo {
+        dry_run,
+        yes,
+        json,
+    } = cli.command
+    {
+        return cmd_undo(cli.home_dir.as_deref(), dry_run, yes, json);
+    }
+    if let Command::Redo {
+        dry_run,
+        yes,
+        json,
+    } = cli.command
+    {
+        return cmd_redo(cli.home_dir.as_deref(), dry_run, yes, json);
+    }
+    if let Command::Restore {
+        id,
+        dry_run,
+        yes,
+        json,
+    } = &cli.command
+    {
+        return cmd_restore(cli.home_dir.as_deref(), id, *dry_run, *yes, *json);
+    }
 
     let paths = resolve_paths(cli.project_dir.as_deref(), cli.home_dir.as_deref())?;
     match cli.command {
@@ -285,6 +365,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::ListProjects { .. } => unreachable!("handled above"),
         Command::Version { .. } => unreachable!("handled above"),
         Command::History { .. } => unreachable!("handled above"),
+        Command::Undo { .. } => unreachable!("handled above"),
+        Command::Redo { .. } => unreachable!("handled above"),
+        Command::Restore { .. } => unreachable!("handled above"),
         Command::Move {
             rule,
             kind,
@@ -642,6 +725,208 @@ fn cmd_move(
         );
     }
     Ok(())
+}
+
+/// Read the audit log for a CLI restore command, surfacing the
+/// unreadable-line count the same way `history` does. `--home-dir`
+/// redirects it identically.
+fn read_audit_log(
+    home: Option<&std::path::Path>,
+) -> Result<Vec<AuditRecord>, Box<dyn std::error::Error>> {
+    let (records, skipped) = audit::read_all(home)?;
+    if skipped > 0 {
+        eprintln!(
+            "note: {skipped} unreadable {} skipped in the log",
+            if skipped == 1 { "entry" } else { "entries" }
+        );
+    }
+    Ok(records)
+}
+
+fn restore_action_label(direction: audit::RestoreDirection) -> &'static str {
+    match direction {
+        audit::RestoreDirection::Undo => "undo",
+        audit::RestoreDirection::Redo => "redo",
+        audit::RestoreDirection::ToPoint => "restore-to-point",
+    }
+}
+
+/// Print a restore preview as a human-readable block: the entry being
+/// acted on, the spanned-entry count for a restore-to-point, and one line
+/// per affected file with its write status.
+fn print_restore_preview(preview: &RestorePreview) {
+    println!(
+        "{}: {} {}",
+        restore_action_label(preview.direction),
+        format_verb(&preview.target.record),
+        extract_rule_summary(&preview.target.record).unwrap_or_default(),
+    );
+    if matches!(preview.direction, audit::RestoreDirection::ToPoint) {
+        println!(
+            "  reverting {} logged entr{}",
+            preview.ops_spanned,
+            if preview.ops_spanned == 1 { "y" } else { "ies" }
+        );
+    }
+    for side in &preview.sides {
+        let status = if !side.will_write {
+            "no change"
+        } else if side.state_mismatch {
+            "write — overwrites an external edit"
+        } else {
+            "write"
+        };
+        println!(
+            "  {:<11} {}  [{status}]",
+            side.scope.label(),
+            side.file_path
+        );
+    }
+}
+
+/// Prompt `Apply? [y/N]` on the terminal; returns true only for an explicit
+/// yes. Any other input (including EOF on a closed stdin) is a "no".
+fn confirm_prompt() -> Result<bool, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    print!("Apply? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let answer = line.trim().to_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
+/// Find the single audit entry whose id begins with `prefix` — a full ULID
+/// or any unique prefix. ULIDs render as uppercase Crockford base32 and
+/// lex-sort, so prefix matching is a cheap `starts_with`.
+fn resolve_entry_id(
+    records: &[AuditRecord],
+    prefix: &str,
+) -> Result<Ulid, Box<dyn std::error::Error>> {
+    let needle = prefix.trim().to_uppercase();
+    if needle.is_empty() {
+        return Err("empty audit entry id".into());
+    }
+    let matches: Vec<&AuditRecord> = records
+        .iter()
+        .filter(|r| r.id.to_string().starts_with(&needle))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(format!("no audit entry matches id `{prefix}`").into()),
+        [one] => Ok(one.id),
+        many => {
+            let ids: Vec<String> = many.iter().map(|r| r.id.to_string()).collect();
+            Err(format!(
+                "id `{prefix}` is ambiguous — matches {} entries:\n  {}",
+                many.len(),
+                ids.join("\n  ")
+            )
+            .into())
+        }
+    }
+}
+
+/// Shared driver for `undo` / `redo` / `restore`: preview, optionally
+/// confirm, apply, and log the resulting `restore` entry (actor `cli`).
+fn run_cli_restore(
+    home: Option<&std::path::Path>,
+    plan: &RestorePlan,
+    target: &AuditRecord,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let preview = preview_restore_plan(plan, target)?;
+    if dry_run {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&preview)?);
+        } else {
+            print_restore_preview(&preview);
+            println!("(dry run — nothing written)");
+        }
+        return Ok(());
+    }
+    if !yes {
+        if !json {
+            print_restore_preview(&preview);
+        }
+        if !confirm_prompt()? {
+            // A declined confirm is not an error — mirror the GUI's Cancel.
+            if !json {
+                println!("aborted");
+            }
+            return Ok(());
+        }
+    }
+    let files = apply_restore_plan(plan, Some(&BackupTracker::new()), &WatchState::default())?;
+    let record = restore_record(plan, audit::Actor::Cli, files);
+    // Fail-open: the restore already took effect on disk, so a log-append
+    // failure is a warning, not a command failure (matches the GUI).
+    if let Err(err) = audit::append(&record, home) {
+        eprintln!("warning: restore applied but audit-log append failed: {err}");
+    }
+    if json {
+        let view = AuditRecordView {
+            ts_ms: record.id.timestamp_ms(),
+            record,
+        };
+        println!("{}", serde_json::to_string_pretty(&view)?);
+    } else {
+        println!(
+            "{} applied — {} file(s) restored",
+            restore_action_label(preview.direction),
+            preview.sides.len()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_undo(
+    home: Option<&std::path::Path>,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let records = read_audit_log(home)?;
+    let target = audit::undo_redo_state(&records)
+        .undoable
+        .ok_or("nothing to undo")?;
+    let plan = build_restore_plan(&target, audit::RestoreDirection::Undo)?;
+    run_cli_restore(home, &plan, &target, dry_run, yes, json)
+}
+
+fn cmd_redo(
+    home: Option<&std::path::Path>,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let records = read_audit_log(home)?;
+    let state = audit::undo_redo_state(&records);
+    if state.sequence_break {
+        return Err("redo is unavailable: a change was made after the last undo".into());
+    }
+    let target = state.redoable.ok_or("nothing to redo")?;
+    let plan = build_restore_plan(&target, audit::RestoreDirection::Redo)?;
+    run_cli_restore(home, &plan, &target, dry_run, yes, json)
+}
+
+fn cmd_restore(
+    home: Option<&std::path::Path>,
+    id: &str,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let records = read_audit_log(home)?;
+    let target_id = resolve_entry_id(&records, id)?;
+    let plan = plan_restore_to(&records, target_id)?;
+    let target = records
+        .iter()
+        .find(|r| r.id == target_id)
+        .expect("plan_restore_to verified the id is in the log")
+        .clone();
+    run_cli_restore(home, &plan, &target, dry_run, yes, json)
 }
 
 fn rules_at(doc: &claude_scope_lib::model::SettingsDoc, kind_key: &str) -> Vec<String> {
@@ -1078,7 +1363,9 @@ mod tests {
 
     // -- history subcommand (#126) -----------------------------------------
 
-    use claude_scope_lib::audit::{self as audit_lib, Actor, Kind, LeafKind, Record, Side};
+    use claude_scope_lib::audit::{
+        self as audit_lib, Actor, Kind, LeafKind, Record, RestoreDirection, RestoreMeta, Side,
+    };
 
     fn make_audit_record(kind: Kind, leaf_kind: LeafKind) -> Record {
         Record::new(kind, leaf_kind, Actor::Gui, None, None, None, vec![], None)
@@ -1358,5 +1645,156 @@ mod tests {
         // Cross-check that the GUI's IPC would produce the same shape —
         // both consume `audit::Record` via `AuditRecordView`, so this
         // assertion is a forward-compat anchor.
+    }
+
+    // -- undo / redo / restore subcommands (#126) --------------------------
+
+    /// Write a settings file, creating parent dirs.
+    fn write_file(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// A logged move of `Bash(ls)` from `project` to `user`, with
+    /// before/after snapshots — the shape `cmd_undo` reads.
+    fn logged_move(project: &Path, user: &Path) -> Record {
+        let mut rec = make_audit_record(Kind::Move, LeafKind::PermissionRule);
+        rec.path = vec![
+            PathSeg::Key("permissions".into()),
+            PathSeg::Key("allow".into()),
+            PathSeg::Index(0),
+        ];
+        rec.from = Some(Side {
+            scope: Scope::Project,
+            file_path: project.to_path_buf(),
+            top_level_key: "permissions".into(),
+            key_before: Some(json!({"allow": ["Bash(ls)"]})),
+            key_after: Some(json!({"allow": []})),
+        });
+        rec.to = Some(Side {
+            scope: Scope::User,
+            file_path: user.to_path_buf(),
+            top_level_key: "permissions".into(),
+            key_before: Some(json!({"allow": []})),
+            key_after: Some(json!({"allow": ["Bash(ls)"]})),
+        });
+        rec
+    }
+
+    #[test]
+    fn cli_undo_reverts_the_last_logged_move_and_logs_a_cli_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let project = tmp.path().join("proj/.claude/settings.json");
+        let user = home.join(".claude/settings.json");
+        // Files at their post-move state: the rule has moved Project → User.
+        write_file(&project, r#"{"permissions":{"allow":[]}}"#);
+        write_file(&user, r#"{"permissions":{"allow":["Bash(ls)"]}}"#);
+        audit_lib::append(&logged_move(&project, &user), Some(home)).unwrap();
+
+        // `--yes` skips the prompt; not a dry run.
+        cmd_undo(Some(home), false, true, false).unwrap();
+
+        // Both files are back to the pre-move state.
+        assert_eq!(
+            rules_at(&io_atomic::load(&project).unwrap().unwrap(), "allow"),
+            vec!["Bash(ls)".to_string()],
+        );
+        assert!(rules_at(&io_atomic::load(&user).unwrap().unwrap(), "allow").is_empty());
+        // A `restore` entry was logged with actor `cli`, so a GUI session
+        // sees the CLI-driven undo in its History.
+        let (records, _) = audit_lib::read_all(Some(home)).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[1].kind, Kind::Restore));
+        assert!(matches!(records[1].actor, Actor::Cli));
+    }
+
+    #[test]
+    fn cli_undo_dry_run_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let project = tmp.path().join("proj/.claude/settings.json");
+        let user = home.join(".claude/settings.json");
+        write_file(&project, r#"{"permissions":{"allow":[]}}"#);
+        write_file(&user, r#"{"permissions":{"allow":["Bash(ls)"]}}"#);
+        audit_lib::append(&logged_move(&project, &user), Some(home)).unwrap();
+
+        cmd_undo(Some(home), true, true, false).unwrap();
+
+        // Files untouched, no restore entry appended.
+        assert!(rules_at(&io_atomic::load(&project).unwrap().unwrap(), "allow").is_empty());
+        let (records, _) = audit_lib::read_all(Some(home)).unwrap();
+        assert_eq!(records.len(), 1, "a dry run must not append a restore entry");
+    }
+
+    #[test]
+    fn cli_undo_errors_on_an_empty_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = cmd_undo(Some(tmp.path()), false, true, false).unwrap_err();
+        assert!(err.to_string().contains("nothing to undo"));
+    }
+
+    #[test]
+    fn cli_redo_errors_after_a_sequence_break() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let project = tmp.path().join("proj/.claude/settings.json");
+        let user = home.join(".claude/settings.json");
+        write_file(&project, r#"{"permissions":{"allow":[]}}"#);
+        write_file(&user, r#"{"permissions":{"allow":["Bash(ls)"]}}"#);
+        // move → undo(move) → another move = a sequence break.
+        let m1 = logged_move(&project, &user);
+        let undo = Record::new_restore(
+            LeafKind::PermissionRule,
+            Actor::Gui,
+            None,
+            vec![],
+            RestoreMeta {
+                target_id: m1.id,
+                direction: RestoreDirection::Undo,
+                files: vec![],
+            },
+        );
+        let m2 = logged_move(&project, &user);
+        for rec in [&m1, &undo, &m2] {
+            audit_lib::append(rec, Some(home)).unwrap();
+        }
+        let err = cmd_redo(Some(home), false, true, false).unwrap_err();
+        assert!(err.to_string().contains("redo is unavailable"));
+    }
+
+    #[test]
+    fn resolve_entry_id_matches_a_full_ulid_and_rejects_misses() {
+        let a = make_audit_record(Kind::Move, LeafKind::PermissionRule);
+        let records = vec![a.clone()];
+        // Full id resolves, case-insensitively.
+        assert_eq!(resolve_entry_id(&records, &a.id.to_string()).unwrap(), a.id);
+        assert_eq!(
+            resolve_entry_id(&records, &a.id.to_string().to_lowercase()).unwrap(),
+            a.id,
+        );
+        // No 2026-era ULID begins with `Z`, so this matches nothing.
+        assert!(resolve_entry_id(&records, "ZZZZZZ")
+            .unwrap_err()
+            .to_string()
+            .contains("no audit entry"));
+        // Whitespace-only is rejected up front.
+        assert!(resolve_entry_id(&records, "  ")
+            .unwrap_err()
+            .to_string()
+            .contains("empty"));
+    }
+
+    #[test]
+    fn resolve_entry_id_reports_an_ambiguous_prefix() {
+        let a = make_audit_record(Kind::Move, LeafKind::PermissionRule);
+        let b = make_audit_record(Kind::Add, LeafKind::PermissionRule);
+        let records = vec![a.clone(), b];
+        // The leading base32 char encodes the top 5 bits of the 48-bit ms
+        // timestamp — identical for any two ULIDs minted this century — so a
+        // one-char prefix matches both records.
+        let one_char = &a.id.to_string()[..1];
+        let err = resolve_entry_id(&records, one_char).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"));
     }
 }
