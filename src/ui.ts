@@ -2851,6 +2851,10 @@ function openModal(opts: {
    *  when the caller needs to resolve a pending promise that the actions
    *  might not have resolved (e.g. the user dismisses without picking). */
   onClose?: () => void;
+  /** Called once with the modal's `close` function right after it's wired,
+   *  so a caller that builds interactive body content (e.g. the History
+   *  dialog's per-row Restore buttons) can dismiss the modal itself. */
+  onReady?: (close: () => void) => void;
 }): void {
   const backdrop = document.createElement("div");
   backdrop.className = "modal-backdrop";
@@ -2953,6 +2957,7 @@ function openModal(opts: {
   });
 
   document.body.appendChild(backdrop);
+  opts.onReady?.(close);
   const initial = actionButtons.find((_, i) => opts.actions[i].focus) ?? actionButtons[0];
   initial?.focus();
 }
@@ -4380,12 +4385,21 @@ export function renderDiagnosticsMarkdown(info: AppInfo): string {
   ].join("\n");
 }
 
+/** Options for [[openHistory]]. */
+export interface HistoryOptions {
+  trigger?: HTMLElement | null;
+  /** Restore-to-point handler (#125). When supplied, each original-write
+   *  row grows a "Restore to before this" button; the History dialog
+   *  closes itself before invoking it so the restore-confirm modal opens
+   *  cleanly on its own. */
+  onRestoreToPoint?: (rec: AuditRecordView) => void;
+}
+
 /**
- * Open the audit-log History dialog (#19 phase 2). Read-only: lists every
- * write ClaudeScope has made since the audit log was first written, in
- * reverse-chronological order. The "Restore to before this" action the
- * issue spec mentions lands with #19 phase 3+; this dialog deliberately
- * omits it so the read path can ship first.
+ * Open the audit-log History dialog (#19 phase 2). Lists every write
+ * ClaudeScope has made since the audit log was first written, in
+ * reverse-chronological order. With `onRestoreToPoint` supplied (#125),
+ * each original-write row offers a "Restore to before this" action.
  *
  * `page` arrives null when the bootstrap fetch failed (e.g. the audit
  * file was unreadable) — the dialog still opens, with an explanatory
@@ -4393,9 +4407,20 @@ export function renderDiagnosticsMarkdown(info: AppInfo): string {
  * are common (fresh install, no writes yet) and render as a friendly
  * empty state.
  */
-export function openHistory(page: AuditLogPage | null, trigger?: HTMLElement | null): void {
+export function openHistory(page: AuditLogPage | null, opts: HistoryOptions = {}): void {
   const body = document.createElement("div");
   body.className = "history-body";
+
+  // The list is built before `openModal` runs, but the per-row Restore
+  // buttons need the modal's `close`; capture it here and let the buttons
+  // read it once `onReady` fires.
+  let closeModal: (() => void) | null = null;
+  const restoreHandler = opts.onRestoreToPoint
+    ? (rec: AuditRecordView) => {
+        closeModal?.();
+        opts.onRestoreToPoint?.(rec);
+      }
+    : undefined;
 
   if (page === null) {
     const err = document.createElement("p");
@@ -4409,7 +4434,7 @@ export function openHistory(page: AuditLogPage | null, trigger?: HTMLElement | n
       "No audit entries yet. Every move / add / delete you make from here will appear in this list.";
     body.appendChild(empty);
   } else {
-    body.appendChild(historyList(page.records));
+    body.appendChild(historyList(page.records, restoreHandler));
     if (page.skipped > 0) {
       const warn = document.createElement("p");
       warn.className = "history-skipped";
@@ -4432,7 +4457,10 @@ export function openHistory(page: AuditLogPage | null, trigger?: HTMLElement | n
       },
     ],
     panelClassName: "modal-history",
-    trigger,
+    trigger: opts.trigger,
+    onReady: (close) => {
+      closeModal = close;
+    },
   });
 }
 
@@ -4443,7 +4471,10 @@ export function openHistory(page: AuditLogPage | null, trigger?: HTMLElement | n
  * useful ordering for a "what just happened?" view — without paying for
  * a backend sort.
  */
-function historyList(records: AuditRecordView[]): HTMLElement {
+function historyList(
+  records: AuditRecordView[],
+  onRestore?: (rec: AuditRecordView) => void,
+): HTMLElement {
   const ul = document.createElement("ul");
   ul.className = "history-list";
   // Index by id so a restore row can name the entry it acted on.
@@ -4451,12 +4482,16 @@ function historyList(records: AuditRecordView[]): HTMLElement {
   // Slice before reverse so we don't mutate the caller's array — the
   // History dialog is intentionally side-effect-free.
   for (const rec of records.slice().reverse()) {
-    ul.appendChild(historyRow(rec, byId));
+    ul.appendChild(historyRow(rec, byId, onRestore));
   }
   return ul;
 }
 
-function historyRow(rec: AuditRecordView, byId: Map<string, AuditRecordView>): HTMLElement {
+function historyRow(
+  rec: AuditRecordView,
+  byId: Map<string, AuditRecordView>,
+  onRestore?: (rec: AuditRecordView) => void,
+): HTMLElement {
   const li = document.createElement("li");
   li.className = "history-row";
 
@@ -4491,6 +4526,20 @@ function historyRow(rec: AuditRecordView, byId: Map<string, AuditRecordView>): H
   ts.dateTime = date.toISOString();
   ts.textContent = date.toLocaleString();
   head.appendChild(ts);
+
+  // Restore-to-point affordance (#125). Offered on original-write rows
+  // only — the backend rejects targeting a `restore` entry, so a button
+  // there would just error.
+  if (onRestore && rec.kind !== "restore") {
+    const restoreBtn = document.createElement("button");
+    restoreBtn.type = "button";
+    restoreBtn.className = "history-restore-btn";
+    restoreBtn.textContent = "Restore";
+    restoreBtn.title = "Restore all affected files to their state before this entry";
+    restoreBtn.setAttribute("aria-label", `Restore to before ${historyVerbLabel(rec)}`);
+    restoreBtn.onclick = () => onRestore(rec);
+    head.appendChild(restoreBtn);
+  }
 
   li.appendChild(head);
 

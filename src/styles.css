@@ -1560,7 +1560,6 @@ button:disabled {
 .history-row-head {
   display: flex;
   align-items: baseline;
-  justify-content: space-between;
   gap: 12px;
 }
 
@@ -1590,15 +1589,30 @@ button:disabled {
 }
 
 /* The "· Move permission rule" reference a restore row shows for the entry
-   it acted on. `margin-right: auto` keeps it grouped with the verb on the
-   left while the timestamp stays pinned right. */
+   it acted on. Sits next to the verb; the timestamp's `margin-left: auto`
+   pushes everything after it to the right edge. */
 .history-restore-ref {
-  margin-right: auto;
   color: var(--muted);
   font-size: 12px;
 }
 
+.history-restore-btn {
+  padding: 1px 8px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.history-restore-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .history-ts {
+  margin-left: auto;
   color: var(--muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
