@@ -92,22 +92,48 @@ claude-scope-cli history [--since <DURATION>] [--limit <N>] [--kind <KIND>]... [
 - `--since` accepts `s` / `m` / `h` / `d` / `ms` suffixes. Bare
   numbers are rejected — the parser refuses to guess units.
 - `--limit` defaults to 20; `0` is unlimited.
-- `--kind` is repeatable: `move` / `add` / `delete` / `change-kind`.
-  OR semantics when multiple flags are passed.
+- `--kind` is repeatable: `move` / `add` / `delete` / `change-kind` /
+  `restore`. OR semantics when multiple flags are passed.
 - `--json` emits the same `AuditLogPage` wire shape the GUI's
   `list_audit_records` IPC returns.
 
 Human output: tab-separated `ULID  ts  verb  scope-arrow  rule`,
 newest-first.
 
-## Pending subcommands
+### `undo` / `redo`
 
-These wait on the audit-log work in
-[#19](https://github.com/bminier/claude-scope/issues/19) phases 3 and 4:
+Step backward / forward through the audit log one operation at a
+time, mirroring the GUI's Undo / Redo buttons.
 
-- `claude-scope-cli undo` — invert the most recent non-restore entry.
-- `claude-scope-cli redo` — re-apply the most recent undone op.
-- `claude-scope-cli restore <entry-id>` — multi-step rollback to
-  before a chosen log entry.
+```sh
+claude-scope-cli undo [--dry-run] [--yes] [--json]
+claude-scope-cli redo [--dry-run] [--yes] [--json]
+```
 
-Tracked in [#126](https://github.com/bminier/claude-scope/issues/126).
+`undo` reverts the most recent operation by writing the affected
+files back to the snapshots in the log; `redo` re-applies the most
+recently undone one. `redo` exits non-zero after a *sequence break*
+(a change made since the last undo) — the forward stack is then
+ambiguous, same rule as the greyed-out GUI button.
+
+Both print the planned restore and prompt `Apply? [y/N]` unless
+`--yes` is passed. `--dry-run` prints the plan and writes nothing.
+Each successful run appends a `restore` entry with `actor: cli`.
+
+### `restore`
+
+Restore every file affected by a logged entry — and the entries after
+it — back to its state before that entry.
+
+```sh
+claude-scope-cli restore <ENTRY-ID> [--dry-run] [--yes] [--json]
+```
+
+`<ENTRY-ID>` is a full ULID or any unique prefix; an ambiguous prefix
+prints the candidates and exits non-zero. Same `--dry-run` / `--yes`
+flags as `undo`.
+
+For `undo` / `redo` / `restore`, `--json` emits the `RestorePreview`
+for a `--dry-run` and the resulting `restore` entry (as an
+`AuditRecordView`, the same shape `history --json` produces) once
+applied.

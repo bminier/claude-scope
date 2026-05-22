@@ -9,17 +9,18 @@ lives at
 ## Record shape
 
 Each line is a self-contained JSON record. Phase 1 (#122) pinned the
-schema; phases 3-5 (#124 / #125 / #126) extend the consumer surface
-but don't break it.
+schema; phases 3-5 (#124 / #125 / #126) added one optional field —
+`restore` — for undo/redo/restore meta-entries, leaving every older
+record valid.
 
 ```jsonc
 {
   "id": "01HF...",                   // ULID (Crockford base32). Lex-sort = chrono-sort.
-  "kind": "move",                    // move | add | delete | change_kind | restore (Phase 3+)
+  "kind": "move",                    // move | add | delete | change_kind | restore
   "leaf_kind": "permission_rule",    // permission_rule | permission_list | top_level_key
-  "actor": "gui",                    // gui | cli | skill | restore
+  "actor": "gui",                    // gui | cli | skill — who triggered it
   "project_dir": "/work/proj",       // optional — user-scope-only ops omit
-  "from": {                          // optional — Add omits, top-level Restore omits
+  "from": {                          // optional — Add omits; every restore omits
     "scope": "project",
     "file_path": "/work/proj/.claude/settings.json",
     "top_level_key": "permissions",
@@ -41,9 +42,46 @@ but don't break it.
 
 The **affected top-level key** (`permissions` for permission ops, the
 moved key for top-level moves) is snapshotted before AND after on
-each side. That's the minimum needed for restore (Phase 4) to invert
-any logged op without re-reading history, while staying narrower than
-the whole file.
+each side. That's the minimum needed for an undo to invert any logged
+op without re-reading history, while staying narrower than the whole
+file.
+
+## Restore entries
+
+An undo, redo, or restore-to-point appends a record with
+`kind: "restore"`. Instead of `from` / `to` it carries a `restore`
+object — a restore can touch more than two files, so two fixed sides
+aren't enough:
+
+```jsonc
+"restore": {
+  "target_id": "01HF...",            // the entry undone / redone / restored-to
+  "direction": "undo",               // undo | redo | to_point
+  "files": [                         // one Side per file the restore rewrote
+    {
+      "scope": "project",
+      "file_path": "/work/proj/.claude/settings.json",
+      "top_level_key": "permissions",
+      "key_before": { "allow": ["Read(**)"] },
+      "key_after":  { "allow": ["Bash(ls)", "Read(**)"] }
+    }
+  ]
+}
+```
+
+Because each `files` entry snapshots before AND after, a restore is
+itself invertible — undoing an undo is just another restore. The
+undo/redo cursor is never stored: it's reconstructed on demand by
+replaying the `direction` of every `restore` entry over the ordered
+list of ops (`audit::undo_redo_state`). A write appended after an undo
+latches a *sequence break*, which withholds redo rather than
+discarding the forward stack.
+
+Snapshot-restore — writing a file back to a `key_before` the log
+already captured — is how undo stays faithful. Synthesizing a reverse
+move/add/delete instead would mishandle a move into a scope that
+already shared the rule (the reverse move would wrongly strip the
+destination's own copy); writing the captured snapshot back cannot.
 
 ## Why ULID, not timestamps
 
@@ -95,8 +133,9 @@ suffixes.
 
 The reader **only scans the active file**. Archives are archival —
 the History dialog and `claude-scope-cli history` don't surface
-them. Future restore-to-point work (#125) is similarly bounded to
-the active log; cross-archive restore would be a separate feature.
+them. Undo / redo and restore-to-point are bounded to the active log
+for the same reason; restoring across an archive boundary would be a
+separate feature.
 
 ## Sandbox
 

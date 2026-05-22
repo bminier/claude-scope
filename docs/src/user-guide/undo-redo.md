@@ -14,12 +14,13 @@ the single-slot `.bak` model can't:
 |---|---|---|
 | 1 | JSONL audit log at `~/.claude/claude-scope/audit.jsonl` | Shipped ([#19](https://github.com/bminier/claude-scope/issues/19) phase 1) |
 | 2 | Read-only **History** dialog (topbar button) listing entries newest-first | Shipped (#19 phase 2) |
-| 3 | `Ctrl+Z` / `Cmd+Z` undo via the diff-confirm modal | Tracked in [#124](https://github.com/bminier/claude-scope/issues/124) |
-| 4 | "Restore to before this" — multi-step rollback from a History row | Tracked in [#125](https://github.com/bminier/claude-scope/issues/125) |
-| 5 | CLI parity (`claude-scope-cli history` shipped; `undo / redo / restore` pending) | Tracked in [#126](https://github.com/bminier/claude-scope/issues/126) |
+| 3 | Undo / redo via the diff-confirm modal, `Ctrl`/`Cmd`+`Z` shortcuts | Shipped ([#124](https://github.com/bminier/claude-scope/issues/124)) |
+| 4 | "Restore to before this" — multi-step rollback from a History row | Shipped ([#125](https://github.com/bminier/claude-scope/issues/125)) |
+| 5 | CLI parity — `claude-scope-cli history / undo / redo / restore` | Shipped ([#126](https://github.com/bminier/claude-scope/issues/126)) |
 
-The on-disk schema is stable as of phase 1, so phases 3-5 don't break
-existing log entries. See
+The on-disk schema is stable as of phase 1; phases 3-5 added an
+optional `restore` field for undo/redo/restore meta-entries without
+breaking older log entries. See
 [Architecture → Audit log](../architecture/audit-log.md) for the
 record format.
 
@@ -37,9 +38,51 @@ Click **History** in the topbar. Entries appear newest-first, with:
 - The affected rule string, recovered by diffing the before/after
   snapshots in the record.
 
+A `restore` entry (the result of an undo / redo / restore-to-point)
+shows as `Undo` / `Redo` / `Restore to point`, names the entry it
+acted on, and lists the scopes it touched.
+
 The bottom of the list surfaces a count of any malformed entries the
 reader skipped — useful if `audit.jsonl` was hand-edited or partially
 written during a crash.
+
+## Undo and redo
+
+The topbar's **Undo** and **Redo** buttons — and `Ctrl`/`Cmd`+`Z` /
+`Ctrl`/`Cmd`+`Shift`+`Z` — step backward and forward through the log
+one operation at a time. Each button's tooltip names exactly what the
+next step would do (e.g. *"Undo: Move permission rule Bash(ls)
+(3 min ago)"*).
+
+Every undo and redo previews before it writes: it routes through the
+same diff-confirm modal a move does, so you see the per-file
+before/after and confirm. Confirming appends a new `restore` entry —
+the log is append-only, so an undo is itself recorded and can be
+redone.
+
+**Sequence break.** If you make a fresh change after an undo, the
+redo stack is ambiguous — Redo greys out and its tooltip explains
+why, rather than silently discarding the forward history.
+
+**External edits.** Undo writes a file back to the snapshot the log
+captured. If the file was hand-edited since (so its current contents
+differ from what the log expected), the confirm modal shows a warning
+band — you can still proceed, but you'll be overwriting that edit.
+
+## Restore to before an entry
+
+Single-step undo walks back one operation at a time. To jump back
+multiple operations at once — *"take me back to before I imported
+that preset"* — open **History** and click the **Restore** button on
+the target row.
+
+That reverts the targeted entry **and every entry logged after it**:
+ClaudeScope walks the log forward, computes the net per-file delta,
+and writes each affected file back to its state before the target.
+The confirm modal lists every file that will change and how many
+operations are being reverted (*"Restoring to 4 ops back"*). A
+restore-to-point is itself a single log entry, so it can be undone
+like any other operation.
 
 ## Rotation
 
@@ -51,20 +94,26 @@ rotation**.
 
 ## CLI
 
-`claude-scope-cli history` mirrors the GUI dialog from a shell:
+`claude-scope-cli` mirrors the History dialog and the undo / redo /
+restore actions from a shell:
 
 ```sh
 # Last 20 entries, newest first.
 claude-scope-cli history
 
-# Just deletes in the last hour, JSON.
-claude-scope-cli history --since 1h --kind delete --json
+# Undo the most recent change — previews, then prompts.
+claude-scope-cli undo
 
-# Everything in the active log (no cap).
-claude-scope-cli history --limit 0
+# Redo it, no prompt.
+claude-scope-cli redo --yes
+
+# Preview a restore-to-point without writing.
+claude-scope-cli restore 01JABC --dry-run
 ```
 
-`--json` emits the same `AuditLogPage` wire format the GUI uses, so a
-[Claude Code skill (#13)](https://github.com/bminier/claude-scope/issues/13)
-can consume CLI output and IPC payloads through one shared type once
-that lands.
+The entry id passed to `restore` is a full ULID or any unique prefix.
+`--dry-run` prints the planned restore and writes nothing; `--yes`
+skips the confirm prompt; `--json` emits machine-readable output. CLI
+restores log a `restore` entry with `actor: cli`, so a GUI session
+sees them in its History. See [CLI reference](../reference/cli.md)
+for the full subcommand surface.
