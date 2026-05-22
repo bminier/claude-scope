@@ -21,6 +21,7 @@ Claude Code reads settings from JSON files at several scopes. Moving a permissio
 - **Rule search / filter** — press `/` anywhere to focus, case-insensitive substring, `m/n` match counts per group
 - **Auto-reload** — `notify`-based file watcher picks up external edits (hand-edited JSON, another editor, etc.) and refreshes the UI without losing state
 - **Heuristic shape lint** — subtle ⚠ badge on rules that don't match the shapes this UI knows (`Bash(...)`, `WebFetch(domain:...)`, `mcp__server__tool`, etc.). Best-effort only: Claude Code's full rule grammar isn't publicly documented, so flagged rules may still work — the popover names the specific heuristic that tripped and disclaims its scope.
+- **Audit log with undo / redo / restore** — every move / add / delete is appended to `~/.claude/claude-scope/audit.jsonl`. A **History** dialog lists them newest-first; `Ctrl`/`Cmd`+`Z` and `Ctrl`/`Cmd`+`Shift`+`Z` step backward and forward through the diff-confirm modal; and any History row can roll the affected files back to their state before that entry. `claude-scope-cli undo / redo / restore` mirror it from the shell.
 
 ### Write strategy
 
@@ -166,6 +167,8 @@ npm run tauri build
 | Key | Action |
 | --- | --- |
 | `/` | Focus the rule search input |
+| `Ctrl`/`Cmd`+`Z` | Undo the last change |
+| `Ctrl`/`Cmd`+`Shift`+`Z` | Redo |
 | `Esc` (in search) | Clear the filter |
 | `Esc` (in diff modal) | Cancel the move |
 | `Enter` (in diff modal) | Activate the focused button (Apply is the default focus) |

@@ -128,6 +128,32 @@ reviewer.
       one. The final remaining checkbox refuses to uncheck (the grid would
       otherwise render empty with no recovery from inside the dialog).
 
+## Audit log: History, undo, redo (non-sandbox runs only)
+
+Undo / redo and the History dialog read
+`~/.claude/claude-scope/audit.jsonl`, which ClaudeScope writes only in
+**non-sandbox** runs — a `--home` sandbox deliberately skips audit
+logging. Exercise this section only when you set up via the
+"Alternative (no sandbox)" path. In a sandbox run, just confirm the
+History dialog opens empty and **Undo** / **Redo** stay disabled, then
+skip the rest.
+
+- [ ] **History dialog.** Click **History** → the moves you made above
+      appear newest-first, each with a verb, timestamp, scope arrow, and
+      rule string.
+- [ ] **Undo.** After a move, the topbar **Undo** button is enabled and
+      its tooltip names the move. Click it → restore-confirm modal with a
+      per-file before/after → confirm → the rule returns to its original
+      scope, and History shows a new `Undo` entry.
+- [ ] **Redo.** `Redo` is now enabled. Click it → the move re-applies.
+- [ ] **`Ctrl`/`Cmd`+`Z`.** Behaves like the Undo button; ignored while a
+      text input or a modal has focus.
+- [ ] **Sequence break.** Undo, then make a fresh move. `Redo` greys out
+      and its tooltip explains a change was made after the last undo.
+- [ ] **Restore to before this.** In **History**, click a row's
+      **Restore** button → the confirm modal lists every affected file and
+      "Restoring to N ops back" → confirm → all spanned files revert.
+
 ## Side-effect verification
 
 After exercising the moves above, in the throwaway `.claude/` dir:
