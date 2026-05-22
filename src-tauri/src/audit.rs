@@ -72,19 +72,21 @@ pub struct Record {
     /// readable as `(verb, leaf_kind)` instead of a fused
     /// `move_permission_rule` string.
     pub leaf_kind: LeafKind,
-    /// Who triggered the op. Always `Gui` in Phase 1; `Cli` and `Restore`
-    /// land with the CLI (#13) and undo (#19 Phase 3) work respectively.
+    /// Who triggered the op — `Gui`, `Cli`, or `Skill`. Orthogonal to
+    /// [`Kind`]: an undo run from the CLI is `actor: Cli`, `kind: Restore`.
     pub actor: Actor,
     /// Project root that scoped the operation. `None` for user-scope-only
     /// ops (e.g. moving a rule into User scope from another user-level
     /// scope — there is no project context).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_dir: Option<PathBuf>,
-    /// Source side. `None` for [`Kind::Add`] (no source) and for top-level
-    /// `Restore` entries that target multiple files (Phase 3+).
+    /// Source side. `None` for [`Kind::Add`] (no source) and for every
+    /// [`Kind::Restore`] entry — restores carry their per-file snapshots in
+    /// [`Record::restore`] instead, since they can touch more than two files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<Side>,
-    /// Destination side. `None` for [`Kind::Delete`].
+    /// Destination side. `None` for [`Kind::Delete`] and every
+    /// [`Kind::Restore`] entry (see [`Record::from`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<Side>,
     /// JSON path of the affected leaf, e.g.
@@ -98,6 +100,13 @@ pub struct Record {
     /// rather than "move".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_kind: Option<PermissionKind>,
+    /// Set on — and only on — [`Kind::Restore`] entries. Carries the
+    /// undo / redo / restore-to-point payload (#19 Phases 3-4): the id of
+    /// the entry acted on, the direction, and a per-file before/after
+    /// snapshot. Absent on the wire for every non-restore record, so the
+    /// field is backwards-compatible with Phase 1-2 logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<RestoreMeta>,
     /// Build that wrote this record. See [`current_version`].
     pub claude_scope_version: String,
 }
@@ -122,6 +131,12 @@ pub enum Kind {
     Add,
     /// `apply_delete_leaf`. Removed a leaf from the `from` side.
     Delete,
+    /// A meta-entry recording an undo, redo, or restore-to-point (#19
+    /// Phases 3-4). Its payload lives in [`Record::restore`]; `from` / `to`
+    /// stay `None`. The undo/redo state machine reads [`RestoreMeta`] to
+    /// reconstruct the cursor — `Undo` / `Redo` restores are cursor moves,
+    /// a `ToPoint` restore is itself an ordinary undoable op.
+    Restore,
 }
 
 /// What shape of leaf the record's `path` targets. Mirrors `MoveLeafKind`
@@ -136,16 +151,16 @@ pub enum LeafKind {
     PermissionRule,
 }
 
-/// Who triggered the op. Phase 1 only emits `Gui`; the other variants
-/// reserve wire-format slots so a CLI (#13) or undo (#19 Phase 3) write
-/// doesn't force a breaking change.
+/// Who triggered the op. Phase 1 only emits `Gui`; `Cli` reserves a
+/// wire-format slot for the CLI (#13) and `Skill` for a future Claude Code
+/// skill. Orthogonal to [`Kind`]: an undo is `kind: Restore` whatever the
+/// actor, so there is deliberately no `Restore` actor variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Actor {
     Gui,
     Cli,
     Skill,
-    Restore,
 }
 
 /// One side of a write — the source or destination, depending on the kind.
@@ -170,6 +185,42 @@ pub struct Side {
     /// Same shape as `key_before`, captured after the op completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_after: Option<serde_json::Value>,
+}
+
+/// Direction of a [`Kind::Restore`] entry. The undo/redo state machine
+/// (`commands::audit_undo`) treats `Undo` / `Redo` as cursor moves and
+/// `ToPoint` as an ordinary op that can itself be undone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreDirection {
+    /// Inverted the most recent applied op (#19 Phase 3).
+    Undo,
+    /// Re-applied the most recently undone op (#19 Phase 3).
+    Redo,
+    /// Rolled the affected files back to their state before a chosen
+    /// history entry (#19 Phase 4).
+    ToPoint,
+}
+
+/// Payload of a [`Kind::Restore`] record. Carries the id of the entry the
+/// restore acted on, the direction, and a per-file before/after snapshot of
+/// everything the restore wrote — the snapshot is what lets a *later* undo
+/// invert the restore itself.
+///
+/// `Undo` / `Redo` restores touch one or two files (a single inverted op);
+/// a `ToPoint` restore may touch up to four. Either way the affected sides
+/// live in `files` rather than in [`Record::from`] / [`Record::to`], which
+/// only have room for two.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestoreMeta {
+    /// The entry this restore inverted (`Undo`), re-applied (`Redo`), or
+    /// rolled back to (`ToPoint`).
+    pub target_id: Ulid,
+    /// Which of undo / redo / restore-to-point produced this entry.
+    pub direction: RestoreDirection,
+    /// One [`Side`] per file the restore rewrote, each with its
+    /// `key_before` / `key_after` snapshot.
+    pub files: Vec<Side>,
 }
 
 impl Record {
@@ -202,6 +253,35 @@ impl Record {
             to,
             path,
             to_kind,
+            restore: None,
+            claude_scope_version: current_version(),
+        }
+    }
+
+    /// Construct a [`Kind::Restore`] record for an undo / redo /
+    /// restore-to-point op (#19 Phases 3-4). `from` / `to` / `to_kind` are
+    /// always `None` on a restore record — the affected sides live in
+    /// `restore.files` — so this constructor takes only the fields a
+    /// restore actually carries. `leaf_kind` echoes the leaf kind of the
+    /// entry being restored so the History view can label the row.
+    pub fn new_restore(
+        leaf_kind: LeafKind,
+        actor: Actor,
+        project_dir: Option<PathBuf>,
+        path: Vec<PathSeg>,
+        restore: RestoreMeta,
+    ) -> Self {
+        Self {
+            id: Ulid::new(),
+            kind: Kind::Restore,
+            leaf_kind,
+            actor,
+            project_dir,
+            from: None,
+            to: None,
+            path,
+            to_kind: None,
+            restore: Some(restore),
             claude_scope_version: current_version(),
         }
     }
@@ -301,6 +381,127 @@ pub fn read_all(home: Option<&Path>) -> io::Result<(Vec<Record>, usize)> {
         }
     }
     Ok((records, skipped))
+}
+
+/// Undo / redo availability, reconstructed from the append-only log by
+/// [`undo_redo_state`]. The log is the single source of truth — there is no
+/// mutable cursor on disk — so every undo / redo decision is a fresh replay
+/// of the records.
+#[derive(Debug, Clone, Default)]
+pub struct UndoRedoState {
+    /// The op the next undo would invert. `None` when nothing is undoable
+    /// (empty log, or every op already undone).
+    pub undoable: Option<Record>,
+    /// The op the next redo would re-apply. `None` when there is nothing to
+    /// redo, or when `sequence_break` has stranded the redo stack.
+    pub redoable: Option<Record>,
+    /// True when a fresh write landed while undone ops were pending,
+    /// stranding the redo stack (#124). Redo is disabled and `redoable` is
+    /// `None`; the flag lets the UI explain *why* in a tooltip rather than
+    /// silently discarding the forward stack.
+    pub sequence_break: bool,
+}
+
+/// How a log entry participates in the undo/redo replay.
+enum ReplayRole {
+    /// An ordinary undoable op: a `move` / `add` / `delete` / `change_kind`,
+    /// or a restore-to-point (which is itself undoable).
+    Op,
+    /// An `undo` restore — a cursor move back, carrying the target op id.
+    Undo(Ulid),
+    /// A `redo` restore — a cursor move forward, carrying the target op id.
+    Redo(Ulid),
+    /// A malformed restore record (no payload). Left out of the replay
+    /// entirely rather than allowed to perturb the cursor.
+    Ignore,
+}
+
+fn replay_role(rec: &Record) -> ReplayRole {
+    match rec.kind {
+        Kind::Move | Kind::ChangeKind | Kind::Add | Kind::Delete => ReplayRole::Op,
+        Kind::Restore => match rec.restore.as_ref() {
+            Some(meta) => match meta.direction {
+                // Restore-to-point is a forward write, not a cursor move:
+                // it can be undone like any other op.
+                RestoreDirection::ToPoint => ReplayRole::Op,
+                RestoreDirection::Undo => ReplayRole::Undo(meta.target_id),
+                RestoreDirection::Redo => ReplayRole::Redo(meta.target_id),
+            },
+            None => ReplayRole::Ignore,
+        },
+    }
+}
+
+/// Reconstruct undo/redo state from `records` (the full log in file order,
+/// as returned by [`read_all`]).
+///
+/// The replay walks the log once, building the list of undoable ops, a
+/// per-op "currently undone" flag, and a redo stack. `undo` / `redo`
+/// restores move the cursor; every other entry — including a
+/// restore-to-point — is an op. A write appended while the redo stack is
+/// non-empty latches `sequence_break`: the redo stack is now ambiguous, so
+/// redo is withheld (but the entries are kept, not discarded — see #124).
+pub fn undo_redo_state(records: &[Record]) -> UndoRedoState {
+    // `ops` holds indices into `records`; `undone` is parallel to it;
+    // `redo_stack` holds indices into `ops` (top = next op to redo).
+    let mut ops: Vec<usize> = Vec::new();
+    let mut undone: Vec<bool> = Vec::new();
+    let mut redo_stack: Vec<usize> = Vec::new();
+    let mut sequence_break = false;
+
+    for (i, rec) in records.iter().enumerate() {
+        match replay_role(rec) {
+            ReplayRole::Op => {
+                if !redo_stack.is_empty() {
+                    sequence_break = true;
+                }
+                ops.push(i);
+                undone.push(false);
+            }
+            ReplayRole::Undo(target) => {
+                if let Some(op_ix) = ops.iter().position(|&r| records[r].id == target) {
+                    // Guard against a double-undo of the same op via two
+                    // log entries (a corrupt log, or two racing writers).
+                    if !undone[op_ix] {
+                        undone[op_ix] = true;
+                        redo_stack.push(op_ix);
+                    }
+                }
+                // A target that isn't in `ops` is dangling (rotated out of
+                // the active log, or never written) — skip it silently.
+            }
+            ReplayRole::Redo(target) => {
+                if let Some(op_ix) = ops.iter().position(|&r| records[r].id == target) {
+                    if undone[op_ix] {
+                        undone[op_ix] = false;
+                        redo_stack.retain(|&x| x != op_ix);
+                    }
+                }
+            }
+            ReplayRole::Ignore => {}
+        }
+    }
+
+    let undoable = ops
+        .iter()
+        .zip(&undone)
+        .rev()
+        .find(|(_, &u)| !u)
+        .map(|(&r, _)| records[r].clone());
+    // `sequence_break` only matters while the redo stack still holds
+    // something; if a (CLI-forced) redo emptied it, drop the stale flag.
+    let sequence_break = sequence_break && !redo_stack.is_empty();
+    let redoable = if sequence_break {
+        None
+    } else {
+        redo_stack.last().map(|&op_ix| records[ops[op_ix]].clone())
+    };
+
+    UndoRedoState {
+        undoable,
+        redoable,
+        sequence_break,
+    }
 }
 
 /// Outcome of a [`rotate_if_needed`] call. `Skipped` covers four cases that
@@ -557,6 +758,225 @@ mod tests {
         assert_eq!(json, r#""change_kind""#);
         let json = serde_json::to_string(&Kind::Move).unwrap();
         assert_eq!(json, r#""move""#);
+        let json = serde_json::to_string(&Kind::Restore).unwrap();
+        assert_eq!(json, r#""restore""#);
+    }
+
+    fn sample_restore_record(direction: RestoreDirection) -> Record {
+        Record::new_restore(
+            LeafKind::PermissionRule,
+            Actor::Gui,
+            Some(PathBuf::from("/work/proj")),
+            vec![
+                PathSeg::Key("permissions".into()),
+                PathSeg::Key("allow".into()),
+                PathSeg::Index(0),
+            ],
+            RestoreMeta {
+                target_id: Ulid::new(),
+                direction,
+                files: vec![
+                    make_side(Scope::Project, "/work/proj/.claude/settings.json"),
+                    make_side(Scope::User, "/home/me/.claude/settings.json"),
+                ],
+            },
+        )
+    }
+
+    #[test]
+    fn restore_record_round_trips_through_json() {
+        for dir in [
+            RestoreDirection::Undo,
+            RestoreDirection::Redo,
+            RestoreDirection::ToPoint,
+        ] {
+            let rec = sample_restore_record(dir);
+            let s = serde_json::to_string(&rec).unwrap();
+            let parsed: Record = serde_json::from_str(&s).unwrap();
+            assert_eq!(parsed, rec);
+        }
+    }
+
+    #[test]
+    fn restore_direction_serializes_to_snake_case() {
+        // The wire format is a contract — pin the casing so a future
+        // `rename_all` typo can't silently rewrite every restore entry.
+        assert_eq!(
+            serde_json::to_string(&RestoreDirection::Undo).unwrap(),
+            r#""undo""#
+        );
+        assert_eq!(
+            serde_json::to_string(&RestoreDirection::Redo).unwrap(),
+            r#""redo""#
+        );
+        assert_eq!(
+            serde_json::to_string(&RestoreDirection::ToPoint).unwrap(),
+            r#""to_point""#
+        );
+    }
+
+    #[test]
+    fn non_restore_record_omits_restore_field_on_the_wire() {
+        // `restore` is skip-on-`None`, so a Phase 1-2 reader (which doesn't
+        // know the field) sees the exact same bytes it always did.
+        let json = serde_json::to_value(sample_record()).unwrap();
+        assert!(json.get("restore").is_none());
+        // A restore record carries it.
+        let json = serde_json::to_value(sample_restore_record(RestoreDirection::Undo)).unwrap();
+        assert!(json.get("restore").is_some());
+        assert!(json.get("from").is_none(), "restore records leave from/to unset");
+        assert!(json.get("to").is_none());
+    }
+
+    #[test]
+    fn restore_record_survives_append_then_read() {
+        let tmp = TempDir::new().unwrap();
+        let rec = sample_restore_record(RestoreDirection::ToPoint);
+        append(&rec, Some(tmp.path())).unwrap();
+        let (records, skipped) = read_all(Some(tmp.path())).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0], rec);
+    }
+
+    // -- undo/redo state machine (#124) ------------------------------------
+
+    /// A bare op record — `undo_redo_state` reads file order, not the ULID
+    /// clock, so no inter-record sleeps are needed.
+    fn op_record() -> Record {
+        Record::new(
+            Kind::Move,
+            LeafKind::PermissionRule,
+            Actor::Gui,
+            None,
+            None,
+            None,
+            vec![],
+            None,
+        )
+    }
+
+    fn restore_of(target: &Record, direction: RestoreDirection) -> Record {
+        Record::new_restore(
+            target.leaf_kind,
+            Actor::Gui,
+            None,
+            vec![],
+            RestoreMeta {
+                target_id: target.id,
+                direction,
+                files: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn undo_redo_state_empty_log_has_nothing() {
+        let state = undo_redo_state(&[]);
+        assert!(state.undoable.is_none());
+        assert!(state.redoable.is_none());
+        assert!(!state.sequence_break);
+    }
+
+    #[test]
+    fn undo_redo_state_fresh_writes_undo_targets_the_last() {
+        let (a, b, c) = (op_record(), op_record(), op_record());
+        let log = [a, b, c.clone()];
+        let state = undo_redo_state(&log);
+        assert_eq!(state.undoable.unwrap().id, c.id);
+        assert!(state.redoable.is_none(), "nothing undone yet");
+        assert!(!state.sequence_break);
+    }
+
+    #[test]
+    fn undo_redo_state_after_one_undo() {
+        let (a, b, c) = (op_record(), op_record(), op_record());
+        let log = [a.clone(), b.clone(), c.clone(), restore_of(&c, RestoreDirection::Undo)];
+        let state = undo_redo_state(&log);
+        // C is undone, so the next undo targets B and the next redo C.
+        assert_eq!(state.undoable.unwrap().id, b.id);
+        assert_eq!(state.redoable.unwrap().id, c.id);
+        assert!(!state.sequence_break);
+    }
+
+    #[test]
+    fn undo_redo_state_stacked_undos_walk_backward() {
+        let (a, b, c) = (op_record(), op_record(), op_record());
+        let log = [
+            a.clone(),
+            b.clone(),
+            c.clone(),
+            restore_of(&c, RestoreDirection::Undo),
+            restore_of(&b, RestoreDirection::Undo),
+        ];
+        let state = undo_redo_state(&log);
+        assert_eq!(state.undoable.unwrap().id, a.id);
+        // Redo re-applies the most recently undone op first: B.
+        assert_eq!(state.redoable.unwrap().id, b.id);
+    }
+
+    #[test]
+    fn undo_redo_state_redo_clears_the_forward_step() {
+        let (a, b, c) = (op_record(), op_record(), op_record());
+        let log = [
+            a,
+            b,
+            c.clone(),
+            restore_of(&c, RestoreDirection::Undo),
+            restore_of(&c, RestoreDirection::Redo),
+        ];
+        let state = undo_redo_state(&log);
+        // C is applied again; redo stack is empty.
+        assert_eq!(state.undoable.unwrap().id, c.id);
+        assert!(state.redoable.is_none());
+    }
+
+    #[test]
+    fn undo_redo_state_write_after_undo_is_a_sequence_break() {
+        let (a, b, c, d) = (op_record(), op_record(), op_record(), op_record());
+        let log = [
+            a,
+            b,
+            c.clone(),
+            restore_of(&c, RestoreDirection::Undo),
+            d.clone(),
+        ];
+        let state = undo_redo_state(&log);
+        // The new write D is undoable; redo is withheld and the break flag
+        // is set so the UI can explain it.
+        assert_eq!(state.undoable.unwrap().id, d.id);
+        assert!(state.redoable.is_none());
+        assert!(state.sequence_break);
+    }
+
+    #[test]
+    fn undo_redo_state_restore_to_point_counts_as_an_op() {
+        let a = op_record();
+        let to_point = restore_of(&a, RestoreDirection::ToPoint);
+        // A restore-to-point is itself undoable.
+        let state = undo_redo_state(&[a.clone(), to_point.clone()]);
+        assert_eq!(state.undoable.unwrap().id, to_point.id);
+        // And undoing it walks back to A.
+        let undo_tp = restore_of(&to_point, RestoreDirection::Undo);
+        let state = undo_redo_state(&[a.clone(), to_point.clone(), undo_tp]);
+        assert_eq!(state.undoable.unwrap().id, a.id);
+        assert_eq!(state.redoable.unwrap().id, to_point.id);
+    }
+
+    #[test]
+    fn undo_redo_state_ignores_dangling_and_malformed_restores() {
+        let a = op_record();
+        // An undo targeting an op that isn't in the log (rotated out) must
+        // not perturb the cursor.
+        let orphan = op_record();
+        let dangling = restore_of(&orphan, RestoreDirection::Undo);
+        let state = undo_redo_state(&[a.clone(), dangling]);
+        assert_eq!(state.undoable.unwrap().id, a.id);
+        // A restore record with no payload is ignored entirely.
+        let mut malformed = restore_of(&a, RestoreDirection::Undo);
+        malformed.restore = None;
+        let state = undo_redo_state(&[a.clone(), malformed]);
+        assert_eq!(state.undoable.unwrap().id, a.id, "malformed restore left A applied");
     }
 
     #[test]

@@ -818,6 +818,17 @@ fn format_verb(rec: &AuditRecord) -> String {
             None => "change-kind".to_string(),
         };
     }
+    if matches!(rec.kind, audit::Kind::Restore) {
+        // A restore meta-entry: name the direction. The payload is in
+        // `rec.restore`; a record missing it is malformed but shouldn't
+        // panic the history printer.
+        return match rec.restore.as_ref().map(|r| r.direction) {
+            Some(audit::RestoreDirection::Undo) => "undo".to_string(),
+            Some(audit::RestoreDirection::Redo) => "redo".to_string(),
+            Some(audit::RestoreDirection::ToPoint) => "restore-to-point".to_string(),
+            None => "restore".to_string(),
+        };
+    }
     let noun = match rec.leaf_kind {
         audit::LeafKind::PermissionRule => "rule",
         audit::LeafKind::PermissionList => "list",
@@ -827,7 +838,7 @@ fn format_verb(rec: &AuditRecord) -> String {
         audit::Kind::Move => "move",
         audit::Kind::Add => "add",
         audit::Kind::Delete => "delete",
-        audit::Kind::ChangeKind => unreachable!("handled above"),
+        audit::Kind::ChangeKind | audit::Kind::Restore => unreachable!("handled above"),
     };
     format!("{verb}-{noun}")
 }

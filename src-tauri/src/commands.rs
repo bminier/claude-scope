@@ -5,10 +5,11 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
+use ulid::Ulid;
 
 use crate::app_info::AppInfo;
 use crate::audit;
-use crate::io_atomic::{self, BackupTracker};
+use crate::io_atomic::{self, BackupTracker, FileStamp};
 use crate::model::{
     describe_path, key_policy, validate_movable_path, KeyPolicy, MovablePath, PathSeg,
     PermissionKind, PermissionRules, SettingsDoc,
@@ -602,14 +603,155 @@ pub struct AuditLogPage {
 #[tauri::command]
 pub fn list_audit_records(overrides: State<'_, RuntimeOverrides>) -> Result<AuditLogPage, String> {
     let (records, skipped) = audit::read_all(overrides.home()).map_err(|e| e.to_string())?;
-    let records = records
-        .into_iter()
-        .map(|r| {
-            let ts_ms = r.id.timestamp_ms();
-            AuditRecordView { record: r, ts_ms }
-        })
-        .collect();
+    let records = records.into_iter().map(record_view).collect();
     Ok(AuditLogPage { records, skipped })
+}
+
+/// Undo / redo availability for the topbar buttons (#19 Phase 3). `undo` /
+/// `redo` carry the audit entry the next click would act on so the frontend
+/// can render a descriptive tooltip with the same helpers the History view
+/// uses; `sequence_break` lets it explain a disabled redo button.
+#[derive(Debug, Serialize)]
+pub struct UndoRedoStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undo: Option<AuditRecordView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redo: Option<AuditRecordView>,
+    pub sequence_break: bool,
+}
+
+/// Report what the next undo / redo would target (#19 Phase 3). Routes
+/// through `RuntimeOverrides::home` like the other audit commands, so a
+/// sandbox session reads its scratch log. A sandbox log is always empty
+/// (writes there are never logged), so undo / redo are simply unavailable
+/// in scratch mode — `.bak` remains the recovery path there.
+#[tauri::command]
+pub fn audit_undo_status(
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<UndoRedoStatus, String> {
+    let (records, _) = audit::read_all(overrides.home()).map_err(|e| e.to_string())?;
+    let state = audit::undo_redo_state(&records);
+    Ok(UndoRedoStatus {
+        undo: state.undoable.map(record_view),
+        redo: state.redoable.map(record_view),
+        sequence_break: state.sequence_break,
+    })
+}
+
+/// Resolve the audit entry the next undo or redo would act on, or a
+/// descriptive error. Shared by the preview and apply commands so they
+/// can't drift on which entry is the target.
+fn undo_redo_target(
+    direction: audit::RestoreDirection,
+    overrides: &RuntimeOverrides,
+) -> Result<audit::Record, Box<dyn std::error::Error>> {
+    let (records, _) = audit::read_all(overrides.home())?;
+    let state = audit::undo_redo_state(&records);
+    let target = match direction {
+        audit::RestoreDirection::Undo => state.undoable,
+        audit::RestoreDirection::Redo => {
+            if state.sequence_break {
+                return Err(
+                    "redo is unavailable: a change was made after the last undo".into(),
+                );
+            }
+            state.redoable
+        }
+        audit::RestoreDirection::ToPoint => {
+            return Err("restore-to-point is not an undo/redo target".into())
+        }
+    };
+    target.ok_or_else(|| -> Box<dyn std::error::Error> {
+        match direction {
+            audit::RestoreDirection::Undo => "nothing to undo".into(),
+            _ => "nothing to redo".into(),
+        }
+    })
+}
+
+fn undo_redo_preview(
+    direction: audit::RestoreDirection,
+    overrides: &RuntimeOverrides,
+) -> Result<RestorePreview, Box<dyn std::error::Error>> {
+    let target = undo_redo_target(direction, overrides)?;
+    let plan = build_restore_plan(&target, direction)?;
+    preview_restore_plan(&plan, &target, 1)
+}
+
+/// Diff preview for the next undo (#19 Phase 3) — same modal the move /
+/// delete / add flows confirm through.
+#[tauri::command]
+pub fn audit_undo_preview(
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<RestorePreview, String> {
+    undo_redo_preview(audit::RestoreDirection::Undo, &overrides).map_err(|e| e.to_string())
+}
+
+/// Diff preview for the next redo (#19 Phase 3).
+#[tauri::command]
+pub fn audit_redo_preview(
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<RestorePreview, String> {
+    undo_redo_preview(audit::RestoreDirection::Redo, &overrides).map_err(|e| e.to_string())
+}
+
+fn apply_undo_redo(
+    expected_id: &str,
+    direction: audit::RestoreDirection,
+    app: &AppHandle,
+    watch: &WatchState,
+    overrides: &RuntimeOverrides,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target = undo_redo_target(direction, overrides)?;
+    // The frontend confirmed a preview built from a specific entry; if the
+    // log moved under us (a concurrent CLI write, an external rotation)
+    // refuse rather than silently acting on a different op.
+    if target.id.to_string() != expected_id {
+        return Err(
+            "the audit log changed since the preview — reload and try again".into(),
+        );
+    }
+    let plan = build_restore_plan(&target, direction)?;
+    let files = apply_restore_plan(&plan, backups_for_session(), watch)?;
+    emit_audit(app, overrides, restore_record(&plan, audit::Actor::Gui, files));
+    Ok(())
+}
+
+/// Apply the next undo (#19 Phase 3). `expected_id` is the id of the entry
+/// the confirmed preview was built from — see [`apply_undo_redo`].
+#[tauri::command]
+pub fn audit_apply_undo(
+    expected_id: String,
+    app: AppHandle,
+    watch: State<'_, WatchState>,
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<(), String> {
+    apply_undo_redo(
+        &expected_id,
+        audit::RestoreDirection::Undo,
+        &app,
+        &watch,
+        &overrides,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Apply the next redo (#19 Phase 3).
+#[tauri::command]
+pub fn audit_apply_redo(
+    expected_id: String,
+    app: AppHandle,
+    watch: State<'_, WatchState>,
+    overrides: State<'_, RuntimeOverrides>,
+) -> Result<(), String> {
+    apply_undo_redo(
+        &expected_id,
+        audit::RestoreDirection::Redo,
+        &app,
+        &watch,
+        &overrides,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Build- and runtime-time diagnostic block for the About dialog (#21).
@@ -1505,6 +1647,317 @@ fn require_path(paths: &ScopePaths, scope: Scope) -> Result<&Path, Box<dyn std::
     })
 }
 
+// -- audit-log restore: undo / redo / restore-to-point (#19 Phases 3-4) -----
+
+/// One file a restore will rewrite. Internal to the restore planner; the
+/// wire-facing shape is [`RestoreSidePreview`].
+#[derive(Debug, Clone)]
+struct RestoreTarget {
+    scope: Scope,
+    file_path: PathBuf,
+    /// Top-level key the restore replaces (or removes).
+    top_level_key: String,
+    /// Value the key should hold after the restore. `None` removes the key.
+    target_value: Option<serde_json::Value>,
+    /// Value the audit log expected the key to currently hold. Drives the
+    /// state-mismatch warning only — it never gates the write.
+    expected_current: Option<serde_json::Value>,
+}
+
+/// A computed, ready-to-apply restoration. Built from an audit record by
+/// [`build_restore_plan`] (undo / redo) or [`plan_restore_to`] (Phase 4),
+/// then handed to [`apply_restore_plan`] / [`preview_restore_plan`].
+#[derive(Debug, Clone)]
+pub struct RestorePlan {
+    direction: audit::RestoreDirection,
+    /// The entry being undone / redone / restored-to.
+    target_id: Ulid,
+    /// Leaf kind + path + project, copied onto the resulting restore record
+    /// so the History view can label the row.
+    leaf_kind: audit::LeafKind,
+    project_dir: Option<PathBuf>,
+    path: Vec<PathSeg>,
+    targets: Vec<RestoreTarget>,
+}
+
+/// Per-file diff in a [`RestorePreview`]. `key_current` / `key_target`
+/// follow `MoveLeafSide`'s skip-on-`None` convention: an absent field means
+/// "key unset", distinct from a literal JSON `null`.
+#[derive(Debug, Serialize)]
+pub struct RestoreSidePreview {
+    pub scope: Scope,
+    pub file_path: String,
+    pub file_path_exists: bool,
+    pub top_level_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_current: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_target: Option<serde_json::Value>,
+    pub will_write: bool,
+    /// True when the on-disk value differs from what the audit log
+    /// expected — i.e. the file was hand-edited since the logged op. The
+    /// restore still proceeds on confirm; the flag drives a warning band.
+    pub state_mismatch: bool,
+}
+
+/// Diff preview for an undo / redo / restore-to-point, rendered by the
+/// frontend's restore-confirm modal.
+#[derive(Debug, Serialize)]
+pub struct RestorePreview {
+    pub direction: audit::RestoreDirection,
+    /// The audit entry being acted on, so the modal can describe it with
+    /// the same helpers the History view uses.
+    pub target: AuditRecordView,
+    pub sides: Vec<RestoreSidePreview>,
+    /// How many ops this restore reverts: 1 for undo / redo, the count of
+    /// spanned entries for a restore-to-point (#125).
+    pub ops_spanned: usize,
+}
+
+/// The sides an audit record snapshots: `from` + `to` for an ordinary op,
+/// or `restore.files` for a `Kind::Restore` entry (which leaves `from` /
+/// `to` unset because a restore can touch more than two files).
+fn record_sides(rec: &audit::Record) -> Vec<&audit::Side> {
+    if let Some(meta) = &rec.restore {
+        return meta.files.iter().collect();
+    }
+    let mut sides = Vec::new();
+    if let Some(f) = &rec.from {
+        sides.push(f);
+    }
+    if let Some(t) = &rec.to {
+        sides.push(t);
+    }
+    sides
+}
+
+/// Wrap an [`audit::Record`] as an [`AuditRecordView`] (record + decoded
+/// timestamp) — the shape both the History view and the restore modal read.
+fn record_view(rec: audit::Record) -> AuditRecordView {
+    let ts_ms = rec.id.timestamp_ms();
+    AuditRecordView { record: rec, ts_ms }
+}
+
+/// Build the plan to undo or redo a single op record.
+///
+/// Undo writes each affected file's key back to the snapshot `key_before`
+/// and expects the file to currently hold `key_after`; redo is the mirror.
+/// Snapshot-restore — rather than synthesizing a reverse move/add/delete
+/// request — is faithful by construction (it writes back a value the log
+/// already captured) and handles rules, lists, and top-level keys
+/// uniformly.
+pub fn build_restore_plan(
+    rec: &audit::Record,
+    direction: audit::RestoreDirection,
+) -> Result<RestorePlan, Box<dyn std::error::Error>> {
+    let undo = match direction {
+        audit::RestoreDirection::Undo => true,
+        audit::RestoreDirection::Redo => false,
+        audit::RestoreDirection::ToPoint => {
+            return Err("restore-to-point plans are built by plan_restore_to".into())
+        }
+    };
+    let sides = record_sides(rec);
+    if sides.is_empty() {
+        return Err("audit entry carries no file snapshots — cannot restore".into());
+    }
+    let mut targets: Vec<RestoreTarget> = Vec::new();
+    for s in sides {
+        // A same-scope change-kind records its one file as both `from` and
+        // `to`; collapse the duplicate so the file is written once.
+        if targets.iter().any(|t| t.file_path == s.file_path) {
+            continue;
+        }
+        let (target_value, expected_current) = if undo {
+            (s.key_before.clone(), s.key_after.clone())
+        } else {
+            (s.key_after.clone(), s.key_before.clone())
+        };
+        targets.push(RestoreTarget {
+            scope: s.scope,
+            file_path: s.file_path.clone(),
+            top_level_key: s.top_level_key.clone(),
+            target_value,
+            expected_current,
+        });
+    }
+    Ok(RestorePlan {
+        direction,
+        target_id: rec.id,
+        leaf_kind: rec.leaf_kind,
+        project_dir: rec.project_dir.clone(),
+        path: rec.path.clone(),
+        targets,
+    })
+}
+
+/// Read a single top-level key's current on-disk value, plus whether the
+/// file exists. Errors (unreadable / malformed file) propagate — a restore
+/// preview that can't read its target should surface that, not paper over
+/// it.
+fn current_top_level(
+    file_path: &Path,
+    key: &str,
+) -> Result<(Option<serde_json::Value>, bool), Box<dyn std::error::Error>> {
+    let loaded = io_atomic::load(file_path)?;
+    let exists = loaded.is_some();
+    let current = loaded.and_then(|d| d.get_top_level(key).cloned());
+    Ok((current, exists))
+}
+
+/// Compute the diff preview for a restore plan without writing anything.
+/// `target` is the audit entry being acted on; `ops_spanned` is 1 for an
+/// undo / redo and the spanned-entry count for a restore-to-point.
+pub fn preview_restore_plan(
+    plan: &RestorePlan,
+    target: &audit::Record,
+    ops_spanned: usize,
+) -> Result<RestorePreview, Box<dyn std::error::Error>> {
+    let mut sides = Vec::with_capacity(plan.targets.len());
+    for t in &plan.targets {
+        let (current, exists) = current_top_level(&t.file_path, &t.top_level_key)?;
+        sides.push(RestoreSidePreview {
+            scope: t.scope,
+            file_path: t.file_path.display().to_string(),
+            file_path_exists: exists,
+            top_level_key: t.top_level_key.clone(),
+            will_write: current != t.target_value,
+            state_mismatch: current != t.expected_current,
+            key_current: current,
+            key_target: t.target_value.clone(),
+        });
+    }
+    Ok(RestorePreview {
+        direction: plan.direction,
+        target: record_view(target.clone()),
+        sides,
+        ops_spanned,
+    })
+}
+
+/// Apply a restore plan: rewrite every target file's affected top-level key
+/// atomically, rolling the whole batch back if any single write fails.
+///
+/// Returns one [`audit::Side`] per target — `key_before` is the value the
+/// file actually held at write time, `key_after` the value written — so the
+/// caller can record a `Kind::Restore` entry that a later undo can itself
+/// invert.
+pub fn apply_restore_plan(
+    plan: &RestorePlan,
+    backups: Option<&BackupTracker>,
+    watch: &WatchState,
+) -> Result<Vec<audit::Side>, Box<dyn std::error::Error>> {
+    /// Everything needed to write one file and, if a later file fails, to
+    /// roll this one back. `pending[i]` lines up with `plan.targets[i]`.
+    struct Pending {
+        path: PathBuf,
+        existed: bool,
+        original: SettingsDoc,
+        stamp: FileStamp,
+        new_doc: SettingsDoc,
+        before_key: Option<serde_json::Value>,
+    }
+
+    // Phase 1 — load + compute. No disk writes here, so a failure to read
+    // any target aborts the whole batch with nothing on disk touched.
+    let mut pending: Vec<Pending> = Vec::with_capacity(plan.targets.len());
+    for t in &plan.targets {
+        let (loaded, stamp) = io_atomic::load_with_stamp(&t.file_path)?;
+        let existed = loaded.is_some();
+        let original = loaded.unwrap_or_else(SettingsDoc::empty);
+        let before_key = original.get_top_level(&t.top_level_key).cloned();
+        let mut new_doc = original.clone();
+        match &t.target_value {
+            Some(v) => new_doc.set_top_level(&t.top_level_key, v.clone()),
+            None => {
+                new_doc.remove_at_path(&[PathSeg::Key(t.top_level_key.clone())]);
+            }
+        }
+        pending.push(Pending {
+            path: t.file_path.clone(),
+            existed,
+            original,
+            stamp,
+            new_doc,
+            before_key,
+        });
+    }
+
+    // Phase 2 — write. Track which files landed so a mid-batch failure
+    // rolls them back: same posture as `apply_move_leaf_impl`'s two-file
+    // dance, generalized to N files.
+    let mut written: Vec<usize> = Vec::new();
+    for (i, p) in pending.iter().enumerate() {
+        // Skip a file already at the target value — no point churning the
+        // watcher or dropping a `.bak` for a zero-delta write.
+        if p.before_key == plan.targets[i].target_value {
+            continue;
+        }
+        if let Err(write_err) = io_atomic::save(&p.path, &p.new_doc, backups, Some(&p.stamp)) {
+            for &w in written.iter().rev() {
+                let pw = &pending[w];
+                let rollback: Result<(), Box<dyn std::error::Error>> = if pw.existed {
+                    io_atomic::save(&pw.path, &pw.original, backups, None).map_err(Into::into)
+                } else {
+                    std::fs::remove_file(&pw.path).map_err(Into::into)
+                };
+                if let Err(rollback_err) = rollback {
+                    return Err(format!(
+                        "restore write of {} failed: {write_err}; \
+                         rolling back {} also failed: {rollback_err}",
+                        p.path.display(),
+                        pw.path.display()
+                    )
+                    .into());
+                }
+                watch.note_self_write(&pw.path);
+            }
+            return Err(format!(
+                "restore write of {} failed — all earlier files rolled back: {write_err}",
+                p.path.display()
+            )
+            .into());
+        }
+        watch.note_self_write(&p.path);
+        written.push(i);
+    }
+
+    // The audit Sides describe what each file held before vs after. Built
+    // for every target, including no-op ones, so undoing this restore has
+    // a complete picture.
+    Ok(plan
+        .targets
+        .iter()
+        .zip(&pending)
+        .map(|(t, p)| audit::Side {
+            scope: t.scope,
+            file_path: t.file_path.clone(),
+            top_level_key: t.top_level_key.clone(),
+            key_before: p.before_key.clone(),
+            key_after: t.target_value.clone(),
+        })
+        .collect())
+}
+
+/// Build the `Kind::Restore` audit record describing a completed restore.
+pub fn restore_record(
+    plan: &RestorePlan,
+    actor: audit::Actor,
+    files: Vec<audit::Side>,
+) -> audit::Record {
+    audit::Record::new_restore(
+        plan.leaf_kind,
+        actor,
+        plan.project_dir.clone(),
+        plan.path.clone(),
+        audit::RestoreMeta {
+            target_id: plan.target_id,
+            direction: plan.direction,
+            files,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2383,6 +2836,204 @@ mod tests {
         assert_eq!(
             preview.from.key_after.unwrap(),
             serde_json::json!({"allow": [], "deny": ["Bash(rm)"]})
+        );
+    }
+
+    // -- audit restore: undo / redo (#124) ---------------------------------
+
+    fn perms(allow: &[&str]) -> serde_json::Value {
+        serde_json::json!({ "allow": allow })
+    }
+
+    fn side_at(
+        scope: Scope,
+        path: &Path,
+        before: serde_json::Value,
+        after: serde_json::Value,
+    ) -> audit::Side {
+        audit::Side {
+            scope,
+            file_path: path.to_path_buf(),
+            top_level_key: "permissions".to_string(),
+            key_before: Some(before),
+            key_after: Some(after),
+        }
+    }
+
+    fn move_record(from: audit::Side, to: audit::Side) -> audit::Record {
+        audit::Record::new(
+            audit::Kind::Move,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            Some(from),
+            Some(to),
+            vec![key("permissions"), key("allow"), idx(0)],
+            None,
+        )
+    }
+
+    #[test]
+    fn undo_of_a_move_restores_both_files_to_pre_move_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = paths.project.clone().unwrap();
+        let user = paths.user.clone().unwrap();
+        // Disk reflects the post-move state: rule A moved Project → User.
+        write(&project, r#"{"permissions":{"allow":["B"]}}"#);
+        write(&user, r#"{"permissions":{"allow":["C","A"]}}"#);
+        let rec = move_record(
+            side_at(Scope::Project, &project, perms(&["A", "B"]), perms(&["B"])),
+            side_at(Scope::User, &user, perms(&["C"]), perms(&["C", "A"])),
+        );
+        let plan = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
+        let sides = apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
+        assert_eq!(
+            io_atomic::load(&project).unwrap().unwrap().permissions().allow,
+            vec!["A".to_string(), "B".to_string()],
+        );
+        assert_eq!(
+            io_atomic::load(&user).unwrap().unwrap().permissions().allow,
+            vec!["C".to_string()],
+        );
+        // The returned sides snapshot what the undo wrote, so the resulting
+        // restore record is itself invertible.
+        assert_eq!(sides.len(), 2);
+        assert_eq!(sides[0].key_before, Some(perms(&["B"])));
+        assert_eq!(sides[0].key_after, Some(perms(&["A", "B"])));
+    }
+
+    #[test]
+    fn redo_of_a_move_re_applies_the_post_move_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = paths.project.clone().unwrap();
+        let user = paths.user.clone().unwrap();
+        // Disk reflects the pre-move state (an undo has already happened).
+        write(&project, r#"{"permissions":{"allow":["A","B"]}}"#);
+        write(&user, r#"{"permissions":{"allow":["C"]}}"#);
+        let rec = move_record(
+            side_at(Scope::Project, &project, perms(&["A", "B"]), perms(&["B"])),
+            side_at(Scope::User, &user, perms(&["C"]), perms(&["C", "A"])),
+        );
+        let plan = build_restore_plan(&rec, audit::RestoreDirection::Redo).unwrap();
+        apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
+        assert_eq!(
+            io_atomic::load(&project).unwrap().unwrap().permissions().allow,
+            vec!["B".to_string()],
+        );
+        assert_eq!(
+            io_atomic::load(&user).unwrap().unwrap().permissions().allow,
+            vec!["C".to_string(), "A".to_string()],
+        );
+    }
+
+    #[test]
+    fn undo_then_redo_round_trips_to_the_original_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = paths.project.clone().unwrap();
+        let user = paths.user.clone().unwrap();
+        write(&project, r#"{"permissions":{"allow":["B"]}}"#);
+        write(&user, r#"{"permissions":{"allow":["C","A"]}}"#);
+        let rec = move_record(
+            side_at(Scope::Project, &project, perms(&["A", "B"]), perms(&["B"])),
+            side_at(Scope::User, &user, perms(&["C"]), perms(&["C", "A"])),
+        );
+        let undo = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
+        apply_restore_plan(&undo, None, &WatchState::default()).unwrap();
+        let redo = build_restore_plan(&rec, audit::RestoreDirection::Redo).unwrap();
+        apply_restore_plan(&redo, None, &WatchState::default()).unwrap();
+        // Back to the post-move state we started from.
+        assert_eq!(
+            io_atomic::load(&user).unwrap().unwrap().permissions().allow,
+            vec!["C".to_string(), "A".to_string()],
+        );
+    }
+
+    #[test]
+    fn build_restore_plan_collapses_change_kind_to_one_target() {
+        // A same-scope change-kind records its single file as both `from`
+        // and `to`; the plan must write that file once, not twice.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("settings.json");
+        let side = side_at(
+            Scope::Project,
+            &project,
+            serde_json::json!({"allow": ["A"], "deny": []}),
+            serde_json::json!({"allow": [], "deny": ["A"]}),
+        );
+        let rec = audit::Record::new(
+            audit::Kind::ChangeKind,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            Some(side.clone()),
+            Some(side),
+            vec![key("permissions"), key("allow"), idx(0)],
+            Some(PermissionKind::Deny),
+        );
+        let plan = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
+        assert_eq!(plan.targets.len(), 1);
+    }
+
+    #[test]
+    fn restore_preview_flags_a_hand_edited_file_as_state_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = paths.project.clone().unwrap();
+        let user = paths.user.clone().unwrap();
+        // The record's `key_after` for Project is {"allow":["B"]}, but the
+        // file on disk says something else — an external hand-edit.
+        write(&project, r#"{"permissions":{"allow":["B","HAND_EDITED"]}}"#);
+        write(&user, r#"{"permissions":{"allow":["C","A"]}}"#);
+        let rec = move_record(
+            side_at(Scope::Project, &project, perms(&["A", "B"]), perms(&["B"])),
+            side_at(Scope::User, &user, perms(&["C"]), perms(&["C", "A"])),
+        );
+        let plan = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
+        let preview = preview_restore_plan(&plan, &rec, 1).unwrap();
+        let project_side = preview
+            .sides
+            .iter()
+            .find(|s| s.scope == Scope::Project)
+            .unwrap();
+        assert!(
+            project_side.state_mismatch,
+            "the hand-edited project file should flag a mismatch"
+        );
+        let user_side = preview
+            .sides
+            .iter()
+            .find(|s| s.scope == Scope::User)
+            .unwrap();
+        assert!(
+            !user_side.state_mismatch,
+            "the untouched user file is not a mismatch"
+        );
+    }
+
+    #[test]
+    fn undo_of_an_add_removes_the_added_rule() {
+        // An add record carries only a `to` side; its undo removes the rule.
+        let tmp = tempfile::tempdir().unwrap();
+        let user = paths_in(tmp.path()).user.clone().unwrap();
+        write(&user, r#"{"permissions":{"allow":["C","A"]}}"#);
+        let rec = audit::Record::new(
+            audit::Kind::Add,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            None,
+            Some(side_at(Scope::User, &user, perms(&["C"]), perms(&["C", "A"]))),
+            vec![key("permissions"), key("allow"), idx(0)],
+            None,
+        );
+        let plan = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
+        apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
+        assert_eq!(
+            io_atomic::load(&user).unwrap().unwrap().permissions().allow,
+            vec!["C".to_string()],
         );
     }
 

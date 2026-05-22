@@ -252,10 +252,29 @@ export interface AppInfo {
 /**
  * Audit log entry kinds (#19). Mirrors Rust's `audit::Kind` — snake_case
  * wire strings pinned by `record_kind_serializes_to_snake_case_strings`
- * in commands.rs. `change_kind` is the same-scope reclassification flow;
- * the full set will grow as #16 / #17 / #18 land in future phases.
+ * in audit.rs. `change_kind` is the same-scope reclassification flow;
+ * `restore` is the meta-entry an undo / redo / restore-to-point writes
+ * (#124), with its payload in [[AuditRecordView]]`.restore`.
  */
-export type AuditKind = "move" | "change_kind" | "add" | "delete";
+export type AuditKind = "move" | "change_kind" | "add" | "delete" | "restore";
+
+/**
+ * Direction of a `restore` audit entry. Mirrors Rust's
+ * `audit::RestoreDirection`: `undo` / `redo` are cursor moves, `to_point`
+ * is a restore-to-point (#125).
+ */
+export type AuditRestoreDirection = "undo" | "redo" | "to_point";
+
+/**
+ * Payload of a `restore` audit entry (#124). Mirrors Rust's
+ * `audit::RestoreMeta`: the id of the entry acted on, the direction, and a
+ * per-file before/after snapshot of everything the restore rewrote.
+ */
+export interface AuditRestoreMeta {
+  target_id: string;
+  direction: AuditRestoreDirection;
+  files: AuditSide[];
+}
 
 /**
  * What shape of leaf the audit record's `path` targets. Mirrors Rust's
@@ -266,12 +285,11 @@ export type AuditKind = "move" | "change_kind" | "add" | "delete";
 export type AuditLeafKind = "top_level_key" | "permission_list" | "permission_rule";
 
 /**
- * Who triggered an audit record. Phase 1 only emits `gui`; the other
- * variants reserve wire-format slots for the CLI (#13) and undo / restore
- * (#19 phases 3-4) so the schema can extend without breaking older
- * History readers.
+ * Who triggered an audit record. Mirrors Rust's `audit::Actor`. Orthogonal
+ * to [[AuditKind]]: an undo run from the CLI is `actor: "cli"`,
+ * `kind: "restore"` — there is deliberately no `restore` actor.
  */
-export type AuditActor = "gui" | "cli" | "skill" | "restore";
+export type AuditActor = "gui" | "cli" | "skill";
 
 /**
  * One side of an audit record's write. Mirrors Rust's `audit::Side` —
@@ -304,8 +322,57 @@ export interface AuditRecordView {
   to?: AuditSide;
   path: PathSeg[];
   to_kind?: PermissionKind;
+  /** Present only on `kind: "restore"` entries — the undo / redo /
+   *  restore-to-point payload. */
+  restore?: AuditRestoreMeta;
   claude_scope_version: string;
   ts_ms: number;
+}
+
+/**
+ * One file's diff in a [[RestorePreview]]. Mirrors Rust's
+ * `RestoreSidePreview`. `key_current` / `key_target` follow the
+ * skip-on-absent convention: `undefined` means the key is unset, distinct
+ * from a literal JSON `null`.
+ */
+export interface RestoreSidePreview {
+  scope: Scope;
+  file_path: string;
+  file_path_exists: boolean;
+  top_level_key: string;
+  key_current?: JsonValue;
+  key_target?: JsonValue;
+  will_write: boolean;
+  /** True when the on-disk value differs from what the audit log expected
+   *  — the file was hand-edited since the logged op. The restore still
+   *  proceeds on confirm; this drives a warning band in the modal. */
+  state_mismatch: boolean;
+}
+
+/**
+ * Diff preview for an undo / redo / restore-to-point (#124 / #125).
+ * Returned by `audit_undo_preview` / `audit_redo_preview`. Mirrors Rust's
+ * `RestorePreview`.
+ */
+export interface RestorePreview {
+  direction: AuditRestoreDirection;
+  /** The audit entry being undone / redone / restored-to. */
+  target: AuditRecordView;
+  sides: RestoreSidePreview[];
+  /** How many ops the restore reverts: 1 for undo / redo. */
+  ops_spanned: number;
+}
+
+/**
+ * Undo / redo availability for the topbar buttons (#124). Returned by
+ * `audit_undo_status`. `undo` / `redo` carry the audit entry the next
+ * click would act on; `sequence_break` is true when redo is unavailable
+ * specifically because a change landed after the last undo.
+ */
+export interface UndoRedoStatus {
+  undo?: AuditRecordView;
+  redo?: AuditRecordView;
+  sequence_break: boolean;
 }
 
 /**

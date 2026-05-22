@@ -57,6 +57,11 @@ pub fn run(context: tauri::Context) {
             commands::load_runtime_info,
             commands::list_known_projects,
             commands::list_audit_records,
+            commands::audit_undo_status,
+            commands::audit_undo_preview,
+            commands::audit_redo_preview,
+            commands::audit_apply_undo,
+            commands::audit_apply_redo,
             commands::get_app_info,
         ])
         .run(context)

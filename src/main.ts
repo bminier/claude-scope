@@ -18,15 +18,18 @@ import type {
   PathSeg,
   PermissionKind,
   Preferences,
+  RestorePreview,
   RuntimeInfo,
   Scope,
   Theme,
+  UndoRedoStatus,
 } from "./types.ts";
 import { SCOPES, SEARCH_INPUT_ID } from "./types.ts";
 import {
   confirmAddLeaf,
   confirmDeleteLeaf,
   confirmMoveLeaf,
+  confirmRestore,
   openAbout,
   openHistory,
   openSettings,
@@ -56,6 +59,7 @@ const state: {
   runtime: RuntimeInfo;
   knownProjects: KnownProject[];
   appInfo: AppInfo | null;
+  undoStatus: UndoRedoStatus | null;
 } = {
   scopes: null,
   projectDir: null,
@@ -74,6 +78,10 @@ const state: {
   // discovery failure; `openAbout` renders a Loading… stub in that case
   // rather than treating it as an error.
   appInfo: null,
+  // Undo/redo availability (#124), refreshed by `refreshUndoStatus` after
+  // every load. Null until the first fetch resolves — the topbar buttons
+  // render disabled in the meantime.
+  undoStatus: null,
 };
 
 // Set by the scopes-changed listener when it fires while another load or
@@ -100,6 +108,10 @@ async function load(projectDir: string | null): Promise<void> {
     // Fire-and-forget — a stale list is purely cosmetic and self-heals on
     // the next successful load.
     refreshPreferences();
+    // Refresh undo/redo availability (#124): every move / add / delete /
+    // undo runs through load(), so this one call keeps the topbar
+    // buttons current after any write.
+    refreshUndoStatus();
   } catch (err) {
     alert(`Failed to load settings: ${err}`);
   } finally {
@@ -131,6 +143,19 @@ function refreshPreferences(): void {
     })
     .catch((err) => {
       console.warn("failed to refresh preferences:", err);
+    });
+}
+
+function refreshUndoStatus(): void {
+  invoke<UndoRedoStatus>("audit_undo_status")
+    .then((status) => {
+      state.undoStatus = status;
+      render();
+    })
+    .catch((err) => {
+      // Non-fatal: a failed status fetch just leaves the undo/redo
+      // buttons disabled until the next load retries.
+      console.warn("failed to read undo/redo status:", err);
     });
 }
 
@@ -331,6 +356,62 @@ async function addLeaf(req: AddLeafRequest, trigger?: HTMLElement): Promise<void
   }
 }
 
+/**
+ * Drive an undo or redo (#124): fetch the preview, route it through the
+ * restore-confirm modal, and on confirm apply it and reload. Shares the
+ * `moveInFlight` guard and deferred-reload drain with the move/add/delete
+ * flows so a write can't start mid-restore.
+ */
+async function runRestore(direction: "undo" | "redo", trigger?: HTMLElement): Promise<void> {
+  if (moveInFlight) return;
+  moveInFlight = true;
+  const label = direction === "undo" ? "Undo" : "Redo";
+  try {
+    let preview: RestorePreview;
+    try {
+      preview = await invoke<RestorePreview>(
+        direction === "undo" ? "audit_undo_preview" : "audit_redo_preview",
+      );
+    } catch (err) {
+      alert(`${label} failed: ${err}`);
+      return;
+    }
+
+    const apply = await confirmRestore(preview, trigger);
+    if (!apply) return;
+
+    state.busy = true;
+    render();
+    try {
+      // `expected_id` lets the backend refuse if the audit log moved since
+      // the preview (a concurrent CLI write) rather than acting on a
+      // different entry than the one the user just confirmed.
+      await invoke(direction === "undo" ? "audit_apply_undo" : "audit_apply_redo", {
+        expected_id: preview.target.id,
+      });
+      await load(state.projectDir);
+    } catch (err) {
+      alert(`${label} failed: ${err}`);
+      state.busy = false;
+      render();
+    }
+  } finally {
+    moveInFlight = false;
+    if (externalReloadPending && !state.busy) {
+      externalReloadPending = false;
+      void load(state.projectDir);
+    }
+  }
+}
+
+function handleUndo(trigger?: HTMLElement): void {
+  void runRestore("undo", trigger);
+}
+
+function handleRedo(trigger?: HTMLElement): void {
+  void runRestore("redo", trigger);
+}
+
 function setQuery(next: string): void {
   if (state.query === next) return;
   state.query = next;
@@ -474,9 +555,12 @@ function render(): void {
     preferences: state.preferences,
     runtime: state.runtime,
     knownProjects: state.knownProjects,
+    undoStatus: state.undoStatus,
     onPickProject: pickProject,
     onPickRecentProject: pickRecentProject,
     onReload: reload,
+    onUndo: handleUndo,
+    onRedo: handleRedo,
     onMoveLeaf: moveLeaf,
     onChangeKind: changeKind,
     onDeleteLeaf: deleteLeaf,
@@ -533,6 +617,36 @@ document.addEventListener("keydown", (e) => {
   e.preventDefault();
   search.focus();
   search.select();
+});
+
+// Ctrl+Z / Cmd+Z undo, Ctrl+Shift+Z / Cmd+Shift+Z redo (#124). Global, but
+// — like the "/" shortcut above — skipped while a text field is focused or
+// a modal is open, so we never steal a keystroke the user meant elsewhere.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "z" && e.key !== "Z") return;
+  // Require exactly the platform modifier; Alt+Ctrl+Z is left alone.
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  if (e.defaultPrevented) return;
+  const target = e.target as HTMLElement | null;
+  if (
+    target &&
+    (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
+  ) {
+    return;
+  }
+  if (document.querySelector(".modal-backdrop")) return;
+  // A load or move/restore in flight: drop the keystroke rather than queue
+  // a second overlapping flow.
+  if (moveInFlight || state.busy) return;
+  if (e.shiftKey) {
+    if (!state.undoStatus?.redo) return;
+    e.preventDefault();
+    handleRedo();
+  } else {
+    if (!state.undoStatus?.undo) return;
+    e.preventDefault();
+    handleUndo();
+  }
 });
 
 // The Rust watcher (`src-tauri/src/watcher.rs`) emits `scopes-changed` when
