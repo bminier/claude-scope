@@ -1,52 +1,63 @@
 set shell := ["bash", "-cu"]
 set windows-shell := ["cmd.exe", "/c"]
 
+# Recipe convention: bminier/home #92 / claude-scope #160.
+# `run` is intentionally omitted — `dev` is the canonical run for a Tauri app.
+
 default:
     @just --list
 
-# Install JS dependencies
-install:
+# Install all dependencies.
+setup:
     npm install
 
-# Run the Tauri app in dev mode
+# Run the Tauri app in dev mode (HMR).
 dev:
     npm run tauri dev
 
-# Run only the Vite dev server (no Tauri shell)
+# Vite dev server only (no Tauri shell) — handy for pure-UI work.
 web:
     npm run dev
 
-# Production build of the Tauri app
+# Production build of the Tauri app.
 build:
     npm run tauri build
 
-# Lint JS/TS with Biome
-lint:
+# --- lint / fmt / test ---------------------------------------------------
+
+js-lint:
     npm run lint
-
-# Format JS/TS with Biome
-fmt:
-    npm run format
-
-# Rust: format, clippy, test
-rs-fmt:
-    cargo fmt --manifest-path src-tauri/Cargo.toml
 
 rs-lint:
     cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+    cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+lint: js-lint rs-lint
+
+js-fmt:
+    npm run format
+
+rs-fmt:
+    cargo fmt --manifest-path src-tauri/Cargo.toml
+
+fmt: js-fmt rs-fmt
+alias format := fmt
+
+js-test:
+    npm run test:unit
 
 rs-test:
     cargo test --manifest-path src-tauri/Cargo.toml
 
-# JS/TS tests (runner not yet configured)
-test:
-    @echo "No JS test runner configured yet" && exit 1
+test: js-test rs-test
 
-# Run all checks (JS lint + Rust fmt/clippy/test)
-check: lint rs-lint rs-test
-    cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+check: lint test
 
-# Clean build artifacts
+# --- misc ----------------------------------------------------------------
+
+docs:
+    mdbook build docs
+
 clean:
-    rm -rf dist
+    rm -rf dist docs/book
     cargo clean --manifest-path src-tauri/Cargo.toml
