@@ -67,7 +67,18 @@ impl ScopePaths {
 /// entry takes precedence so that running from a sub-crate like `src-tauri/`
 /// still resolves to the repo root, even if that sub-crate happens to contain
 /// its own stray `.claude/`.
-pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
+///
+/// The real `$HOME` is **never** treated as a project root, regardless of
+/// whether it contains `.git` or `.claude/` — `~/.claude` is by definition
+/// the User scope's location, and a versioned-dotfiles `.git` at home would
+/// otherwise hijack the walk-up. `extra_home` is an additional path to skip
+/// on top of the real home — used by sandbox mode (#66) so a scratch `~`
+/// override is also exempt from project discovery, even when the start path
+/// lives inside it.
+pub fn find_project_root(
+    start: Option<&Path>,
+    extra_home: Option<&Path>,
+) -> std::io::Result<PathBuf> {
     // Normalize to an absolute path so the walk-up terminates at the real
     // filesystem root. A relative `start` would otherwise `.pop()` down to
     // an empty relative path, and joining `.git` onto that would probe
@@ -78,6 +89,11 @@ pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
         None => std::env::current_dir()?,
     };
 
+    let real_home = dirs::home_dir();
+    let is_home = |p: &Path| {
+        real_home.as_deref().is_some_and(|h| p == h) || extra_home.is_some_and(|h| p == h)
+    };
+
     // .git may be a directory (normal repo) or a file (worktree / submodule),
     // so check existence rather than is_dir(). try_exists() distinguishes
     // "not found" from real I/O errors (e.g., permission denied) — the former
@@ -85,7 +101,7 @@ pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
     // through to .claude/start.
     let mut cursor = start.clone();
     loop {
-        if cursor.join(".git").try_exists()? {
+        if !is_home(&cursor) && cursor.join(".git").try_exists()? {
             return Ok(cursor);
         }
         if !cursor.pop() {
@@ -95,14 +111,16 @@ pub fn find_project_root(start: Option<&Path>) -> std::io::Result<PathBuf> {
 
     let mut cursor = start.clone();
     loop {
-        // Mirror the `.git` pass: ENOENT keeps walking, genuine I/O errors
-        // propagate. We need metadata() (not try_exists()) so we can also
-        // reject a `.claude` that's a regular file.
-        match cursor.join(".claude").metadata() {
-            Ok(md) if md.is_dir() => return Ok(cursor),
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+        if !is_home(&cursor) {
+            // Mirror the `.git` pass: ENOENT keeps walking, genuine I/O errors
+            // propagate. We need metadata() (not try_exists()) so we can also
+            // reject a `.claude` that's a regular file.
+            match cursor.join(".claude").metadata() {
+                Ok(md) if md.is_dir() => return Ok(cursor),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
         if !cursor.pop() {
             // Reached filesystem root without finding .git or .claude; fall
@@ -127,10 +145,12 @@ pub fn resolve_with_home(
     start: Option<&Path>,
     home_override: Option<&Path>,
 ) -> std::io::Result<ScopePaths> {
-    let project_dir = find_project_root(start)?;
+    // Walk-up always skips real $HOME implicitly; only pass the sandbox
+    // override here, and only when it's distinct from real $HOME.
+    let project_dir = find_project_root(start, home_override)?;
+    let home = home_override.map(Path::to_path_buf).or_else(dirs::home_dir);
     let local = Some(project_dir.join(".claude").join("settings.local.json"));
     let project = Some(project_dir.join(".claude").join("settings.json"));
-    let home = home_override.map(Path::to_path_buf).or_else(dirs::home_dir);
     let user_local = home
         .as_ref()
         .map(|h| h.join(".claude").join("settings.local.json"));
@@ -172,7 +192,7 @@ mod tests {
         // tempdir lives under /var which resolves to /private/var via a
         // filesystem-level symlink.
         let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
-        let got = canon(find_project_root(Some(&nested)).unwrap());
+        let got = canon(find_project_root(Some(&nested), None).unwrap());
         let want = canon(tmp.path().to_path_buf());
         assert_eq!(got, want);
     }
@@ -188,7 +208,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
         std::fs::create_dir_all(sub.join(".claude")).unwrap();
         let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
-        let got = canon(find_project_root(Some(&sub)).unwrap());
+        let got = canon(find_project_root(Some(&sub), None).unwrap());
         let want = canon(tmp.path().to_path_buf());
         assert_eq!(got, want);
     }
@@ -204,7 +224,7 @@ mod tests {
         std::fs::write(tmp.path().join(".git"), "gitdir: ../.git/modules/repo\n").unwrap();
         std::fs::create_dir_all(sub.join(".claude")).unwrap();
         let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
-        let got = canon(find_project_root(Some(&sub)).unwrap());
+        let got = canon(find_project_root(Some(&sub), None).unwrap());
         let want = canon(tmp.path().to_path_buf());
         assert_eq!(got, want);
     }
@@ -214,7 +234,41 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
-        let got = find_project_root(Some(&nested)).unwrap();
+        let got = find_project_root(Some(&nested), None).unwrap();
+        assert_eq!(got, nested);
+    }
+
+    #[test]
+    fn walks_past_home_with_dot_claude() {
+        // Regression: when the user's home contains `.claude/` (the User
+        // scope), the walk-up must NOT lock onto home as the project root.
+        // Build a fake home that sits as an ancestor of the start path,
+        // plant a `.claude/` inside it, and verify find_project_root walks
+        // past it. Mirrors Brian's real Windows setup where $HOME has
+        // .claude/ and tempdirs live under $HOME.
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path().join("home");
+        let nested = fake_home.join("work").join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(fake_home.join(".claude")).unwrap();
+
+        let got = find_project_root(Some(&nested), Some(&fake_home)).unwrap();
+        // No .git or .claude anywhere except inside home (which is skipped),
+        // so the walker falls back to the start path.
+        assert_eq!(got, nested);
+    }
+
+    #[test]
+    fn walks_past_home_with_dot_git() {
+        // Same guarantee for `.git` at home: a versioned dotfiles repo at
+        // $HOME must not hijack project discovery.
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path().join("home");
+        let nested = fake_home.join("work").join("a");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(fake_home.join(".git")).unwrap();
+
+        let got = find_project_root(Some(&nested), Some(&fake_home)).unwrap();
         assert_eq!(got, nested);
     }
 
@@ -238,7 +292,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
 
-        let got = find_project_root(Some(Path::new("work"))).unwrap();
+        let got = find_project_root(Some(Path::new("work")), None).unwrap();
         assert!(
             got.is_absolute(),
             "expected absolute path, got relative: {got:?}"
