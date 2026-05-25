@@ -2186,55 +2186,79 @@ pub fn apply_restore_plan(
     backups: Option<&BackupTracker>,
     watch: &WatchState,
 ) -> Result<Vec<audit::Side>, Box<dyn std::error::Error>> {
-    /// Everything needed to write one file and, if a later file fails, to
-    /// roll this one back. `pending[i]` lines up with `plan.targets[i]`.
-    struct Pending {
+    /// One unique file's combined write. Multiple plan targets that
+    /// share `file_path` (different `top_level_key`s) coalesce into
+    /// the same `FileWrite` — its `new_doc` accumulates every key's
+    /// restored value, then a single save persists the combined
+    /// result. Without this coalescing, two targets on the same file
+    /// each issued their own save against the original stamp; the
+    /// second save would either hit `ConcurrentModification` (because
+    /// the first save changed the file) or, on coarse-mtime filesystems,
+    /// overwrite the first key's restoration with a stale doc. See
+    /// codex 4th-pass [P1].
+    struct FileWrite {
         path: PathBuf,
         existed: bool,
         original: SettingsDoc,
         stamp: FileStamp,
         new_doc: SettingsDoc,
-        before_key: Option<serde_json::Value>,
     }
 
-    // Phase 1 — load + compute. No disk writes here, so a failure to read
-    // any target aborts the whole batch with nothing on disk touched.
-    let mut pending: Vec<Pending> = Vec::with_capacity(plan.targets.len());
+    // Phase 1 — load + accumulate per-file mutations. The first time we
+    // see a file_path, load it; every subsequent target on the same
+    // file just mutates the in-progress new_doc. Preserves first-seen
+    // file order so phase 2 writes in plan order.
+    let mut writes: Vec<FileWrite> = Vec::new();
+    let mut file_idx: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
     for t in &plan.targets {
-        let (loaded, stamp) = io_atomic::load_with_stamp(&t.file_path)?;
-        let existed = loaded.is_some();
-        let original = loaded.unwrap_or_else(SettingsDoc::empty);
-        let before_key = original.get_top_level(&t.top_level_key).cloned();
-        let mut new_doc = original.clone();
-        match &t.target_value {
-            Some(v) => new_doc.set_top_level(&t.top_level_key, v.clone()),
+        let idx = match file_idx.get(&t.file_path) {
+            Some(&i) => i,
             None => {
-                new_doc.remove_at_path(&[PathSeg::Key(t.top_level_key.clone())]);
+                let (loaded, stamp) = io_atomic::load_with_stamp(&t.file_path)?;
+                let existed = loaded.is_some();
+                let original = loaded.unwrap_or_else(SettingsDoc::empty);
+                let new_doc = original.clone();
+                let i = writes.len();
+                file_idx.insert(t.file_path.clone(), i);
+                writes.push(FileWrite {
+                    path: t.file_path.clone(),
+                    existed,
+                    original,
+                    stamp,
+                    new_doc,
+                });
+                i
+            }
+        };
+        let fw = &mut writes[idx];
+        match &t.target_value {
+            Some(v) => fw.new_doc.set_top_level(&t.top_level_key, v.clone()),
+            None => {
+                fw.new_doc
+                    .remove_at_path(&[PathSeg::Key(t.top_level_key.clone())]);
             }
         }
-        pending.push(Pending {
-            path: t.file_path.clone(),
-            existed,
-            original,
-            stamp,
-            new_doc,
-            before_key,
-        });
     }
 
-    // Phase 2 — write. Track which files landed so a mid-batch failure
-    // rolls them back: same posture as `apply_move_leaf_impl`'s two-file
-    // dance, generalized to N files.
+    // Phase 2 — write each unique file once. Skip a file whose
+    // accumulated new_doc matches its original on every key the plan
+    // touched (no key actually moved — e.g. every per-key target was
+    // a no-op against current disk).
     let mut written: Vec<usize> = Vec::new();
-    for (i, p) in pending.iter().enumerate() {
-        // Skip a file already at the target value — no point churning the
-        // watcher or dropping a `.bak` for a zero-delta write.
-        if p.before_key == plan.targets[i].target_value {
+    for (i, fw) in writes.iter().enumerate() {
+        let no_change = plan.targets.iter().all(|t| {
+            if t.file_path != fw.path {
+                return true;
+            }
+            let before = fw.original.get_top_level(&t.top_level_key).cloned();
+            before == t.target_value
+        });
+        if no_change {
             continue;
         }
-        if let Err(write_err) = io_atomic::save(&p.path, &p.new_doc, backups, Some(&p.stamp)) {
+        if let Err(write_err) = io_atomic::save(&fw.path, &fw.new_doc, backups, Some(&fw.stamp)) {
             for &w in written.iter().rev() {
-                let pw = &pending[w];
+                let pw = &writes[w];
                 let rollback: Result<(), Box<dyn std::error::Error>> = if pw.existed {
                     io_atomic::save(&pw.path, &pw.original, backups, None).map_err(Into::into)
                 } else {
@@ -2244,7 +2268,7 @@ pub fn apply_restore_plan(
                     return Err(format!(
                         "restore write of {} failed: {write_err}; \
                          rolling back {} also failed: {rollback_err}",
-                        p.path.display(),
+                        fw.path.display(),
                         pw.path.display()
                     )
                     .into());
@@ -2253,27 +2277,36 @@ pub fn apply_restore_plan(
             }
             return Err(format!(
                 "restore write of {} failed — all earlier files rolled back: {write_err}",
-                p.path.display()
+                fw.path.display()
             )
             .into());
         }
-        watch.note_self_write(&p.path);
+        watch.note_self_write(&fw.path);
         written.push(i);
     }
 
-    // The audit Sides describe what each file held before vs after. Built
-    // for every target, including no-op ones, so undoing this restore has
-    // a complete picture.
+    // Phase 3 — produce one audit Side per plan target, with per-key
+    // before/after values pulled from the matching FileWrite. The
+    // returned Sides line up 1:1 with `plan.targets`, even when two
+    // targets share a file_path — each Side reports its own
+    // top-level-key transition.
     Ok(plan
         .targets
         .iter()
-        .zip(&pending)
-        .map(|(t, p)| audit::Side {
-            scope: t.scope,
-            file_path: t.file_path.clone(),
-            top_level_key: t.top_level_key.clone(),
-            key_before: p.before_key.clone(),
-            key_after: t.target_value.clone(),
+        .map(|t| {
+            let idx = file_idx
+                .get(&t.file_path)
+                .expect("every target was inserted in phase 1");
+            let fw = &writes[*idx];
+            let key_before = fw.original.get_top_level(&t.top_level_key).cloned();
+            let key_after = fw.new_doc.get_top_level(&t.top_level_key).cloned();
+            audit::Side {
+                scope: t.scope,
+                file_path: t.file_path.clone(),
+                top_level_key: t.top_level_key.clone(),
+                key_before,
+                key_after,
+            }
         })
         .collect())
 }
@@ -3622,6 +3655,63 @@ mod tests {
             key_before: Some(before),
             key_after: Some(after),
         }
+    }
+
+    #[test]
+    fn apply_restore_plan_coalesces_two_targets_in_one_file() {
+        // Regression for codex 4th-pass [P1]. Two restore targets on
+        // the same file (different top-level keys) used to load the
+        // file twice from the same stamp and save twice; the second
+        // save tripped ConcurrentModification (or, worse, overwrote
+        // the first key's restore on coarse-mtime filesystems). The
+        // fix loads once per file and accumulates per-key mutations
+        // into a single new_doc + a single save.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = paths_in(tmp.path()).project.clone().unwrap();
+        // Current on-disk state — both keys present in their
+        // post-change form.
+        write(
+            &project,
+            r#"{"env":{"X":"1","Y":"2"},"permissions":{"allow":["A"]}}"#,
+        );
+
+        let plan = RestorePlan {
+            direction: audit::RestoreDirection::ToPoint,
+            target_id: Ulid::new(),
+            leaf_kind: audit::LeafKind::PermissionRule,
+            project_dir: None,
+            path: vec![],
+            ops_spanned: 2,
+            targets: vec![
+                RestoreTarget {
+                    scope: Scope::Project,
+                    file_path: project.clone(),
+                    top_level_key: "env".to_string(),
+                    target_value: Some(serde_json::json!({"X": "1"})),
+                    expected_current: Some(serde_json::json!({"X": "1", "Y": "2"})),
+                },
+                RestoreTarget {
+                    scope: Scope::Project,
+                    file_path: project.clone(),
+                    top_level_key: "permissions".to_string(),
+                    target_value: Some(serde_json::json!({"allow": []})),
+                    expected_current: Some(serde_json::json!({"allow": ["A"]})),
+                },
+            ],
+        };
+
+        let sides = apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
+        // Both Sides returned, in plan order, each carrying its own
+        // key's before/after.
+        assert_eq!(sides.len(), 2);
+        assert_eq!(sides[0].top_level_key, "env");
+        assert_eq!(sides[1].top_level_key, "permissions");
+
+        // The file holds BOTH restored keys, not just one of them.
+        let on_disk = std::fs::read_to_string(&project).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(v["env"], serde_json::json!({"X": "1"}));
+        assert_eq!(v["permissions"], serde_json::json!({"allow": []}));
     }
 
     #[test]
