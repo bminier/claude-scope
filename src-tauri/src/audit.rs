@@ -475,6 +475,19 @@ impl Drop for AuditLock {
 /// alongside the records so a caller can surface "N entries unreadable"
 /// rather than silently swallowing data.
 pub fn read_all(home: Option<&Path>) -> io::Result<(Vec<Record>, usize)> {
+    // Hold the same advisory lock writers take in `persist`, so a
+    // rotation can't slip between our archive enumeration and the
+    // active-log read (codex second-pass [P2]). A rotation that lands
+    // in that window would rename the active file into an archive that
+    // wasn't in our enumerated list — the record would be invisible to
+    // this call until the next read. Holding the lock keeps the
+    // archives+active pair consistent.
+    //
+    // The lock is best-effort: if it can't be acquired (no home dir,
+    // permission error), we fall through to an unlocked read. That's
+    // the same fail-open posture writers take.
+    let _lock = AuditLock::acquire(home).ok().flatten();
+
     let mut records = Vec::new();
     let mut skipped = 0usize;
     for archive in audit_archives(home)? {
@@ -521,8 +534,51 @@ fn audit_archives(home: Option<&Path>) -> io::Result<Vec<PathBuf>> {
             archives.push(path);
         }
     }
-    archives.sort();
+    // Sort by (year-month, collision-suffix-as-integer) instead of pure
+    // lexicographic. Plain lex order puts `audit-2026-05-10.jsonl`
+    // *before* `audit-2026-05-2.jsonl`, which would replay records out
+    // of causal order once ten same-month rotations land. Parsing the
+    // suffix numerically keeps history monotonic.
+    archives.sort_by_cached_key(|p| {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        archive_sort_key(name)
+    });
     Ok(archives)
+}
+
+/// Sort key for an `audit-YYYY-MM[-N].jsonl` archive filename:
+/// `(YYYY-MM string, N as integer)`. The base archive (no suffix)
+/// sorts as `N=1` so it comes before any collision suffix
+/// (`audit-YYYY-MM-2.jsonl` and beyond). Names that don't match the
+/// pattern fall to the end with `N=u32::MAX`, which keeps them
+/// deterministic without claiming they were chronologically first.
+fn archive_sort_key(name: &str) -> (String, u32) {
+    // Strip the `audit-` prefix and `.jsonl` suffix; what's left is
+    // either `YYYY-MM` or `YYYY-MM-N`.
+    let stem = name
+        .strip_prefix("audit-")
+        .and_then(|s| s.strip_suffix(".jsonl"))
+        .unwrap_or("");
+    // Try `YYYY-MM-N` first: split on the LAST `-` and parse the tail.
+    if let Some((head, tail)) = stem.rsplit_once('-') {
+        if let Ok(n) = tail.parse::<u32>() {
+            // Tail parsed as a number — but only treat it as a
+            // collision suffix when the head still looks like
+            // `YYYY-MM` (7 chars, digits + one dash). Otherwise the
+            // whole stem is a bare year-month with a hyphen inside
+            // (e.g. `2026-05`).
+            if head.len() == 7 && head.as_bytes().get(4) == Some(&b'-') {
+                return (head.to_string(), n);
+            }
+        }
+    }
+    // Bare `YYYY-MM` form — treat as collision index 1 so it sorts
+    // before the `-2`, `-3`, … siblings.
+    if stem.len() == 7 && stem.as_bytes().get(4) == Some(&b'-') {
+        return (stem.to_string(), 1);
+    }
+    // Unrecognized shape; park at the end deterministically.
+    (stem.to_string(), u32::MAX)
 }
 
 /// Read records + skipped count from a single audit-log file. Factored
@@ -1424,6 +1480,43 @@ mod tests {
                 "spawned record {id:?} not retrievable from read_all"
             );
         }
+    }
+
+    #[test]
+    fn archive_sort_key_orders_collision_suffixes_numerically() {
+        // Regression for codex 2nd-pass [P2]: lex sort puts
+        // `audit-2026-05-10.jsonl` before `audit-2026-05-2.jsonl`,
+        // which would replay records out of causal order with ten or
+        // more same-month rotations. The numeric-suffix key fixes it.
+        let mut names = vec![
+            "audit-2026-05-10.jsonl",
+            "audit-2026-05.jsonl",
+            "audit-2026-05-2.jsonl",
+            "audit-2026-04.jsonl",
+            "audit-2026-05-9.jsonl",
+            "audit-2026-05-11.jsonl",
+        ];
+        names.sort_by_cached_key(|n| archive_sort_key(n));
+        assert_eq!(
+            names,
+            vec![
+                "audit-2026-04.jsonl",   // older month first
+                "audit-2026-05.jsonl",   // base file (suffix 1)
+                "audit-2026-05-2.jsonl", // then numeric suffixes …
+                "audit-2026-05-9.jsonl",
+                "audit-2026-05-10.jsonl", // -10 sorts AFTER -9, not before -2
+                "audit-2026-05-11.jsonl",
+            ]
+        );
+    }
+
+    #[test]
+    fn archive_sort_key_parks_unknown_shapes_deterministically() {
+        // Unrecognized shapes still need a stable position. Park them
+        // at the end via u32::MAX rather than mixing with parseable
+        // archives.
+        let key = archive_sort_key("audit-garbage.jsonl");
+        assert_eq!(key.1, u32::MAX);
     }
 
     #[test]
