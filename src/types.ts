@@ -102,6 +102,15 @@ export interface AddLeafRequest {
  */
 export interface MoveOptions {
   skipConfirm?: boolean;
+  /**
+   * Override the active project root for this single move. The Move-to
+   * submenu (#111) lets a user redirect a rule into a *different*
+   * project's `local` or `project` scope; without this override the
+   * dispatch would silently use `state.projectDir` and land the write
+   * in the currently-open project's settings instead of the chosen
+   * one. See codex 6th-pass [P1].
+   */
+  projectDir?: string;
 }
 
 /**
