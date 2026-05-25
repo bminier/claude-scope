@@ -19,8 +19,8 @@ use claude_scope_lib::audit::{self, Record as AuditRecord};
 use claude_scope_lib::commands::{
     apply_move_leaf_impl, apply_restore_plan, audit_leaf_kind, audit_side, build_loaded,
     build_restore_plan, diff_move_leaf_impl, persist_audit_record, plan_restore_to,
-    preview_restore_plan, restore_record, AuditLogPage, AuditRecordView, MoveLeafPreview,
-    MoveLeafRequest, RestorePlan, RestorePreview,
+    preview_restore_plan, restore_record, validate_audit_records, AuditLogPage, AuditRecordView,
+    MoveLeafPreview, MoveLeafRequest, RestorePlan, RestorePreview,
 };
 use claude_scope_lib::io_atomic::{self, BackupTracker};
 use claude_scope_lib::model::{PathSeg, PermissionKind};
@@ -769,12 +769,15 @@ fn cmd_move(
 
     // Build and persist the audit record. CLI move is always
     // `Kind::Move` today — no change-kind path is exposed at the
-    // command line (#8 is GUI-only).
+    // command line (#8 is GUI-only). `project_dir` is required for
+    // the #183 path allowlist: without it, undo/redo/restore would
+    // refuse the record because they couldn't resolve the legitimate
+    // scope set. Closes #180 alongside the security fix.
     let record = audit::Record::new(
         audit::Kind::Move,
         audit_leaf_kind(&req.path),
         audit::Actor::Cli,
-        None,
+        Some(paths.project_dir.clone()),
         audit_side(
             req.from,
             from_file.as_deref(),
@@ -1029,6 +1032,11 @@ fn cmd_undo(
     let target = audit::undo_redo_state(&records)
         .undoable
         .ok_or("nothing to undo")?;
+    // Audit-log boundary check (#183). Refuse any record whose Side
+    // points outside the legitimate scope allowlist for its
+    // project_dir, so a hostile log line can't drive the apply path
+    // into writing attacker JSON to an attacker-chosen file.
+    validate_audit_records(std::slice::from_ref(&target), home)?;
     let plan = build_restore_plan(&target, audit::RestoreDirection::Undo)?;
     run_cli_restore(home, &plan, &target, expected_tail_id, dry_run, yes, json)
 }
@@ -1046,6 +1054,7 @@ fn cmd_redo(
         return Err("redo is unavailable: a change was made after the last undo".into());
     }
     let target = state.redoable.ok_or("nothing to redo")?;
+    validate_audit_records(std::slice::from_ref(&target), home)?;
     let plan = build_restore_plan(&target, audit::RestoreDirection::Redo)?;
     run_cli_restore(home, &plan, &target, expected_tail_id, dry_run, yes, json)
 }
@@ -1060,12 +1069,14 @@ fn cmd_restore(
     let records = read_audit_log(home)?;
     let expected_tail_id = records.last().map(|r| r.id);
     let target_id = resolve_entry_id(&records, id)?;
-    let plan = plan_restore_to(&records, target_id)?;
-    let target = records
+    let target_idx = records
         .iter()
-        .find(|r| r.id == target_id)
-        .expect("plan_restore_to verified the id is in the log")
-        .clone();
+        .position(|r| r.id == target_id)
+        .ok_or("target audit entry not found in the log")?;
+    // Validate the entire window (#183).
+    validate_audit_records(&records[target_idx..], home)?;
+    let plan = plan_restore_to(&records, target_id)?;
+    let target = records[target_idx].clone();
     run_cli_restore(home, &plan, &target, expected_tail_id, dry_run, yes, json)
 }
 
@@ -1820,9 +1831,14 @@ mod tests {
     }
 
     /// A logged move of `Bash(ls)` from `project` to `user`, with
-    /// before/after snapshots — the shape `cmd_undo` reads.
-    fn logged_move(project: &Path, user: &Path) -> Record {
+    /// before/after snapshots — the shape `cmd_undo` reads. The
+    /// `project_dir` argument scopes the record so the #183 path
+    /// allowlist accepts the `project` file_path; pre-validator the
+    /// helper left project_dir = None which now (correctly) fails
+    /// the security gate.
+    fn logged_move(project_dir: &Path, project: &Path, user: &Path) -> Record {
         let mut rec = make_audit_record(Kind::Move, LeafKind::PermissionRule);
+        rec.project_dir = Some(project_dir.to_path_buf());
         rec.path = vec![
             PathSeg::Key("permissions".into()),
             PathSeg::Key("allow".into()),
@@ -1854,7 +1870,11 @@ mod tests {
         // Files at their post-move state: the rule has moved Project → User.
         write_file(&project, r#"{"permissions":{"allow":[]}}"#);
         write_file(&user, r#"{"permissions":{"allow":["Bash(ls)"]}}"#);
-        audit_lib::append(&logged_move(&project, &user), Some(home)).unwrap();
+        audit_lib::append(
+            &logged_move(&tmp.path().join("proj"), &project, &user),
+            Some(home),
+        )
+        .unwrap();
 
         // `--yes` skips the prompt; not a dry run.
         cmd_undo(Some(home), false, true, false).unwrap();
@@ -1881,7 +1901,11 @@ mod tests {
         let user = home.join(".claude/settings.json");
         write_file(&project, r#"{"permissions":{"allow":[]}}"#);
         write_file(&user, r#"{"permissions":{"allow":["Bash(ls)"]}}"#);
-        audit_lib::append(&logged_move(&project, &user), Some(home)).unwrap();
+        audit_lib::append(
+            &logged_move(&tmp.path().join("proj"), &project, &user),
+            Some(home),
+        )
+        .unwrap();
 
         cmd_undo(Some(home), true, true, false).unwrap();
 
@@ -1911,7 +1935,7 @@ mod tests {
         write_file(&project, r#"{"permissions":{"allow":[]}}"#);
         write_file(&user, r#"{"permissions":{"allow":["Bash(ls)"]}}"#);
         // move → undo(move) → another move = a sequence break.
-        let m1 = logged_move(&project, &user);
+        let m1 = logged_move(&tmp.path().join("proj"), &project, &user);
         let undo = Record::new_restore(
             LeafKind::PermissionRule,
             Actor::Gui,
@@ -1923,7 +1947,7 @@ mod tests {
                 files: vec![],
             },
         );
-        let m2 = logged_move(&project, &user);
+        let m2 = logged_move(&tmp.path().join("proj"), &project, &user);
         for rec in [&m1, &undo, &m2] {
             audit_lib::append(rec, Some(home)).unwrap();
         }
