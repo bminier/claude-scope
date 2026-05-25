@@ -3457,6 +3457,44 @@ mod tests {
     }
 
     #[test]
+    fn apply_change_kind_same_scope_returns_audit_outcome() {
+        // Regression for #182. The same-scope change-kind path populates all
+        // four LeafApplyOutcome fields from a single load (one file is both
+        // `from` and `to`), so a refactor that swapped `key_before` /
+        // `key_after` on any of the four assignments would leave on-disk
+        // state correct but feed wrong values into the audit log — a later
+        // undo would then restore the post-change state. The two existing
+        // tests assert on disk only; this one reads back the outcome.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = paths.project.clone().unwrap();
+        write(
+            &project,
+            r#"{"permissions":{"allow":["Bash(git status)"]}}"#,
+        );
+
+        let req = MoveLeafRequest {
+            path: vec![key("permissions"), key("allow"), idx(0)],
+            from: Scope::Project,
+            to: Scope::Project,
+            to_kind: Some(PermissionKind::Deny),
+        };
+        let outcome = apply_move_leaf_impl(&paths, &req, None, &WatchState::default()).unwrap();
+
+        // Same-scope: from_* and to_* describe the same file, before/after
+        // the in-memory mutation. The two pre-write captures should be
+        // equal, the two post-write captures should be equal, and the
+        // pair should differ from each other.
+        let before = serde_json::json!({"allow": ["Bash(git status)"]});
+        let after = serde_json::json!({"allow": [], "deny": ["Bash(git status)"]});
+        assert_eq!(outcome.from_before, Some(before.clone()));
+        assert_eq!(outcome.to_before, Some(before));
+        assert_eq!(outcome.from_after, Some(after.clone()));
+        assert_eq!(outcome.to_after, Some(after));
+        assert_ne!(outcome.from_before, outcome.from_after);
+    }
+
+    #[test]
     fn apply_add_leaf_impl_idempotent_returns_equal_before_after() {
         // Regression for #172 (companion to #169). When the rule is
         // already present at the destination, the impl returns an
