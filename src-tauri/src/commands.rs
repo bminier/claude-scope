@@ -1833,9 +1833,16 @@ pub fn build_restore_plan(
     }
     let mut targets: Vec<RestoreTarget> = Vec::new();
     for s in sides {
-        // A same-scope change-kind records its one file as both `from` and
-        // `to`; collapse the duplicate so the file is written once.
-        if targets.iter().any(|t| t.file_path == s.file_path) {
+        // Dedupe on (file_path, top_level_key) — a same-scope change-kind
+        // records its one file under one top-level key as both `from` and
+        // `to`, which should collapse; but two sides on the same file
+        // touching *different* top-level keys are independent targets and
+        // must each survive. Keying on file_path alone (the pre-fix shape)
+        // silently dropped the second key — see #167.
+        if targets
+            .iter()
+            .any(|t| t.file_path == s.file_path && t.top_level_key == s.top_level_key)
+        {
             continue;
         }
         let (target_value, expected_current) = if undo {
@@ -1888,22 +1895,30 @@ pub fn plan_restore_to(
         );
     }
     let window = &records[target_idx..];
-    // Preserve first-seen file order so the plan (and the modal) list files
+    // Preserve first-seen order so the plan (and the modal) list targets
     // in a stable, log-driven order rather than hash order.
-    let mut order: Vec<PathBuf> = Vec::new();
-    let mut by_path: std::collections::HashMap<PathBuf, RestoreTarget> =
+    //
+    // Key on (file_path, top_level_key): a window can touch two different
+    // top-level keys in the same settings.json (e.g. an `env` change
+    // followed by a `permissions` change), and each (file, key) pair is
+    // an independent restore target. Keying on file_path alone silently
+    // dropped the second key — see #163.
+    type RestoreKey = (PathBuf, String);
+    let mut order: Vec<RestoreKey> = Vec::new();
+    let mut by_key: std::collections::HashMap<RestoreKey, RestoreTarget> =
         std::collections::HashMap::new();
     for entry in window {
         for s in record_sides(entry) {
-            match by_path.get_mut(&s.file_path) {
+            let map_key: RestoreKey = (s.file_path.clone(), s.top_level_key.clone());
+            match by_key.get_mut(&map_key) {
                 // Already seen: keep the first `key_before` (window-start
-                // state) and advance `expected_current` to this later
-                // `key_after`.
+                // state for this key) and advance `expected_current` to
+                // this later `key_after`.
                 Some(existing) => existing.expected_current = s.key_after.clone(),
                 None => {
-                    order.push(s.file_path.clone());
-                    by_path.insert(
-                        s.file_path.clone(),
+                    order.push(map_key.clone());
+                    by_key.insert(
+                        map_key,
                         RestoreTarget {
                             scope: s.scope,
                             file_path: s.file_path.clone(),
@@ -1918,7 +1933,7 @@ pub fn plan_restore_to(
     }
     let targets: Vec<RestoreTarget> = order
         .into_iter()
-        .map(|p| by_path.remove(&p).expect("path inserted above"))
+        .map(|k| by_key.remove(&k).expect("key inserted above"))
         .collect();
     if targets.is_empty() {
         return Err("nothing to restore — the spanned entries touched no files".into());
@@ -3290,6 +3305,168 @@ mod tests {
     fn restore_to_point_rejects_an_unknown_target() {
         let err = plan_restore_to(&[], Ulid::new()).unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    /// Helper for the multi-key dedupe regression tests below: build a Side
+    /// with a caller-supplied `top_level_key` so we can synthesize records
+    /// that touch two keys in one file (the case #163 / #167 exposed).
+    fn side_at_key(
+        scope: Scope,
+        path: &Path,
+        top_level_key: &str,
+        before: serde_json::Value,
+        after: serde_json::Value,
+    ) -> audit::Side {
+        audit::Side {
+            scope,
+            file_path: path.to_path_buf(),
+            top_level_key: top_level_key.to_string(),
+            key_before: Some(before),
+            key_after: Some(after),
+        }
+    }
+
+    #[test]
+    fn build_restore_plan_keeps_two_keys_in_one_file_as_distinct_targets() {
+        // Regression for #167. A single record whose `from` and `to` sides
+        // reference the same settings.json under different top-level keys
+        // must produce two restore targets — the pre-fix dedupe keyed on
+        // file_path alone collapsed the second one silently.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = paths_in(tmp.path()).project.clone().unwrap();
+        let rec = audit::Record::new(
+            audit::Kind::Move,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            Some(side_at_key(
+                Scope::Project,
+                &project,
+                "permissions",
+                perms(&["A"]),
+                perms(&[]),
+            )),
+            Some(side_at_key(
+                Scope::Project,
+                &project,
+                "env",
+                serde_json::json!({"FOO": "1"}),
+                serde_json::json!({"FOO": "1", "BAR": "2"}),
+            )),
+            vec![key("permissions"), key("allow"), idx(0)],
+            None,
+        );
+        let plan = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
+        assert_eq!(
+            plan.targets.len(),
+            2,
+            "both top-level keys should survive the dedupe"
+        );
+        let keys: Vec<&str> = plan
+            .targets
+            .iter()
+            .map(|t| t.top_level_key.as_str())
+            .collect();
+        assert!(keys.contains(&"permissions"));
+        assert!(keys.contains(&"env"));
+    }
+
+    #[test]
+    fn build_restore_plan_still_collapses_same_file_same_key() {
+        // The pre-fix dedupe existed for a real reason: a same-scope
+        // change-kind records its one (file, key) tuple as both `from` and
+        // `to`. Keep that case collapsed.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = paths_in(tmp.path()).project.clone().unwrap();
+        let rec = audit::Record::new(
+            audit::Kind::ChangeKind,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            Some(side_at(
+                Scope::Project,
+                &project,
+                serde_json::json!({"allow": ["A"], "deny": []}),
+                serde_json::json!({"allow": [], "deny": ["A"]}),
+            )),
+            Some(side_at(
+                Scope::Project,
+                &project,
+                serde_json::json!({"allow": ["A"], "deny": []}),
+                serde_json::json!({"allow": [], "deny": ["A"]}),
+            )),
+            vec![key("permissions"), key("allow"), idx(0)],
+            Some(PermissionKind::Deny),
+        );
+        let plan = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
+        assert_eq!(plan.targets.len(), 1, "same (file, key) must collapse");
+    }
+
+    #[test]
+    fn plan_restore_to_keeps_two_keys_in_one_file_as_distinct_targets() {
+        // Regression for #163. A restore window that touches the same
+        // settings.json under two different top-level keys must produce
+        // two targets — the pre-fix HashMap<PathBuf, _> dropped the
+        // second key's `top_level_key`/`target_value` on the floor.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = paths_in(tmp.path()).project.clone().unwrap();
+        // Two consecutive ops on the same file under different keys.
+        let r_env = audit::Record::new(
+            audit::Kind::Move,
+            audit::LeafKind::TopLevelKey,
+            audit::Actor::Gui,
+            None,
+            Some(side_at_key(
+                Scope::Project,
+                &project,
+                "env",
+                serde_json::json!({"FOO": "1"}),
+                serde_json::json!({"FOO": "1", "BAR": "2"}),
+            )),
+            None,
+            vec![key("env")],
+            None,
+        );
+        let r_perms = audit::Record::new(
+            audit::Kind::Move,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            Some(side_at_key(
+                Scope::Project,
+                &project,
+                "permissions",
+                perms(&[]),
+                perms(&["A"]),
+            )),
+            None,
+            vec![key("permissions"), key("allow"), idx(0)],
+            None,
+        );
+        let plan = plan_restore_to(&[r_env.clone(), r_perms], r_env.id).unwrap();
+        assert_eq!(
+            plan.targets.len(),
+            2,
+            "both top-level keys should survive the window dedupe"
+        );
+        let keys: Vec<&str> = plan
+            .targets
+            .iter()
+            .map(|t| t.top_level_key.as_str())
+            .collect();
+        assert!(keys.contains(&"permissions"));
+        assert!(keys.contains(&"env"));
+        // `target_value` per target is the per-key window-start state
+        // (the first `key_before` seen for that key).
+        let env_target = plan
+            .targets
+            .iter()
+            .find(|t| t.top_level_key == "env")
+            .unwrap();
+        assert_eq!(
+            env_target.target_value,
+            Some(serde_json::json!({"FOO": "1"}))
+        );
     }
 
     #[test]
