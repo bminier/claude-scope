@@ -69,6 +69,28 @@ captured. If the file was hand-edited since (so its current contents
 differ from what the log expected), the confirm modal shows a warning
 band — you can still proceed, but you'll be overwriting that edit.
 
+**Disabled with a "log degraded" tooltip.** If
+`~/.claude/claude-scope/audit.jsonl` has unreadable lines (corrupt
+JSON, a crash mid-write, schema drift the build doesn't recognize),
+both Undo and Redo are withheld until the log is repaired. The
+tooltip names the count of unreadable entries. Acting against a
+partial log could emit a duplicate restore entry, so ClaudeScope
+refuses rather than guess. The CLI exits non-zero with the same
+message. Repair option: copy `audit.jsonl` aside, drop the broken
+lines, restart.
+
+**"Log changed since the preview."** If a concurrent CLI or GUI
+session writes to the audit log while the confirm modal is open,
+the apply is refused with that message — re-open the History view
+and retry against the fresh state. Same posture under
+`claude-scope-cli undo` and `--yes`.
+
+**"Path injection refused."** If an audit-log entry's `file_path`
+points outside the legitimate scope set for its project (e.g. an
+attacker hand-wrote a hostile line into `audit.jsonl`), the restore
+is refused before any I/O. See the
+[Security threat model](../security.md#threat-model) for context.
+
 ## Restore to before an entry
 
 Single-step undo walks back one operation at a time. To jump back
