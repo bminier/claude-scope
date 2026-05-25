@@ -361,6 +361,15 @@ export interface RestorePreview {
   sides: RestoreSidePreview[];
   /** How many ops the restore reverts: 1 for undo / redo. */
   ops_spanned: number;
+  /**
+   * ULID (Crockford base32) of the audit log's trailing record at preview
+   * time. The apply call passes this back as `expected_tail_id` so the
+   * backend can refuse if the log has changed since — closes the gap
+   * `ops_spanned` alone leaves open (a same-length window after a
+   * concurrent rotate+append). Populated for restore-to-point only;
+   * absent for undo / redo. See #171.
+   */
+  tail_id?: string;
 }
 
 /**
@@ -373,6 +382,15 @@ export interface UndoRedoStatus {
   undo?: AuditRecordView;
   redo?: AuditRecordView;
   sequence_break: boolean;
+  /**
+   * Count of unreadable audit-log lines (corrupt JSON, truncated tail,
+   * schema drift the reader couldn't parse). When non-zero, the backend
+   * withholds both `undo` and `redo` and the topbar should surface a
+   * "log degraded" warning. Acting against a partial log can emit a
+   * duplicate restore entry, so undo/redo stay disabled until the
+   * issue is resolved. See #170.
+   */
+  skipped: number;
 }
 
 /**

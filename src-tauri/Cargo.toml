@@ -31,6 +31,9 @@ tempfile = "3"
 notify-debouncer-mini = "0.7"
 clap = { version = "4", features = ["derive"] }
 ulid = { version = "1", features = ["serde"] }
+# Cross-process file lock around audit-log rotate+append (#166). Both
+# Windows (LockFileEx) and POSIX (flock) advisory locks via one API.
+fs2 = "0.4"
 
 [features]
 # By default Tauri runs in production mode.

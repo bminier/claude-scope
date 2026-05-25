@@ -335,6 +335,12 @@ pub enum AppendError {
 /// taken at write time, so two ClaudeScope processes racing to log don't
 /// interleave bytes — they get sequential lines in *some* order, which is
 /// the same property we need for the in-process single-process case.
+///
+/// Note: `append` itself does NOT take the rotate/append lock. Production
+/// callers route through [`persist`] which holds the lock around the
+/// rotate-then-append pair (#166). Direct `append` callers are the
+/// truncated-tail-tolerance tests and the malformed-line injection in
+/// the CLI integration tests, where the bypass is intentional.
 pub fn append(record: &Record, home: Option<&Path>) -> Result<(), AppendError> {
     let path = audit_path(home).ok_or(AppendError::NoLocation)?;
     if let Some(parent) = path.parent() {
@@ -347,21 +353,183 @@ pub fn append(record: &Record, home: Option<&Path>) -> Result<(), AppendError> {
     Ok(())
 }
 
-/// Read every well-formed record from the audit log, in file order. A
-/// truncated tail line (no terminating newline AND a parse error) is
+/// Options for [`persist`]. `rotate_cap_bytes` is `Some(_)` to attempt a
+/// rotation before the append when the active log exceeds the cap; `None`
+/// to skip rotation entirely.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PersistOptions {
+    pub rotate_cap_bytes: Option<u64>,
+}
+
+/// Outcome of [`persist`]: rotation and append errors are reported
+/// separately so callers can surface them in their idiomatic way.
+#[derive(Debug, Default)]
+pub struct PersistResult {
+    pub rotate_error: Option<String>,
+    pub append_error: Option<AppendError>,
+}
+
+/// Persist `record` to the audit log under `home`, optionally rotating
+/// first when the active log is over `rotate_cap_bytes`.
+///
+/// The whole operation runs under an advisory file lock at
+/// `<audit_dir>/audit.lock`. The lock closes the rotate-then-append race
+/// (#166): without it, two processes can race such that one rotates the
+/// active log into an archive while the other is mid-append, leaving the
+/// fresh record stranded in the archive where [`read_all`] would have
+/// missed it pre-fix. With the lock and the now-archive-aware
+/// [`read_all`], records are durable and reachable from the undo/redo
+/// state machine regardless of how rotations interleave with writes.
+///
+/// Rotation failure is non-fatal — the append still proceeds against the
+/// over-cap log, which is better than dropping the record. Append failure
+/// is returned in the result; callers (GUI / CLI) surface it as a
+/// warning, not a hard error, because the on-disk operation that
+/// triggered the audit (the move / add / delete itself) has already
+/// succeeded.
+pub fn persist(record: &Record, home: Option<&Path>, options: PersistOptions) -> PersistResult {
+    let _lock = AuditLock::acquire(home).ok().flatten();
+    let mut result = PersistResult::default();
+    if let Some(cap_bytes) = options.rotate_cap_bytes {
+        if let Err(err) = rotate_if_needed(home, cap_bytes) {
+            result.rotate_error = Some(format!("rotation: {err}"));
+        }
+    }
+    if let Err(err) = append(record, home) {
+        result.append_error = Some(err);
+    }
+    result
+}
+
+/// Path to the cross-process advisory lock file. Lives alongside
+/// `audit.jsonl` so the lock semantically protects the log directory.
+fn audit_lock_path(home: Option<&Path>) -> Option<PathBuf> {
+    audit_path(home).and_then(|p| p.parent().map(|parent| parent.join("audit.lock")))
+}
+
+/// RAII guard for the audit-log advisory lock. Acquired around
+/// rotate-then-append in [`persist`] so two processes can't interleave a
+/// rotation with another process's append. The lock is `fs2`'s advisory
+/// flock (`LockFileEx` on Windows, `flock` on POSIX) — released when the
+/// guard drops, or when the process exits even after a crash (the kernel
+/// reclaims advisory locks on file-handle close).
+struct AuditLock(std::fs::File);
+
+impl AuditLock {
+    /// Open (creating if needed) the lock file and take an exclusive
+    /// lock. Returns `None` when the audit location is unavailable
+    /// (no home dir) — the caller falls open just like the legacy
+    /// `append` did, so audit failures never block the primary write.
+    fn acquire(home: Option<&Path>) -> io::Result<Option<Self>> {
+        let Some(path) = audit_lock_path(home) else {
+            return Ok(None);
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Lock file is content-irrelevant — flock semantics don't care
+        // about bytes. `.truncate(false)` keeps any stray bytes alone
+        // (which is fine, we never read it) and silences clippy's
+        // "no truncate spec on write open" warning.
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+        // Blocking exclusive lock — both POSIX and Windows. For the
+        // millisecond-scale rotate+append, blocking is fine; if a
+        // crashed process held the lock the kernel would have released
+        // it.
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(Some(AuditLock(file)))
+    }
+}
+
+impl Drop for AuditLock {
+    fn drop(&mut self) {
+        // Best-effort. If unlock fails, dropping the file handle still
+        // releases the kernel lock on exit. Don't panic in Drop.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+/// Read every well-formed record from the audit log, merging the active
+/// log with any rotated archives (`audit-YYYY-MM.jsonl`, plus collision
+/// suffixes) in the same directory. Archives come first, in filename
+/// order (which encodes `YYYY-MM` plus collision suffix — older archives
+/// sort first), then the active log. Within each file, records are
+/// returned in append order — the file's own ordering, not re-sorted by
+/// ULID, because file order IS the causal record of what happened.
+///
+/// Archive-aware reads close half of the rotate/append race (#166):
+/// even if a record lands in what becomes an archive (a slow append
+/// racing a rotation), [`read_all`] still finds it. The other half is
+/// the lock held by [`persist`] which makes the race extremely narrow
+/// in the first place.
+///
+/// A truncated tail line (no terminating newline AND a parse error) is
 /// silently skipped — that's the partial-write tolerance property. A
 /// well-formed line that fails parse (e.g. a future schema field this
-/// build doesn't understand strictly) is also skipped, with the count of
-/// skipped lines returned alongside the records so a caller can surface
-/// "N entries unreadable" rather than silently swallowing data.
-///
-/// Phase 1 callers only need the count for telemetry; the Phase 2 History
-/// view will use the records themselves.
+/// build doesn't understand strictly) is also skipped, with the count
+/// of skipped lines (summed across archives + active) returned
+/// alongside the records so a caller can surface "N entries unreadable"
+/// rather than silently swallowing data.
 pub fn read_all(home: Option<&Path>) -> io::Result<(Vec<Record>, usize)> {
-    let Some(path) = audit_path(home) else {
-        return Ok((Vec::new(), 0));
+    let mut records = Vec::new();
+    let mut skipped = 0usize;
+    for archive in audit_archives(home)? {
+        let (recs, skip) = read_log_file(&archive)?;
+        records.extend(recs);
+        skipped += skip;
+    }
+    if let Some(active) = audit_path(home) {
+        let (recs, skip) = read_log_file(&active)?;
+        records.extend(recs);
+        skipped += skip;
+    }
+    Ok((records, skipped))
+}
+
+/// Enumerate `audit-*.jsonl` files in the audit directory (the rotation
+/// archives — see [`rotate_if_needed`]), sorted lexicographically by
+/// filename so older archives come first. The archive naming scheme
+/// (`audit-YYYY-MM[-N].jsonl`) makes lex order match chronological
+/// order for both the main per-month files and the within-month
+/// collision suffixes. Returns an empty vec if the directory doesn't
+/// exist; the caller treats that as "no archives."
+fn audit_archives(home: Option<&Path>) -> io::Result<Vec<PathBuf>> {
+    let Some(active) = audit_path(home) else {
+        return Ok(Vec::new());
     };
-    let file = match std::fs::File::open(&path) {
+    let Some(parent) = active.parent() else {
+        return Ok(Vec::new());
+    };
+    if !parent.exists() {
+        return Ok(Vec::new());
+    }
+    let mut archives = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Match `audit-*.jsonl` exactly — and skip the active log itself
+        // (which is `audit.jsonl`, no dash) since the caller reads it
+        // separately.
+        if name.starts_with("audit-") && name.ends_with(".jsonl") {
+            archives.push(path);
+        }
+    }
+    archives.sort();
+    Ok(archives)
+}
+
+/// Read records + skipped count from a single audit-log file. Factored
+/// out so [`read_all`] can apply the same parse-tolerance behavior to
+/// both the active log and each archive.
+fn read_log_file(path: &Path) -> io::Result<(Vec<Record>, usize)> {
+    let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(e),
@@ -1140,15 +1308,23 @@ mod tests {
     }
 
     #[test]
-    fn read_all_ignores_rotated_archives() {
-        // After rotation the active file is fresh; an immediate read_all
-        // returns nothing. The reader deliberately doesn't scan archives —
-        // that's the "active file is authoritative" property the
-        // History UI binds to.
+    fn read_all_merges_active_log_with_rotated_archives() {
+        // After rotation the active file is fresh, but read_all is
+        // archive-aware as of #166 — records that landed in archives
+        // remain reachable so undo/redo/history don't lose entries to
+        // a rotation that interleaved with a write.
         let tmp = TempDir::new().unwrap();
+        // Seed three records into the active log…
+        let mut expected_ids = Vec::new();
         for _ in 0..3 {
-            append(&sample_record(), Some(tmp.path())).unwrap();
+            let rec = sample_record();
+            expected_ids.push(rec.id);
+            append(&rec, Some(tmp.path())).unwrap();
+            // Sleep a hair so each ULID's timestamp portion differs —
+            // makes the sort assertion meaningful.
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
+        // …then rotate them into an archive.
         let cap = fs::metadata(audit_path(Some(tmp.path())).unwrap())
             .unwrap()
             .len()
@@ -1157,16 +1333,97 @@ mod tests {
 
         let (records, skipped) = read_all(Some(tmp.path())).unwrap();
         assert_eq!(skipped, 0);
-        assert!(
-            records.is_empty(),
-            "active file is freshly empty after rotation"
+        assert_eq!(
+            records.len(),
+            3,
+            "archived records must remain reachable from read_all (#166)"
+        );
+        let got_ids: Vec<_> = records.iter().map(|r| r.id).collect();
+        assert_eq!(
+            got_ids, expected_ids,
+            "archived records must come back in append order"
         );
 
-        // A subsequent append lands in the new active file, not in the
-        // archive.
-        append(&sample_record(), Some(tmp.path())).unwrap();
+        // A subsequent append lands in the new active file. read_all
+        // returns the archive's 3 first, then the new 1 — archives
+        // before active, file-order within each.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let post_rotation = sample_record();
+        let post_id = post_rotation.id;
+        append(&post_rotation, Some(tmp.path())).unwrap();
+
         let (records, _) = read_all(Some(tmp.path())).unwrap();
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 4);
+        assert_eq!(
+            records.last().map(|r| r.id),
+            Some(post_id),
+            "the post-rotation record must come after the archived ones"
+        );
+    }
+
+    #[test]
+    fn persist_concurrent_threads_lose_no_records_across_rotation() {
+        // Regression for #166. Multiple threads call `persist` with the
+        // active log near the rotation cap. Without the lock, one thread
+        // can rotate the log while another's append is in flight,
+        // potentially stranding the racer's record in the archive (and
+        // pre-fix `read_all` would never see it). With the lock + the
+        // now-archive-aware `read_all`, every record persisted must be
+        // retrievable.
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = Arc::new(TempDir::new().unwrap());
+
+        // Seed a few records so the log has size, then pick a cap just
+        // below the current size so the first persist triggers a
+        // rotation.
+        for _ in 0..5 {
+            append(&sample_record(), Some(tmp.path())).unwrap();
+        }
+        let seeded_len = fs::metadata(audit_path(Some(tmp.path())).unwrap())
+            .unwrap()
+            .len();
+        let cap = seeded_len - 1;
+
+        let n_threads = 8;
+        let mut handles = Vec::new();
+        for _ in 0..n_threads {
+            let tmp = Arc::clone(&tmp);
+            handles.push(thread::spawn(move || {
+                let rec = sample_record();
+                let id = rec.id;
+                let options = PersistOptions {
+                    rotate_cap_bytes: Some(cap),
+                };
+                let result = persist(&rec, Some(tmp.path()), options);
+                assert!(
+                    result.append_error.is_none(),
+                    "concurrent append must not fail: {:?}",
+                    result.append_error
+                );
+                id
+            }));
+        }
+        let mut spawned_ids: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        spawned_ids.sort();
+
+        let (records, skipped) = read_all(Some(tmp.path())).unwrap();
+        assert_eq!(skipped, 0);
+        // Every record we persisted must be reachable — the 5 seeded
+        // plus the 8 concurrent appends, regardless of which file each
+        // landed in.
+        assert_eq!(
+            records.len(),
+            5 + n_threads,
+            "lost records under concurrent rotate+append (#166)"
+        );
+        for id in &spawned_ids {
+            assert!(
+                records.iter().any(|r| r.id == *id),
+                "spawned record {id:?} not retrievable from read_all"
+            );
+        }
     }
 
     #[test]

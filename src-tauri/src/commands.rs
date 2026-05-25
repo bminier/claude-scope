@@ -336,6 +336,13 @@ impl AuditPersistResult {
 /// Rotate (if configured) and append `record` to the audit log at the
 /// location implied by `home` (None = production, Some = sandbox / test).
 ///
+/// Wraps [`audit::persist`], which holds a cross-process advisory lock
+/// around the rotate+append pair so two ClaudeScope sessions can't
+/// interleave a rotation with another session's append (#166). Reads the
+/// rotation preference (`audit_log_rotate` / `audit_log_max_size_mb`)
+/// fresh on every call so a toggle in Settings takes effect on the next
+/// write.
+///
 /// Both steps are best-effort: rotation failure is logged and execution
 /// proceeds to append; append failure is reported in the returned struct
 /// so the caller can surface it in their idiomatic way (the GUI emits a
@@ -343,24 +350,19 @@ impl AuditPersistResult {
 /// paths so the two surfaces can't drift on rotation behavior — see
 /// #164 and #168.
 pub fn persist_audit_record(record: &audit::Record, home: Option<&Path>) -> AuditPersistResult {
-    let mut out = AuditPersistResult::default();
     let prefs = preferences::load();
-    // Rotate before the append so the fresh entry lands in the new
-    // active file (#127). Rotation errors are fail-open: we surface
-    // them as a non-fatal warning and proceed to append against the
-    // existing file rather than dropping the entry. The append itself
-    // would then write to an over-cap log, which is still better than
-    // losing the record.
-    if prefs.audit_log_rotate {
-        let cap_bytes = u64::from(prefs.audit_log_max_size_mb) * 1_000_000;
-        if let Err(err) = audit::rotate_if_needed(home, cap_bytes) {
-            out.rotate_error = Some(format!("rotation: {err}"));
-        }
+    let options = audit::PersistOptions {
+        rotate_cap_bytes: if prefs.audit_log_rotate {
+            Some(u64::from(prefs.audit_log_max_size_mb) * 1_000_000)
+        } else {
+            None
+        },
+    };
+    let result = audit::persist(record, home, options);
+    AuditPersistResult {
+        rotate_error: result.rotate_error,
+        append_error: result.append_error.map(|e| e.to_string()),
     }
-    if let Err(err) = audit::append(record, home) {
-        out.append_error = Some(err.to_string());
-    }
-    out
 }
 
 /// Append one entry to the audit log on a successful GUI write. Fail-open:
@@ -663,6 +665,12 @@ pub struct UndoRedoStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redo: Option<AuditRecordView>,
     pub sequence_break: bool,
+    /// Count of unreadable audit-log lines (`read_all` skip count). When
+    /// non-zero, the undo/redo state machine is missing some records —
+    /// a corrupt `restore` line could make us think an op is still
+    /// undoable when it isn't. The topbar surfaces this and refuses
+    /// undo/redo until the log is repaired. See #170.
+    pub skipped: usize,
 }
 
 /// Report what the next undo / redo would target (#19 Phase 3). Routes
@@ -672,12 +680,27 @@ pub struct UndoRedoStatus {
 /// in scratch mode — `.bak` remains the recovery path there.
 #[tauri::command]
 pub fn audit_undo_status(overrides: State<'_, RuntimeOverrides>) -> Result<UndoRedoStatus, String> {
-    let (records, _) = audit::read_all(overrides.home()).map_err(|e| e.to_string())?;
+    let (records, skipped) = audit::read_all(overrides.home()).map_err(|e| e.to_string())?;
     let state = audit::undo_redo_state(&records);
+    // When the log has malformed lines, withhold undo/redo: a corrupt
+    // restore record could leave the state machine pointing at an op
+    // that was already undone, and confirming would emit a duplicate
+    // restore entry. The topbar surfaces `skipped > 0` as a warning
+    // and disables the buttons. See #170.
+    let degraded = skipped > 0;
     Ok(UndoRedoStatus {
-        undo: state.undoable.map(record_view),
-        redo: state.redoable.map(record_view),
+        undo: if degraded {
+            None
+        } else {
+            state.undoable.map(record_view)
+        },
+        redo: if degraded {
+            None
+        } else {
+            state.redoable.map(record_view)
+        },
         sequence_break: state.sequence_break,
+        skipped,
     })
 }
 
@@ -814,7 +837,11 @@ fn restore_to_point_preview(
         .iter()
         .find(|r| r.id == id)
         .expect("plan_restore_to already verified the id is in the log");
-    preview_restore_plan(&plan, target)
+    let mut preview = preview_restore_plan(&plan, target)?;
+    // Capture the trailing ULID so the apply can detect a concurrent
+    // append that left `ops_spanned` coincidentally identical (#171).
+    preview.tail_id = records.last().map(|r| r.id);
+    Ok(preview)
 }
 
 /// Diff preview for a restore-to-point (#19 Phase 4) — rolls the affected
@@ -830,16 +857,26 @@ pub fn audit_restore_to_point_preview(
 fn apply_restore_to_point(
     target_id: &str,
     expected_ops_spanned: usize,
+    expected_tail_id: Option<Ulid>,
     app: &AppHandle,
     watch: &WatchState,
     overrides: &RuntimeOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let id = parse_audit_id(target_id)?;
     let (records, _) = audit::read_all(overrides.home())?;
+    // Identity check first: a concurrent rotate+append can leave the log
+    // with a same-length-but-different-records window (codex #166 +
+    // #171). Compare the trailing ULID against the preview's snapshot.
+    // None on either side means "no tail recorded" — treat the absence
+    // as a non-mismatch only when both are absent.
+    let current_tail = records.last().map(|r| r.id);
+    if current_tail != expected_tail_id {
+        return Err("the audit log changed since the preview — reload and try again".into());
+    }
     let plan = plan_restore_to(&records, id)?;
-    // The window the user confirmed had `expected_ops_spanned` entries; if
-    // a write landed since (a concurrent CLI op) the window has grown —
-    // refuse rather than reverting more than the preview showed.
+    // Spanned-count check is now redundant with the tail check above —
+    // but keep it as defense in depth in case `expected_tail_id` is
+    // None for any future reason (callers that haven't been updated).
     if plan.ops_spanned != expected_ops_spanned {
         return Err("the audit log changed since the preview — reload and try again".into());
     }
@@ -852,18 +889,27 @@ fn apply_restore_to_point(
     Ok(())
 }
 
-/// Apply a restore-to-point (#19 Phase 4). `expected_ops_spanned` is the
-/// span the confirmed preview reported — see [`apply_restore_to_point`].
+/// Apply a restore-to-point (#19 Phase 4). `expected_ops_spanned` and
+/// `expected_tail_id` are the span and trailing-record ULID that the
+/// confirmed preview reported — see [`apply_restore_to_point`].
 #[tauri::command]
 pub fn audit_apply_restore_to_point(
     target_id: String,
     expected_ops_spanned: usize,
+    expected_tail_id: Option<Ulid>,
     app: AppHandle,
     watch: State<'_, WatchState>,
     overrides: State<'_, RuntimeOverrides>,
 ) -> Result<(), String> {
-    apply_restore_to_point(&target_id, expected_ops_spanned, &app, &watch, &overrides)
-        .map_err(|e| e.to_string())
+    apply_restore_to_point(
+        &target_id,
+        expected_ops_spanned,
+        expected_tail_id,
+        &app,
+        &watch,
+        &overrides,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Build- and runtime-time diagnostic block for the About dialog (#21).
@@ -1824,6 +1870,15 @@ pub struct RestorePreview {
     /// the same helpers the History view uses.
     pub target: AuditRecordView,
     pub sides: Vec<RestoreSidePreview>,
+    /// ULID of the last record in the audit log at preview time. The
+    /// apply path passes this back in `expected_tail_id` so it can refuse
+    /// to apply against a log that has since changed — closes the gap
+    /// `ops_spanned` alone leaves open (a same-length window can hold
+    /// different records after a concurrent rotate+append). See #171.
+    /// `None` only when the log was empty at preview time (impossible for
+    /// any restore that has a target, but kept Optional for future-proofing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_id: Option<Ulid>,
     /// How many ops this restore reverts: 1 for undo / redo, the count of
     /// spanned entries for a restore-to-point (#125).
     pub ops_spanned: usize,
@@ -2033,6 +2088,10 @@ pub fn preview_restore_plan(
         target: record_view(target.clone()),
         sides,
         ops_spanned: plan.ops_spanned,
+        // Filled in by higher-level callers that have the log handy
+        // (`restore_to_point_preview`). `preview_restore_plan` itself only
+        // sees the plan + target, not the full log.
+        tail_id: None,
     })
 }
 
@@ -3511,6 +3570,80 @@ mod tests {
         assert_eq!(
             env_target.target_value,
             Some(serde_json::json!({"FOO": "1"}))
+        );
+    }
+
+    #[test]
+    fn restore_to_point_preview_captures_trailing_ulid_for_apply_recheck() {
+        // Regression for #171. The apply path compares the trailing
+        // record's ULID against this `tail_id` to detect a concurrent
+        // rotate+append that left `ops_spanned` coincidentally identical
+        // but the window's contents different. The preview must populate
+        // `tail_id` from the same read that fed `plan_restore_to`.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = paths_in(tmp.path()).project.clone().unwrap();
+        write(&project, r#"{"permissions":{"allow":["A"]}}"#);
+        let target = move_record(
+            side_at(Scope::Project, &project, perms(&["A"]), perms(&[])),
+            side_at(Scope::User, &project, perms(&[]), perms(&["A"])),
+        );
+        let records = vec![target.clone()];
+        let plan = plan_restore_to(&records, target.id).unwrap();
+        let mut preview = preview_restore_plan(&plan, &target).unwrap();
+        // `preview_restore_plan` alone doesn't see the log; the
+        // higher-level `restore_to_point_preview` populates `tail_id`.
+        assert!(
+            preview.tail_id.is_none(),
+            "preview_restore_plan should not set tail_id"
+        );
+        preview.tail_id = records.last().map(|r| r.id);
+        // After populating, the tail should equal the target (only one
+        // entry in the log).
+        assert_eq!(preview.tail_id, Some(target.id));
+    }
+
+    #[test]
+    fn tail_ulid_changes_when_audit_log_grows() {
+        // Demonstrates the detection mechanism the #171 fix relies on.
+        // If a concurrent process appends to the audit log between
+        // preview and apply, the trailing ULID changes — even if the
+        // window's `ops_spanned` stays coincidentally identical.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let a = audit::Record::new(
+            audit::Kind::Move,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            None,
+            None,
+            vec![],
+            None,
+        );
+        audit::append(&a, Some(home)).unwrap();
+        // Capture trailing ULID — what the preview would record.
+        let (snapshot, _) = audit::read_all(Some(home)).unwrap();
+        let expected_tail = snapshot.last().map(|r| r.id);
+
+        // Concurrent writer appends.
+        let b = audit::Record::new(
+            audit::Kind::Add,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Cli,
+            None,
+            None,
+            None,
+            vec![],
+            None,
+        );
+        audit::append(&b, Some(home)).unwrap();
+
+        // Apply-side re-read: tail has shifted.
+        let (after, _) = audit::read_all(Some(home)).unwrap();
+        let current_tail = after.last().map(|r| r.id);
+        assert_ne!(
+            current_tail, expected_tail,
+            "trailing ULID must change after a concurrent append — this is the signal apply_restore_to_point uses to detect staleness (#171)"
         );
     }
 

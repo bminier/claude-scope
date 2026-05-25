@@ -773,12 +773,30 @@ function recordTooltip(rec: AuditRecordView): string {
   return rule ? `${historyVerbLabel(rec)} ${rule} (${when})` : `${historyVerbLabel(rec)} (${when})`;
 }
 
+/**
+ * Build the "log degraded" tooltip text when the audit log has unreadable
+ * lines (#170). Surfaces the count and explains why undo/redo are off.
+ */
+function logDegradedTooltip(skipped: number): string {
+  const lines = skipped === 1 ? "1 audit-log entry is" : `${skipped} audit-log entries are`;
+  return `${lines} unreadable — undo/redo are disabled until the log is repaired`;
+}
+
 function undoButton(props: AppProps): HTMLButtonElement {
   const btn = document.createElement("button");
   btn.textContent = "Undo";
-  const target = props.undoStatus?.undo;
+  const status = props.undoStatus;
+  const target = status?.undo;
   btn.disabled = props.busy || !props.scopes || !target;
-  btn.title = target ? `Undo: ${recordTooltip(target)}` : "Nothing to undo";
+  if (target) {
+    btn.title = `Undo: ${recordTooltip(target)}`;
+  } else if (status && status.skipped > 0) {
+    // Backend withheld undo because the log has malformed lines. Tell
+    // the user why rather than the default "Nothing to undo".
+    btn.title = logDegradedTooltip(status.skipped);
+  } else {
+    btn.title = "Nothing to undo";
+  }
   btn.setAttribute("aria-label", btn.title);
   btn.onclick = (e) => props.onUndo(e.currentTarget as HTMLElement);
   return btn;
@@ -795,6 +813,9 @@ function redoButton(props: AppProps): HTMLButtonElement {
   } else if (status?.sequence_break) {
     // The forward stack is stranded — explain rather than just greying out.
     btn.title = "Redo unavailable — a change was made after the last undo";
+  } else if (status && status.skipped > 0) {
+    // Same log-degraded posture as undo.
+    btn.title = logDegradedTooltip(status.skipped);
   } else {
     btn.title = "Nothing to redo";
   }

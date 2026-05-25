@@ -816,11 +816,28 @@ fn read_audit_log(
     home: Option<&std::path::Path>,
 ) -> Result<Vec<AuditRecord>, Box<dyn std::error::Error>> {
     let (records, skipped) = audit::read_all(home)?;
+    // Undo/redo/restore refuse against a partial log: a corrupt restore
+    // line could leave the state machine pointing at an op that's
+    // already undone, and confirming would emit a duplicate restore
+    // entry. The GUI's `audit_undo_status` returns the same signal as
+    // `skipped` and disables the topbar buttons. See #170.
     if skipped > 0 {
-        eprintln!(
-            "note: {skipped} unreadable {} skipped in the log",
-            if skipped == 1 { "entry" } else { "entries" }
-        );
+        return Err(format!(
+            "{skipped} audit-log {} unreadable — refusing to compute \
+             undo/redo against a partial log. Repair {} (or copy aside \
+             and reset) before running undo/redo/restore.",
+            if skipped == 1 {
+                "entry is"
+            } else {
+                "entries are"
+            },
+            if skipped == 1 {
+                "the entry"
+            } else {
+                "those entries"
+            }
+        )
+        .into());
     }
     Ok(records)
 }
