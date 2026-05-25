@@ -5,6 +5,7 @@ pub mod io_atomic;
 pub mod model;
 pub mod preferences;
 pub mod projects;
+pub mod redundancy;
 mod runtime;
 pub mod scope;
 pub mod watcher;

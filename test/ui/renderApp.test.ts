@@ -247,6 +247,79 @@ describe("renderApp", () => {
     }
   });
 
+  it("renders a redundancy badge on the redundant rule's per-scope row (#17)", () => {
+    // The detector backend produces redundancy entries with
+    // (redundant, covered_by) pairs. The renderer keys per-scope
+    // badges on (scope, kind, index), so the badge lands on the
+    // narrower-rule chip at its exact slot.
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/project-redundancy-perscope",
+      scopes: [
+        { scope: "user", permissions: { allow: ["Bash(git *)"] } },
+        { scope: "project", permissions: { allow: ["Bash(git status)"] } },
+      ],
+      redundancies: [
+        {
+          redundant: { rule: "Bash(git status)", scope: "project", kind: "allow", index: 0 },
+          covered_by: { rule: "Bash(git *)", scope: "user", kind: "allow", index: 0 },
+          kind: "subsumed",
+        },
+      ],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const projectRule = Array.from(root.querySelectorAll(".rule")).find((r) =>
+      r.textContent?.includes("Bash(git status)"),
+    );
+    expect(projectRule).toBeDefined();
+    expect(projectRule!.querySelector(".redundancy-wrap")).not.toBeNull();
+    const pop = projectRule!.querySelector(".redundancy-popover");
+    expect(pop?.textContent).toContain("Already covered by a broader rule");
+    expect(pop?.textContent).toContain("Bash(git *)");
+    expect(pop?.textContent).toContain("User");
+    // The covering rule's own row should NOT carry a badge.
+    const userRule = Array.from(root.querySelectorAll(".rule")).find((r) =>
+      r.textContent?.includes("Bash(git *)"),
+    );
+    expect(userRule?.querySelector(".redundancy-wrap")).toBeNull();
+  });
+
+  it("labels exact duplicates differently in the redundancy popover (#17)", () => {
+    // Duplicate kind gets "Exact duplicate of another rule"; subsumed
+    // gets "Already covered by a broader rule." Pin the wording so a
+    // refactor doesn't silently change the user-facing strings.
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/project-redundancy-duplicate",
+      scopes: [
+        { scope: "user", permissions: { allow: ["Bash(rm)"] } },
+        { scope: "project", permissions: { allow: ["Bash(rm)"] } },
+      ],
+      redundancies: [
+        {
+          redundant: { rule: "Bash(rm)", scope: "project", kind: "allow", index: 0 },
+          covered_by: { rule: "Bash(rm)", scope: "user", kind: "allow", index: 0 },
+          kind: "duplicate",
+        },
+      ],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const flagged = Array.from(root.querySelectorAll(".rule")).find((r) =>
+      r.querySelector(".redundancy-wrap"),
+    );
+    expect(flagged).toBeDefined();
+    const pop = flagged!.querySelector(".redundancy-popover");
+    expect(pop?.textContent).toContain("Exact duplicate of another rule");
+  });
+
+  it("does not render the redundancy badge when no redundancies are present (#17)", () => {
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/project-redundancy-none",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
+      redundancies: [],
+    });
+    renderApp(root, makeProps({ scopes }));
+    expect(root.querySelector(".redundancy-wrap")).toBeNull();
+  });
+
   it("defaults the combined panel to collapsed via preferences (#155)", () => {
     // Default `combined_panel_collapsed: true` from buildPreferences
     // mirrors the Rust default — the panel renders closed on first

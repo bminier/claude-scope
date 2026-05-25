@@ -82,6 +82,12 @@ pub struct LoadedScopes {
     /// disagreement so the user can spot a likely typo or stale rule
     /// without scanning every column. See #156.
     pub kind_conflicts: Vec<KindConflict>,
+    /// Permission rules that are either exact duplicates or fully
+    /// covered by a broader rule of the same kind (#17). The UI renders
+    /// a ⚠ badge on every redundant chip with a popover naming the
+    /// covering rule. Cross-kind shadowing (allow vs deny) is out of
+    /// scope here — that's the kind-conflict warning's territory.
+    pub redundancies: Vec<crate::redundancy::Redundancy>,
 }
 
 /// Two-or-more scopes whose resolved file paths point at the same on-disk
@@ -1129,6 +1135,7 @@ pub fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::err
     let (combined, origins) = combined_permissions(&views);
     let path_collisions = detect_path_collisions(paths);
     let kind_conflicts = detect_kind_conflicts(&views);
+    let redundancies = crate::redundancy::detect_redundancies(&views);
 
     Ok(LoadedScopes {
         project_dir: paths.project_dir.display().to_string(),
@@ -1137,6 +1144,7 @@ pub fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::err
         combined_origins: origins,
         path_collisions,
         kind_conflicts,
+        redundancies,
     })
 }
 
@@ -1305,7 +1313,9 @@ fn combined_permissions(views: &[ScopeView]) -> (PermissionRules, PermissionRule
 /// disk load. Missing or malformed shapes degrade to empty lists rather
 /// than panic, matching the "partial corruption shouldn't break the UI"
 /// stance everywhere else.
-fn permissions_from_values(values: &serde_json::Map<String, serde_json::Value>) -> PermissionRules {
+pub fn permissions_from_values(
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> PermissionRules {
     let mut out = PermissionRules::default();
     let Some(perms) = values
         .get("permissions")

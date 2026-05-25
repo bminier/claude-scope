@@ -1091,6 +1091,41 @@ button:disabled {
   font-weight: 600;
 }
 
+/* Redundancy badge (#17). Recolored to --muted so the user can tell at
+   a glance it's the lowest-severity of the three warnings — lint's --ask
+   amber flags a shape problem, --deny red flags a kind disagreement,
+   --muted gray suggests "this could be tidied up." The popover's
+   `redundancy-covering` code block names the covering rule verbatim so
+   the user can compare without leaving the chip. */
+.redundancy-warn {
+  color: var(--muted);
+}
+.redundancy-warn:hover,
+.redundancy-wrap.is-open > .redundancy-warn {
+  color: var(--text);
+  border-color: var(--muted);
+}
+.redundancy-warn:focus-visible {
+  color: var(--text);
+  border-color: var(--muted);
+}
+
+.redundancy-covering {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 2px 5px;
+  background: var(--panel-2);
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.redundancy-scope {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 /* Reason on top, then a muted heuristic disclaimer separated by a hairline.
    The yellow ⚠ reads as authoritative on its own, so the popover spells out
    that it's a best-effort shape check rather than a verdict from Claude

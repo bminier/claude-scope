@@ -7,6 +7,7 @@ import type {
   PermissionRuleOrigins,
   PermissionRules,
   Preferences,
+  Redundancy,
   RuntimeInfo,
   Scope,
   ScopeView,
@@ -100,6 +101,7 @@ interface LoadedScopesOverrides {
   combined_origins?: Partial<PermissionRuleOrigins>;
   path_collisions?: PathCollision[];
   kind_conflicts?: KindConflict[];
+  redundancies?: Redundancy[];
 }
 
 /**
@@ -153,6 +155,7 @@ export function buildLoadedScopes(overrides: LoadedScopesOverrides = {}): Loaded
     combined_origins: { ...origins, ...(overrides.combined_origins ?? {}) },
     path_collisions: overrides.path_collisions ?? [],
     kind_conflicts: overrides.kind_conflicts ?? [],
+    redundancies: overrides.redundancies ?? [],
   };
 }
 
