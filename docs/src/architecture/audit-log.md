@@ -36,7 +36,7 @@ record valid.
   },
   "path": ["permissions", "allow", 0],
   "to_kind": null,                   // set on change-kind ops
-  "claude_scope_version": "0.3.0"
+  "claude_scope_version": "0.6.0"
 }
 ```
 
@@ -165,6 +165,45 @@ window from `audit::read_all`, which now spans archives. Restoring
 to a point that lives in an archive works the same way as restoring
 to a point in the active log — same `record_sides` walk, same per-
 file snapshot revert.
+
+## Security invariants
+
+The audit log is read by every undo / redo / restore call, and its
+contents drive direct writes to the user's settings files. A hostile
+line appended to `audit.jsonl` (cloud-sync collision, malicious
+postinstall, compromised tool with user-scope write) must not be able
+to escalate into arbitrary file-write. Three gates enforce that.
+
+**Path allowlist (#183).** Every audit-log boundary —
+`undo_redo_target`, `restore_to_point_preview`,
+`apply_restore_to_point`, and the CLI's `cmd_undo` / `cmd_redo` /
+`cmd_restore` — calls `validate_audit_records` immediately after
+reading records and before building any `RestorePlan`. Each
+`Side.file_path` must equal one of the four resolved `ScopePaths`
+slots (`local`, `project`, `user_local`, `user`) for that record's
+own `project_dir`, against the active home override. Canonicalization
+absorbs platform-specific path forms (`/var → /private/var` on macOS,
+`\\?\C:\…` extended-length paths on Windows). The basename must be
+`settings.json` or `settings.local.json`. Any path outside the
+allowlist is refused with a clear `path injection refused` message;
+no writes happen.
+
+**Degraded-log refusal (#170).** `audit::read_all` reports a count
+of unreadable lines (corrupt JSON, schema drift the reader can't
+parse, truncated tails). Every undo / redo / restore path gates on
+that count: the GUI's `require_clean_audit_log` and the CLI's
+`read_audit_log` both refuse with a non-zero exit / blocked topbar
+button when `skipped > 0`. A partial log could leave the undo/redo
+state machine pointing at an op that was already undone, and
+confirming would emit a duplicate `restore` entry.
+
+**Tail-ID stalecheck (#165, #171).** Every restore re-reads the log
+immediately before applying and compares the trailing record's ULID
+against the value captured at preview time. A mismatch means the log
+changed under the user — refuse rather than apply a plan against a
+log the user didn't see. This catches concurrent GUI/CLI appends in
+the prompt window AND the (smaller) window between the initial read
+and `--yes` apply.
 
 ## Sandbox
 
