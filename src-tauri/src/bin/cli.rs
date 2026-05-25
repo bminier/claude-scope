@@ -5,8 +5,9 @@
 //! binary call the same impl functions, so the two surfaces can't drift on
 //! semantics.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -16,15 +17,45 @@ use ulid::Ulid;
 use claude_scope_lib::app_info::AppInfo;
 use claude_scope_lib::audit::{self, Record as AuditRecord};
 use claude_scope_lib::commands::{
-    apply_move_leaf_impl, apply_restore_plan, build_loaded, build_restore_plan,
-    diff_move_leaf_impl, plan_restore_to, preview_restore_plan, restore_record, AuditLogPage,
-    AuditRecordView, MoveLeafPreview, MoveLeafRequest, RestorePlan, RestorePreview,
+    apply_move_leaf_impl, apply_restore_plan, audit_leaf_kind, audit_side, build_loaded,
+    build_restore_plan, diff_move_leaf_impl, persist_audit_record, plan_restore_to,
+    preview_restore_plan, restore_record, snapshot_top_level_key, AuditLogPage, AuditRecordView,
+    MoveLeafPreview, MoveLeafRequest, RestorePlan, RestorePreview,
 };
 use claude_scope_lib::io_atomic::{self, BackupTracker};
 use claude_scope_lib::model::{PathSeg, PermissionKind};
+use claude_scope_lib::preferences;
 use claude_scope_lib::projects::{self, KnownProject};
 use claude_scope_lib::scope::{self, Scope, ScopePaths};
 use claude_scope_lib::watcher::WatchState;
+
+/// Process-local backup tracker for the CLI. Same role as the GUI's
+/// `BACKUPS`: one `.bak` per file per process. The CLI process is
+/// short-lived (one subcommand per invocation), so the tracker exists
+/// mostly to share state if a single command writes multiple files (e.g.
+/// a restore plan spanning project + user). Gated on
+/// `Preferences::backup_on_write` so a `false` setting from the GUI
+/// Settings dialog is honored from the terminal too — see #168.
+fn cli_backups_for_session() -> Option<&'static BackupTracker> {
+    static BACKUPS: OnceLock<BackupTracker> = OnceLock::new();
+    if preferences::load().backup_on_write {
+        Some(BACKUPS.get_or_init(BackupTracker::new))
+    } else {
+        None
+    }
+}
+
+/// Surface the outcome of an audit-log persist to stderr the same way
+/// the GUI emits Tauri events. Append failures are warnings, not hard
+/// errors — the on-disk operation already succeeded.
+fn report_audit_persist(outcome: claude_scope_lib::commands::AuditPersistResult, op: &str) {
+    if let Some(err) = outcome.rotate_error {
+        eprintln!("warning: {op} applied but {err}");
+    }
+    if let Some(err) = outcome.append_error {
+        eprintln!("warning: {op} applied but audit-log append failed: {err}");
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -365,7 +396,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             to,
             dry_run,
             json,
-        } => cmd_move(&paths, &rule, kind, from.into(), to.into(), dry_run, json),
+        } => cmd_move(
+            &paths,
+            cli.home_dir.as_deref(),
+            &rule,
+            kind,
+            from.into(),
+            to.into(),
+            dry_run,
+            json,
+        ),
     }
 }
 
@@ -641,8 +681,10 @@ fn cmd_version(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_move(
     paths: &ScopePaths,
+    home: Option<&Path>,
     rule: &str,
     kind: KindArg,
     from: Scope,
@@ -690,12 +732,62 @@ fn cmd_move(
         return Ok(());
     }
 
+    // Pre-snapshot the affected top-level key on both sides so the audit
+    // record can carry a faithful before/after. Mirrors the GUI's
+    // `apply_move_leaf` flow at commands.rs — see #164.
+    let top_key = "permissions";
+    let from_file = paths.path_for(from).map(Path::to_path_buf);
+    let to_file = paths.path_for(to).map(Path::to_path_buf);
+    let from_before = from_file
+        .as_deref()
+        .and_then(|p| snapshot_top_level_key(p, top_key));
+    let to_before = if from == to {
+        from_before.clone()
+    } else {
+        to_file
+            .as_deref()
+            .and_then(|p| snapshot_top_level_key(p, top_key))
+    };
+
     apply_move_leaf_impl(
         paths,
         &req,
-        Some(&BackupTracker::new()),
+        cli_backups_for_session(),
         &WatchState::default(),
     )?;
+
+    let from_after = from_file
+        .as_deref()
+        .and_then(|p| snapshot_top_level_key(p, top_key));
+    let to_after = if from == to {
+        from_after.clone()
+    } else {
+        to_file
+            .as_deref()
+            .and_then(|p| snapshot_top_level_key(p, top_key))
+    };
+
+    // Build and persist the audit record. CLI move is always
+    // `Kind::Move` today — no change-kind path is exposed at the
+    // command line (#8 is GUI-only).
+    let record = audit::Record::new(
+        audit::Kind::Move,
+        audit_leaf_kind(&req.path),
+        audit::Actor::Cli,
+        None,
+        audit_side(
+            req.from,
+            from_file.as_deref(),
+            top_key,
+            from_before,
+            from_after,
+        ),
+        audit_side(req.to, to_file.as_deref(), top_key, to_before, to_after),
+        req.path.clone(),
+        req.to_kind,
+    );
+    let outcome = persist_audit_record(&record, home);
+    report_audit_persist(outcome, "move");
 
     if json {
         let out = json!({
@@ -818,10 +910,17 @@ fn resolve_entry_id(
 
 /// Shared driver for `undo` / `redo` / `restore`: preview, optionally
 /// confirm, apply, and log the resulting `restore` entry (actor `cli`).
+///
+/// `expected_tail_id` is the ULID of the last audit-log record the caller
+/// saw when building the plan. After the confirm prompt — the only window
+/// where another process can append an entry — the log is re-read and the
+/// new tail compared against `expected_tail_id`. A mismatch means the
+/// plan is stale; abort instead of applying it (#165).
 fn run_cli_restore(
     home: Option<&std::path::Path>,
     plan: &RestorePlan,
     target: &AuditRecord,
+    expected_tail_id: Option<Ulid>,
     dry_run: bool,
     yes: bool,
     json: bool,
@@ -847,14 +946,25 @@ fn run_cli_restore(
             }
             return Ok(());
         }
+        // Re-read the log right after the prompt to catch a concurrent
+        // append from another GUI/CLI session that landed during the
+        // user's confirm window. The plan was computed against the
+        // pre-prompt log; applying it against a changed log can clobber
+        // the intervening op. Skipped only when `--yes` is set, since
+        // there's no prompt window then. See #165.
+        let (current_records, _) = audit::read_all(home)?;
+        let current_tail = current_records.last().map(|r| r.id);
+        if current_tail != expected_tail_id {
+            return Err("the audit log changed while waiting for \
+                        confirmation (another session appended an entry). \
+                        Re-run the command."
+                .into());
+        }
     }
-    let files = apply_restore_plan(plan, Some(&BackupTracker::new()), &WatchState::default())?;
+    let files = apply_restore_plan(plan, cli_backups_for_session(), &WatchState::default())?;
     let record = restore_record(plan, audit::Actor::Cli, files);
-    // Fail-open: the restore already took effect on disk, so a log-append
-    // failure is a warning, not a command failure (matches the GUI).
-    if let Err(err) = audit::append(&record, home) {
-        eprintln!("warning: restore applied but audit-log append failed: {err}");
-    }
+    let outcome = persist_audit_record(&record, home);
+    report_audit_persist(outcome, restore_action_label(preview.direction));
     if json {
         let view = AuditRecordView {
             ts_ms: record.id.timestamp_ms(),
@@ -878,11 +988,12 @@ fn cmd_undo(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let records = read_audit_log(home)?;
+    let expected_tail_id = records.last().map(|r| r.id);
     let target = audit::undo_redo_state(&records)
         .undoable
         .ok_or("nothing to undo")?;
     let plan = build_restore_plan(&target, audit::RestoreDirection::Undo)?;
-    run_cli_restore(home, &plan, &target, dry_run, yes, json)
+    run_cli_restore(home, &plan, &target, expected_tail_id, dry_run, yes, json)
 }
 
 fn cmd_redo(
@@ -892,13 +1003,14 @@ fn cmd_redo(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let records = read_audit_log(home)?;
+    let expected_tail_id = records.last().map(|r| r.id);
     let state = audit::undo_redo_state(&records);
     if state.sequence_break {
         return Err("redo is unavailable: a change was made after the last undo".into());
     }
     let target = state.redoable.ok_or("nothing to redo")?;
     let plan = build_restore_plan(&target, audit::RestoreDirection::Redo)?;
-    run_cli_restore(home, &plan, &target, dry_run, yes, json)
+    run_cli_restore(home, &plan, &target, expected_tail_id, dry_run, yes, json)
 }
 
 fn cmd_restore(
@@ -909,6 +1021,7 @@ fn cmd_restore(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let records = read_audit_log(home)?;
+    let expected_tail_id = records.last().map(|r| r.id);
     let target_id = resolve_entry_id(&records, id)?;
     let plan = plan_restore_to(&records, target_id)?;
     let target = records
@@ -916,7 +1029,7 @@ fn cmd_restore(
         .find(|r| r.id == target_id)
         .expect("plan_restore_to verified the id is in the log")
         .clone();
-    run_cli_restore(home, &plan, &target, dry_run, yes, json)
+    run_cli_restore(home, &plan, &target, expected_tail_id, dry_run, yes, json)
 }
 
 fn rules_at(doc: &claude_scope_lib::model::SettingsDoc, kind_key: &str) -> Vec<String> {

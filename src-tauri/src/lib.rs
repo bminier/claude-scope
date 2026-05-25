@@ -3,7 +3,7 @@ pub mod audit;
 pub mod commands;
 pub mod io_atomic;
 pub mod model;
-mod preferences;
+pub mod preferences;
 pub mod projects;
 mod runtime;
 pub mod scope;
