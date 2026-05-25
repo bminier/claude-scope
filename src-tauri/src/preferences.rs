@@ -292,10 +292,17 @@ where
 /// give us a config directory (no `$HOME` set, say) — we treat that the same
 /// as "no config yet" and fall back to defaults.
 ///
-/// `CLAUDE_SCOPE_CONFIG_DIR` overrides the default OS location. Used by the
-/// CLI integration tests to point at a sandbox config; also a useful escape
-/// hatch for users who want to relocate preferences (XDG-style on platforms
-/// where `dirs` doesn't honor it natively).
+/// `CLAUDE_SCOPE_CONFIG_DIR` overrides the default OS location. **This is a
+/// developer/test hook, not a user-facing feature.** The CLI integration
+/// tests under `src-tauri/tests/cli.rs` set it on each subprocess to give
+/// every test an isolated sandbox config (the alternative — touching the
+/// developer's real `~/.config/claude-scope/` — would be unsafe and
+/// non-parallel). A power user who knowingly sets this env var to relocate
+/// their config will get the relocation, but there is no UI affordance for
+/// it: the Settings dialog will silently read/write at the override path
+/// with no banner the way `--home`'s sandbox mode shows. If we ever want
+/// to expose config relocation as a real feature, plumb it through
+/// `RuntimeOverrides` instead so the sandbox banner picks it up.
 pub fn config_path() -> Option<PathBuf> {
     if let Some(override_dir) = std::env::var_os("CLAUDE_SCOPE_CONFIG_DIR") {
         return Some(PathBuf::from(override_dir).join("config.json"));
