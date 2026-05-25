@@ -271,6 +271,27 @@ pub fn snapshot_top_level_key(path: &Path, key: &str) -> Option<serde_json::Valu
     doc.and_then(|d| d.get_top_level(key).cloned())
 }
 
+/// Audit-side values captured during an apply_*_leaf_impl invocation,
+/// from the same `load_with_stamp` reads the impl uses for its writes.
+///
+/// Returning these from the impl (rather than having the command boundary
+/// do a separate `snapshot_top_level_key`) closes the race window a
+/// third-party writer could exploit by landing between the command's
+/// pre-snapshot and the impl's own load — pre-fix the audit's `key_before`
+/// could reflect a state the impl never actually overwrote, so a later
+/// undo would silently revert past the third-party edit. See #169.
+///
+/// Move populates both `from_*` and `to_*`. Same-scope change-kind also
+/// fills both, with identical values (one file, recorded as two sides).
+/// Delete fills only `from_*`. Add fills only `to_*`.
+#[derive(Debug, Default)]
+pub struct LeafApplyOutcome {
+    pub from_before: Option<serde_json::Value>,
+    pub from_after: Option<serde_json::Value>,
+    pub to_before: Option<serde_json::Value>,
+    pub to_after: Option<serde_json::Value>,
+}
+
 /// Classify a movable leaf path for the audit log. Path shapes mirror
 /// `validate_movable_path` — re-derived from the path itself rather than
 /// running validate again, because by the time the audit-recording code
@@ -396,36 +417,16 @@ pub fn apply_move_leaf(
     let paths =
         resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
 
-    // Pre-read affected top-level keys so the audit record can carry a
-    // before-snapshot. Done here at the command boundary (rather than
-    // threading through apply_*_impl) so the 30+ impl-level unit tests
-    // stay untouched and the audit instrumentation is purely additive.
     let key = path_top_level_key(&req.path).to_string();
     let from_path = paths.path_for(req.from).map(Path::to_path_buf);
     let to_path = paths.path_for(req.to).map(Path::to_path_buf);
-    let from_before = from_path
-        .as_deref()
-        .and_then(|p| snapshot_top_level_key(p, &key));
-    let to_before = if req.from == req.to {
-        from_before.clone()
-    } else {
-        to_path
-            .as_deref()
-            .and_then(|p| snapshot_top_level_key(p, &key))
-    };
 
-    apply_move_leaf_impl(&paths, &req, backups_for_session(), &watch).map_err(|e| e.to_string())?;
-
-    let from_after = from_path
-        .as_deref()
-        .and_then(|p| snapshot_top_level_key(p, &key));
-    let to_after = if req.from == req.to {
-        from_after.clone()
-    } else {
-        to_path
-            .as_deref()
-            .and_then(|p| snapshot_top_level_key(p, &key))
-    };
+    // The impl returns the before/after values it captured from its own
+    // load_with_stamp — closing the race window a separate pre-snapshot
+    // at this boundary would leave open against a third-party writer
+    // (#169).
+    let outcome = apply_move_leaf_impl(&paths, &req, backups_for_session(), &watch)
+        .map_err(|e| e.to_string())?;
 
     // Same-scope move with `to_kind` set is the "change kind" flow (#8);
     // recorded as its own audit kind so a History reader (#19 Phase 2)
@@ -445,10 +446,16 @@ pub fn apply_move_leaf(
             req.from,
             from_path.as_deref(),
             &key,
-            from_before,
-            from_after,
+            outcome.from_before,
+            outcome.from_after,
         ),
-        audit_side(req.to, to_path.as_deref(), &key, to_before, to_after),
+        audit_side(
+            req.to,
+            to_path.as_deref(),
+            &key,
+            outcome.to_before,
+            outcome.to_after,
+        ),
         req.path.clone(),
         req.to_kind,
     );
@@ -480,16 +487,9 @@ pub fn apply_delete_leaf(
 
     let key = path_top_level_key(&req.path).to_string();
     let from_path = paths.path_for(req.from).map(Path::to_path_buf);
-    let from_before = from_path
-        .as_deref()
-        .and_then(|p| snapshot_top_level_key(p, &key));
 
-    apply_delete_leaf_impl(&paths, &req, backups_for_session(), &watch)
+    let outcome = apply_delete_leaf_impl(&paths, &req, backups_for_session(), &watch)
         .map_err(|e| e.to_string())?;
-
-    let from_after = from_path
-        .as_deref()
-        .and_then(|p| snapshot_top_level_key(p, &key));
 
     let record = audit::Record::new(
         audit::Kind::Delete,
@@ -500,8 +500,8 @@ pub fn apply_delete_leaf(
             req.from,
             from_path.as_deref(),
             &key,
-            from_before,
-            from_after,
+            outcome.from_before,
+            outcome.from_after,
         ),
         None,
         req.path.clone(),
@@ -535,15 +535,17 @@ pub fn apply_add_leaf(
 
     let key = path_top_level_key(&req.path).to_string();
     let to_path = paths.path_for(req.to).map(Path::to_path_buf);
-    let to_before = to_path
-        .as_deref()
-        .and_then(|p| snapshot_top_level_key(p, &key));
 
-    apply_add_leaf_impl(&paths, &req, backups_for_session(), &watch).map_err(|e| e.to_string())?;
+    let outcome = apply_add_leaf_impl(&paths, &req, backups_for_session(), &watch)
+        .map_err(|e| e.to_string())?;
 
-    let to_after = to_path
-        .as_deref()
-        .and_then(|p| snapshot_top_level_key(p, &key));
+    // Idempotent add: the impl returns the same before/after, meaning
+    // nothing was written. Skip the audit append so the History view
+    // doesn't show a phantom Add row that an Undo would treat as the
+    // next undoable op while doing nothing on disk (#172).
+    if outcome.to_before == outcome.to_after {
+        return Ok(());
+    }
 
     let record = audit::Record::new(
         audit::Kind::Add,
@@ -551,7 +553,13 @@ pub fn apply_add_leaf(
         audit::Actor::Gui,
         project_dir.as_ref().map(PathBuf::from),
         None,
-        audit_side(req.to, to_path.as_deref(), &key, to_before, to_after),
+        audit_side(
+            req.to,
+            to_path.as_deref(),
+            &key,
+            outcome.to_before,
+            outcome.to_after,
+        ),
         req.path.clone(),
         None,
     );
@@ -1397,7 +1405,7 @@ pub fn apply_move_leaf_impl(
     req: &MoveLeafRequest,
     backups: Option<&BackupTracker>,
     watch: &WatchState,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<LeafApplyOutcome, Box<dyn std::error::Error>> {
     let movable = validate_movable_path(&req.path)?;
     validate_move_request(req, &movable)?;
 
@@ -1418,6 +1426,12 @@ pub fn apply_move_leaf_impl(
         Some(d) => d,
         None => return Err(format!("source file {} does not exist", from_path.display()).into()),
     };
+    // Capture the source's pre-mutation top-level-key value for the
+    // audit record. From this load — not a separate snapshot at the
+    // command boundary — so a third-party writer that lands between
+    // the command and this point can't leave the audit log claiming a
+    // value the impl never overwrote (#169).
+    let from_key_before = from_doc.get_top_level(affected_key).cloned();
     let src_value =
         from_doc
             .get_at_path(&req.path)
@@ -1494,7 +1508,13 @@ pub fn apply_move_leaf_impl(
         );
     }
     watch.note_self_write(&from_path);
-    Ok(())
+    let from_key_after = from_doc.get_top_level(affected_key).cloned();
+    Ok(LeafApplyOutcome {
+        from_before: from_key_before,
+        from_after: from_key_after,
+        to_before: to_key_before,
+        to_after: to_key_after,
+    })
 }
 
 /// Apply a same-scope change-kind move (#8): one file, one save. Avoids the
@@ -1506,8 +1526,9 @@ fn apply_change_kind_same_scope(
     movable: &MovablePath<'_>,
     backups: Option<&BackupTracker>,
     watch: &WatchState,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<LeafApplyOutcome, Box<dyn std::error::Error>> {
     let path = require_path(paths, req.from)?.to_path_buf();
+    let affected_key = path_top_level_key(&req.path);
     let dest_path = dest_path_for(req);
 
     let (loaded, stamp) = io_atomic::load_with_stamp(&path)?;
@@ -1515,6 +1536,11 @@ fn apply_change_kind_same_scope(
         Some(d) => d,
         None => return Err(format!("source file {} does not exist", path.display()).into()),
     };
+    // Same-scope change-kind: one file, but the audit record carries two
+    // sides (`from` + `to`) referencing it, both pre/post the in-memory
+    // mutation. Capture before/after here from the impl's own load so
+    // the audit values reflect what was actually overwritten (#169).
+    let key_before = doc.get_top_level(affected_key).cloned();
     let src_value =
         doc.get_at_path(&req.path)
             .cloned()
@@ -1541,10 +1567,16 @@ fn apply_change_kind_same_scope(
         )
         .into());
     }
+    let key_after = doc.get_top_level(affected_key).cloned();
 
     io_atomic::save(&path, &doc, backups, Some(&stamp))?;
     watch.note_self_write(&path);
-    Ok(())
+    Ok(LeafApplyOutcome {
+        from_before: key_before.clone(),
+        from_after: key_after.clone(),
+        to_before: key_before,
+        to_after: key_after,
+    })
 }
 
 fn diff_delete_leaf_impl(
@@ -1620,15 +1652,17 @@ fn apply_delete_leaf_impl(
     req: &DeleteLeafRequest,
     backups: Option<&BackupTracker>,
     watch: &WatchState,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<LeafApplyOutcome, Box<dyn std::error::Error>> {
     let movable = validate_movable_path(&req.path)?;
     let path = require_path(paths, req.from)?.to_path_buf();
+    let affected_key = path_top_level_key(&req.path);
 
     let (loaded, stamp) = io_atomic::load_with_stamp(&path)?;
     let mut doc = match loaded {
         Some(d) => d,
         None => return Err(format!("file {} does not exist", path.display()).into()),
     };
+    let key_before = doc.get_top_level(affected_key).cloned();
     let src_value =
         doc.get_at_path(&req.path)
             .cloned()
@@ -1648,9 +1682,15 @@ fn apply_delete_leaf_impl(
         )
         .into());
     }
+    let key_after = doc.get_top_level(affected_key).cloned();
     io_atomic::save(&path, &doc, backups, Some(&stamp))?;
     watch.note_self_write(&path);
-    Ok(())
+    Ok(LeafApplyOutcome {
+        from_before: key_before,
+        from_after: key_after,
+        to_before: None,
+        to_after: None,
+    })
 }
 
 fn diff_add_leaf_impl(
@@ -1698,7 +1738,7 @@ fn apply_add_leaf_impl(
     req: &AddLeafRequest,
     backups: Option<&BackupTracker>,
     watch: &WatchState,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<LeafApplyOutcome, Box<dyn std::error::Error>> {
     let _movable = validate_movable_path(&req.path)?;
     let path = require_path(paths, req.to)?.to_path_buf();
     let affected_key = path_top_level_key(&req.path);
@@ -1709,14 +1749,22 @@ fn apply_add_leaf_impl(
     let mut doc = to_doc_before;
     doc.merge_at_path(&req.path, req.value.clone())?;
     let key_after = doc.get_top_level(affected_key).cloned();
+    let outcome = LeafApplyOutcome {
+        from_before: None,
+        from_after: None,
+        to_before: key_before.clone(),
+        to_after: key_after.clone(),
+    };
     if key_before == key_after {
         // Idempotent add — no write needed. Surface success quietly so the
         // frontend's load() runs without the watcher seeing a stale event.
-        return Ok(());
+        // The outcome still carries the (equal) before/after so the
+        // command can decide whether to skip the audit append (#172).
+        return Ok(outcome);
     }
     io_atomic::save(&path, &doc, backups, Some(&stamp))?;
     watch.note_self_write(&path);
-    Ok(())
+    Ok(outcome)
 }
 
 /// Human-readable note shown on the destination side of a `MoveLeafPreview`.
@@ -3131,6 +3179,121 @@ mod tests {
             vec![key("permissions"), key("allow"), idx(0)],
             None,
         )
+    }
+
+    #[test]
+    fn apply_move_leaf_impl_returns_audit_outcome_matching_disk_state() {
+        // Regression for #169. The impl must return before/after values
+        // captured from its own load_with_stamp — not from a separate
+        // snapshot at the command boundary. The test cuts out the
+        // command boundary entirely and verifies the impl's outcome
+        // reflects the actual transition.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = paths.project.clone().unwrap();
+        let user = paths.user.clone().unwrap();
+        write(&project, r#"{"permissions":{"allow":["X","Y"]}}"#);
+        write(&user, r#"{"permissions":{"allow":["Z"]}}"#);
+
+        let req = MoveLeafRequest {
+            path: vec![key("permissions"), key("allow"), idx(0)],
+            from: Scope::Project,
+            to: Scope::User,
+            to_kind: None,
+        };
+        let outcome = apply_move_leaf_impl(&paths, &req, None, &WatchState::default()).unwrap();
+
+        // from_before reflects the file BEFORE the impl's mutation.
+        assert_eq!(
+            outcome.from_before,
+            Some(serde_json::json!({"allow": ["X", "Y"]}))
+        );
+        // from_after reflects the file AFTER the impl's mutation.
+        assert_eq!(
+            outcome.from_after,
+            Some(serde_json::json!({"allow": ["Y"]}))
+        );
+        assert_eq!(outcome.to_before, Some(serde_json::json!({"allow": ["Z"]})));
+        assert_eq!(
+            outcome.to_after,
+            Some(serde_json::json!({"allow": ["Z", "X"]}))
+        );
+    }
+
+    #[test]
+    fn apply_delete_leaf_impl_returns_audit_outcome() {
+        // Regression for #169 — same shape, delete leaf.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = paths.project.clone().unwrap();
+        write(&project, r#"{"permissions":{"allow":["X","Y"]}}"#);
+
+        let req = DeleteLeafRequest {
+            path: vec![key("permissions"), key("allow"), idx(0)],
+            from: Scope::Project,
+        };
+        let outcome = apply_delete_leaf_impl(&paths, &req, None, &WatchState::default()).unwrap();
+
+        assert_eq!(
+            outcome.from_before,
+            Some(serde_json::json!({"allow": ["X", "Y"]}))
+        );
+        assert_eq!(
+            outcome.from_after,
+            Some(serde_json::json!({"allow": ["Y"]}))
+        );
+        // Delete has no `to` side.
+        assert!(outcome.to_before.is_none());
+        assert!(outcome.to_after.is_none());
+    }
+
+    #[test]
+    fn apply_add_leaf_impl_returns_audit_outcome() {
+        // Regression for #169 — same shape, add leaf.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let user = paths.user.clone().unwrap();
+        write(&user, r#"{"permissions":{"allow":["Z"]}}"#);
+
+        let req = AddLeafRequest {
+            path: vec![key("permissions"), key("allow"), idx(0)],
+            to: Scope::User,
+            value: serde_json::Value::String("NEW".to_string()),
+        };
+        let outcome = apply_add_leaf_impl(&paths, &req, None, &WatchState::default()).unwrap();
+
+        // Add has no `from` side.
+        assert!(outcome.from_before.is_none());
+        assert!(outcome.from_after.is_none());
+        assert_eq!(outcome.to_before, Some(serde_json::json!({"allow": ["Z"]})));
+        // merge_at_path appends; the new rule lands after the existing one.
+        assert_eq!(
+            outcome.to_after,
+            Some(serde_json::json!({"allow": ["Z", "NEW"]}))
+        );
+    }
+
+    #[test]
+    fn apply_add_leaf_impl_idempotent_returns_equal_before_after() {
+        // Regression for #172 (companion to #169). When the rule is
+        // already present at the destination, the impl returns an
+        // outcome with `to_before == to_after` and the command can
+        // skip the audit append rather than emit a phantom entry.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let user = paths.user.clone().unwrap();
+        write(&user, r#"{"permissions":{"allow":["NEW"]}}"#);
+
+        let req = AddLeafRequest {
+            path: vec![key("permissions"), key("allow"), idx(0)],
+            to: Scope::User,
+            value: serde_json::Value::String("NEW".to_string()),
+        };
+        let outcome = apply_add_leaf_impl(&paths, &req, None, &WatchState::default()).unwrap();
+
+        // Same value before and after — caller (`apply_add_leaf`) skips
+        // emit_audit on this signal.
+        assert_eq!(outcome.to_before, outcome.to_after);
     }
 
     #[test]
