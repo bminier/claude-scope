@@ -215,7 +215,11 @@ async function moveLeaf(
   if (moveInFlight) return;
   moveInFlight = true;
   try {
-    const projectDir = state.projectDir;
+    // `opts.projectDir` lets the Move-to submenu redirect a write into
+    // a different known project's `local` / `project` scope (#111).
+    // Without honoring it we'd silently target the currently-open
+    // project regardless of which entry the user clicked.
+    const projectDir = opts?.projectDir ?? state.projectDir;
     // Drag-and-drop drops set `skipConfirm`: the user already expressed
     // intent by dragging onto a target column, so the diff/confirm modal
     // becomes friction (#70). Click-to-move stays gated on the modal as
