@@ -720,6 +720,12 @@ fn undo_redo_target(
     overrides: &RuntimeOverrides,
 ) -> Result<audit::Record, Box<dyn std::error::Error>> {
     let records = require_clean_audit_log(overrides)?;
+    // Audit log boundary check — refuse any record whose Side points
+    // at a path outside the legitimate scope-file allowlist for its
+    // project_dir (#183). A hostile log line can otherwise drive
+    // `apply_restore_plan` to write attacker JSON to any user-writable
+    // path.
+    validate_audit_records(&records, overrides.home())?;
     let state = audit::undo_redo_state(&records);
     let target = match direction {
         audit::RestoreDirection::Undo => state.undoable,
@@ -871,6 +877,14 @@ fn restore_to_point_preview(
 ) -> Result<RestorePreview, Box<dyn std::error::Error>> {
     let id = parse_audit_id(target_id)?;
     let records = require_clean_audit_log(overrides)?;
+    // Validate the entire window before building the plan (#183). Each
+    // record in `[target..]` could reference a different project_dir;
+    // the validator checks each against its own allowlist.
+    let target_idx = records
+        .iter()
+        .position(|r| r.id == id)
+        .ok_or("target audit entry not found in the log")?;
+    validate_audit_records(&records[target_idx..], overrides.home())?;
     let plan = plan_restore_to(&records, id)?;
     let target = records
         .iter()
@@ -903,6 +917,14 @@ fn apply_restore_to_point(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let id = parse_audit_id(target_id)?;
     let records = require_clean_audit_log(overrides)?;
+    // Allowlist gate on the window — see `restore_to_point_preview`.
+    // Mirrored at apply time so a malicious record appended between
+    // preview and apply also fails the security check (#183).
+    let target_idx_for_validate = records
+        .iter()
+        .position(|r| r.id == id)
+        .ok_or("target audit entry not found in the log")?;
+    validate_audit_records(&records[target_idx_for_validate..], overrides.home())?;
     // Identity check first: a concurrent rotate+append can leave the log
     // with a same-length-but-different-records window (codex #166 +
     // #171). Compare the trailing ULID against the preview's snapshot.
@@ -1985,6 +2007,103 @@ fn record_sides(rec: &audit::Record) -> Vec<&audit::Side> {
 fn record_view(rec: audit::Record) -> AuditRecordView {
     let ts_ms = rec.id.timestamp_ms();
     AuditRecordView { record: rec, ts_ms }
+}
+
+/// Validate every record in `records` against the legitimate scope-file
+/// allowlist (#183). Returns an error on the first record whose Side
+/// points outside the resolved [`ScopePaths`] for that record's own
+/// `project_dir`. Used at every audit-log boundary — GUI commands and
+/// CLI subcommands call this immediately after loading records and
+/// before building any [`RestorePlan`], so a hostile audit-log line
+/// can never reach `apply_restore_plan` with an attacker-controlled
+/// `file_path`.
+pub fn validate_audit_records(
+    records: &[audit::Record],
+    home_dir: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in records {
+        for s in record_sides(entry) {
+            validate_audit_path(
+                &s.file_path,
+                &s.top_level_key,
+                entry.project_dir.as_deref(),
+                home_dir,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Verify that an audit-log-derived `file_path` belongs to the legitimate
+/// scope-file allowlist for `record_project_dir` under `home_dir`. Returns
+/// an error if the path is outside the resolved [`ScopePaths`] (local,
+/// project, user_local, user) for that project, or if the basename isn't
+/// a settings file.
+///
+/// Closes the path-injection primitive in #183: without this check, a
+/// hostile audit-log line carrying an arbitrary `file_path` would drive
+/// [`apply_restore_plan`] to write attacker-chosen JSON to any path the
+/// user can write to (including, on Windows, the Startup folder, and on
+/// Unix files like `~/.config/Code/User/settings.json` whose contents
+/// trigger code execution on the next app launch).
+///
+/// Both sides are canonicalized before comparison so a stamp-style path
+/// (`/private/var/...` on macOS, `\\?\C:\...` on Windows) doesn't slip
+/// past byte-equal checks. A canonicalize failure (target file doesn't
+/// exist yet — legitimate for create-on-restore) falls back to lexical
+/// equality, which is safe: the audit log stores the same path string
+/// the resolver produces, so they match without canonicalization too.
+fn validate_audit_path(
+    target_path: &Path,
+    _target_top_level_key: &str,
+    record_project_dir: Option<&Path>,
+    home_dir: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let basename = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if !matches!(basename, "settings.json" | "settings.local.json") {
+        return Err(format!(
+            "audit-log path injection refused: file_path `{}` does not look \
+             like a Claude Code settings file (basename `{}`).",
+            target_path.display(),
+            basename
+        )
+        .into());
+    }
+    let paths = scope::resolve_with_home(record_project_dir, home_dir)?;
+    let allowed: [Option<&Path>; 4] = [
+        paths.local.as_deref(),
+        paths.project.as_deref(),
+        paths.user_local.as_deref(),
+        paths.user.as_deref(),
+    ];
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let target_canon = canon(target_path);
+    if !allowed
+        .iter()
+        .filter_map(|opt| *opt)
+        .any(|allowed_path| canon(allowed_path) == target_canon || allowed_path == target_path)
+    {
+        return Err(format!(
+            "audit-log path injection refused: file_path `{}` is not a \
+             legitimate scope file for project_dir `{}`. \
+             Refusing to restore to a path outside the resolved scope set.",
+            target_path.display(),
+            record_project_dir
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<user-only>".to_string()),
+        )
+        .into());
+    }
+    // Top-level key allowlist is intentionally left for follow-up — the
+    // load-bearing security control is the path allowlist above. A
+    // hostile `top_level_key` on a *legitimate* settings.json file
+    // expands attacker control to the user's own Claude config keys,
+    // which is a much narrower blast radius than the original
+    // arbitrary-file-write primitive.
+    Ok(())
 }
 
 /// Build the plan to undo or redo a single op record.
@@ -3712,6 +3831,116 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
         assert_eq!(v["env"], serde_json::json!({"X": "1"}));
         assert_eq!(v["permissions"], serde_json::json!({"allow": []}));
+    }
+
+    #[test]
+    fn validate_audit_records_refuses_path_outside_scope_allowlist() {
+        // Regression for #183 (security). A hostile audit-log line
+        // carrying a `file_path` outside the resolved ScopePaths for
+        // its `project_dir` must be rejected before any restore plan
+        // is built. Otherwise the apply path would write attacker-
+        // controlled JSON to an attacker-chosen file.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+
+        // Hostile record claims its project is the test's project, but
+        // its Side's file_path points at a totally different file.
+        let hostile = audit::Record::new(
+            audit::Kind::Move,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            Some(paths.project_dir.clone()),
+            None,
+            Some(audit::Side {
+                scope: Scope::User,
+                file_path: tmp.path().join("malicious-target.json"),
+                top_level_key: "permissions".to_string(),
+                key_before: Some(serde_json::json!({})),
+                key_after: Some(serde_json::json!({"allow": ["pwn"]})),
+            }),
+            vec![key("permissions"), key("allow"), idx(0)],
+            None,
+        );
+
+        let home = tmp.path().join("home");
+        let err = validate_audit_records(std::slice::from_ref(&hostile), Some(&home))
+            .expect_err("must refuse path outside scope allowlist");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("path injection refused"),
+            "expected path-injection refusal, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_audit_records_refuses_non_settings_basename() {
+        // Defense-in-depth: even a path the resolver might somehow
+        // produce must end in `settings.json` or `settings.local.json`.
+        // Catches hostile records that try to use the home dir
+        // structure to claim a non-settings basename.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+
+        let hostile = audit::Record::new(
+            audit::Kind::Move,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            Some(paths.project_dir.clone()),
+            None,
+            Some(audit::Side {
+                scope: Scope::Project,
+                file_path: paths.project_dir.join(".claude").join("config.json"), // wrong basename
+                top_level_key: "permissions".to_string(),
+                key_before: None,
+                key_after: Some(serde_json::json!({"allow": ["x"]})),
+            }),
+            vec![key("permissions"), key("allow"), idx(0)],
+            None,
+        );
+
+        let err = validate_audit_records(std::slice::from_ref(&hostile), None)
+            .expect_err("must refuse non-settings basename");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not look like a Claude Code settings file"),
+            "expected basename refusal, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_audit_records_accepts_legitimate_record() {
+        // Sanity: a record produced for a legitimate scope file under
+        // the resolved project must pass.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+
+        let legit = audit::Record::new(
+            audit::Kind::Move,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            Some(paths.project_dir.clone()),
+            Some(audit::Side {
+                scope: Scope::Project,
+                file_path: paths.project.clone().unwrap(),
+                top_level_key: "permissions".to_string(),
+                key_before: Some(serde_json::json!({"allow": ["A"]})),
+                key_after: Some(serde_json::json!({"allow": []})),
+            }),
+            Some(audit::Side {
+                scope: Scope::User,
+                file_path: paths.user.clone().unwrap(),
+                top_level_key: "permissions".to_string(),
+                key_before: Some(serde_json::json!({"allow": []})),
+                key_after: Some(serde_json::json!({"allow": ["A"]})),
+            }),
+            vec![key("permissions"), key("allow"), idx(0)],
+            None,
+        );
+
+        // home_dir matches what paths_in used for user_home.
+        let home = tmp.path().join("home");
+        validate_audit_records(std::slice::from_ref(&legit), Some(&home))
+            .expect("legitimate record must pass");
     }
 
     #[test]
