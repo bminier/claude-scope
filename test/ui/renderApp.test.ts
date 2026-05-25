@@ -201,6 +201,23 @@ describe("renderApp", () => {
     expect(grid!.lastElementChild).toBe(combined);
   });
 
+  it("labels the combined panel as 'Effective settings' with the project dir in the subtitle (#158)", () => {
+    // Reframes the panel from "Combined permissions" (a merge view)
+    // to "Effective settings" (the source-of-truth view for what
+    // applies in this directory). The project dir lands in the
+    // subtitle so the section is self-contained.
+    const scopes = buildLoadedScopes({
+      project_dir: "/work/explicit-project",
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const title = root.querySelector(".combined-title");
+    expect(title?.textContent).toBe("Effective settings");
+    const subtitle = root.querySelector(".combined-subtitle");
+    expect(subtitle?.textContent).toContain("/work/explicit-project");
+    expect(subtitle?.textContent).toContain("union across scopes");
+  });
+
   it("renders the combined permissions panel with allow/deny/ask counts", () => {
     const scopes = buildLoadedScopes({
       scopes: [
