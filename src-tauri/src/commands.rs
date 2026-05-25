@@ -417,6 +417,11 @@ pub fn apply_move_leaf(
     let paths =
         resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
 
+    // Validate the path shape before any helper that assumes "path[0] is a
+    // key" — path_top_level_key panics on a malformed payload, and a panic
+    // across the Tauri FFI boundary becomes an opaque error instead of the
+    // typed validation message that lives one frame deeper (#174).
+    validate_movable_path(&req.path).map_err(|e| e.to_string())?;
     let key = path_top_level_key(&req.path).to_string();
     let from_path = paths.path_for(req.from).map(Path::to_path_buf);
     let to_path = paths.path_for(req.to).map(Path::to_path_buf);
@@ -485,6 +490,8 @@ pub fn apply_delete_leaf(
     let paths =
         resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
 
+    // See #174 — validate before any helper that assumes path[0] is a key.
+    validate_movable_path(&req.path).map_err(|e| e.to_string())?;
     let key = path_top_level_key(&req.path).to_string();
     let from_path = paths.path_for(req.from).map(Path::to_path_buf);
 
@@ -533,6 +540,8 @@ pub fn apply_add_leaf(
     let paths =
         resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
 
+    // See #174 — validate before any helper that assumes path[0] is a key.
+    validate_movable_path(&req.path).map_err(|e| e.to_string())?;
     let key = path_top_level_key(&req.path).to_string();
     let to_path = paths.path_for(req.to).map(Path::to_path_buf);
 
@@ -3454,6 +3463,81 @@ mod tests {
             outcome.to_after,
             Some(serde_json::json!({"allow": ["Z", "NEW"]}))
         );
+    }
+
+    #[test]
+    fn apply_leaf_impls_reject_malformed_paths_without_panicking() {
+        // #174 — Before the fix, the three Tauri command wrappers called
+        // `path_top_level_key(&req.path)` (which `.expect()`s) before any
+        // validation. A malformed IPC payload — empty path, or a path whose
+        // first segment is an Index rather than a Key — would panic across
+        // the FFI boundary instead of returning a typed validation error.
+        // The wrappers now run `validate_movable_path` first; the test pins
+        // the impl behavior that the wrappers now defer to.
+        //
+        // Two malformed shapes per impl:
+        //   - `path = []` exercises the empty-path branch of validation.
+        //   - `path = [Index(0)]` exercises the "first segment is not a key"
+        //     branch (which `validate_movable_path`'s wildcard arm rejects).
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = paths.project.clone().unwrap();
+        write(&project, r#"{"permissions":{"allow":["X"]}}"#);
+
+        let bad_paths: Vec<Vec<PathSeg>> = vec![vec![], vec![idx(0)]];
+
+        for bad in &bad_paths {
+            // Move
+            let err = apply_move_leaf_impl(
+                &paths,
+                &MoveLeafRequest {
+                    path: bad.clone(),
+                    from: Scope::Project,
+                    to: Scope::User,
+                    to_kind: None,
+                },
+                None,
+                &WatchState::default(),
+            )
+            .unwrap_err();
+            assert!(
+                !err.to_string().is_empty(),
+                "move expected typed error for {bad:?}, got empty"
+            );
+
+            // Delete
+            let err = apply_delete_leaf_impl(
+                &paths,
+                &DeleteLeafRequest {
+                    path: bad.clone(),
+                    from: Scope::Project,
+                },
+                None,
+                &WatchState::default(),
+            )
+            .unwrap_err();
+            assert!(
+                !err.to_string().is_empty(),
+                "delete expected typed error for {bad:?}, got empty"
+            );
+
+            // Add
+            let err = apply_add_leaf_impl(
+                &paths,
+                &AddLeafRequest {
+                    path: bad.clone(),
+                    to: Scope::Project,
+                    value: serde_json::Value::String("X".into()),
+                },
+                None,
+                &WatchState::default(),
+            )
+            .unwrap_err();
+            assert!(
+                !err.to_string().is_empty(),
+                "add expected typed error for {bad:?}, got empty"
+            );
+        }
     }
 
     #[test]
