@@ -34,10 +34,11 @@ narrowest-on-the-right**:
 
 That's the opposite of precedence order. ClaudeScope's column order is
 about *audience* — User-scope rules affect every project, Local-scope
-rules affect one. The "Combined permissions" panel above the columns is
-a simple union across scopes; it's **not** a full precedence-aware
-evaluation of what Claude Code resolves at runtime, and the subtitle in
-the app says so.
+rules affect one. The **Effective settings** panel is the trailing column
+in the same row, summarizing what applies in the active directory.
+Default-collapsed with inline counts; expand to see the full union
+across scopes. It's **not** a full precedence-aware evaluation of what
+Claude Code resolves at runtime — the subtitle in the app says so.
 
 ## Per-scope file presence
 

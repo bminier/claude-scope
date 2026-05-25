@@ -956,7 +956,12 @@ function combinedPanel(loaded: LoadedScopes, props: AppProps, lowerQuery: string
   summary.className = "combined-summary";
   const title = document.createElement("span");
   title.className = "combined-title";
-  title.textContent = "Combined permissions";
+  // Reframe from "Combined permissions" (a merge view) to "Effective
+  // settings" (the source-of-truth view for what Claude Code applies
+  // in this directory). The data itself is unchanged — same union
+  // across scopes — but the label now matches the question the user
+  // is actually asking when they look here. See #158.
+  title.textContent = "Effective settings";
   summary.appendChild(title);
   // Inline kind-count summary so the collapsed state still tells the
   // user what's in the combined view at a glance. Reads "5 allow ·
@@ -979,9 +984,24 @@ function combinedPanel(loaded: LoadedScopes, props: AppProps, lowerQuery: string
     props.onToggleCombinedPanelCollapsed(!panel.open);
   });
 
+  // Subtitle: name the directory this panel is summarizing, with the
+  // honest "union, not precedence-aware" caveat right after. Putting
+  // the project dir in the panel itself (#158) makes the section
+  // self-contained — a user who scrolls down to the effective view
+  // doesn't have to look back up at the topbar to confirm which
+  // directory's settings they're reading.
   const subtitle = document.createElement("p");
   subtitle.className = "combined-subtitle";
-  subtitle.textContent = "Union across scopes — not a precedence-aware evaluation.";
+  if (loaded.project_dir) {
+    const forDir = document.createElement("span");
+    forDir.className = "combined-subtitle-dir";
+    forDir.textContent = `for ${loaded.project_dir}`;
+    subtitle.appendChild(forDir);
+    subtitle.appendChild(document.createTextNode(" · "));
+  }
+  subtitle.appendChild(
+    document.createTextNode("union across scopes — not a precedence-aware evaluation"),
+  );
   panel.appendChild(subtitle);
 
   // Three side-by-side group columns instead of stacked rows. The grid

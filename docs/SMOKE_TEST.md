@@ -63,9 +63,11 @@ reviewer.
 ## Golden path
 
 - [ ] **All four scope columns render.** User / User-Local / Project / Local
-      appear left-to-right; the "Combined permissions" panel shows the union
-      across scopes on top, with the precedence-aware-evaluation caveat in
-      its subtitle.
+      appear left-to-right; the **Effective settings** panel is the trailing
+      column. It's collapsed by default with an inline `N allow · N deny ·
+      N ask` summary, naming the project directory in its subtitle. Expanding
+      shows the union across scopes with the precedence-aware-evaluation
+      caveat.
 - [ ] **Click-to-move a permission rule.** From any populated scope, click a
       `→ <Scope>` button on a rule → diff modal opens with before/after for
       both sides → click **Apply** → modal closes, rule disappears from
