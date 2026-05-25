@@ -120,22 +120,51 @@ succeeds, so a failure here means the file is updated but not
 logged — which is the safe direction for ambiguity.
 
 Tauri emits an `audit-error` event when an append fails, surfaced as
-a non-fatal warning in the GUI.
+a non-fatal warning in the GUI; the CLI prints the same information
+to stderr.
 
-## Rotation
+## Rotation and concurrency (#166)
 
-Once `audit.jsonl` exceeds the configurable size cap (default
-10 MB), `rotate_if_needed` runs before the next append. The active
-file is renamed to `audit-YYYY-MM.jsonl` (using the file's mtime, so
-the stamp reflects the data inside) and the next entry lands in a
-fresh `audit.jsonl`. Same-month collisions become `-2`, `-3`, ...
-suffixes.
+Two ClaudeScope sessions can target the same audit log — a GUI plus a
+CLI invocation, two CLI invocations in different shells, or a Claude
+Code skill driving the CLI alongside an open GUI. The rotation +
+append sequence has to behave correctly under that interleaving.
 
-The reader **only scans the active file**. Archives are archival —
-the History dialog and `claude-scope-cli history` don't surface
-them. Undo / redo and restore-to-point are bounded to the active log
-for the same reason; restoring across an archive boundary would be a
-separate feature.
+**Cross-process lock.** Every rotate-then-append pair runs inside
+`audit::persist`, which holds an advisory exclusive lock on
+`<audit_dir>/audit.lock` for the duration. `fs2` provides the
+cross-platform primitive (`flock` on POSIX, `LockFileEx` on
+Windows). Two processes both arriving with the active log near the
+cap serialize on the lock: the first rotates and appends to a fresh
+active file; the second waits, sees the active file is fresh
+(under cap, no rotation needed), and appends to the same fresh
+file.
+
+**Archive-aware reads.** Even with the lock, `audit.jsonl` may have
+been rotated into `audit-YYYY-MM.jsonl` between two appends — that's
+the normal-case behavior under rotation, not a bug. `audit::read_all`
+therefore enumerates every `audit-*.jsonl` archive in the directory,
+reads them in filename order (which is chronological — the naming
+encodes `YYYY-MM` plus collision suffix), then reads the active log,
+and returns the concatenated record stream. Undo / redo / history
+all see every persisted record regardless of which file it lives in.
+
+**File naming.** The active log is `audit.jsonl`. The first
+rotation lands at `audit-YYYY-MM.jsonl` using the file's mtime so
+the stamp reflects the data inside. Same-month collisions become
+`audit-YYYY-MM-2.jsonl`, `audit-YYYY-MM-3.jsonl`, … — the lex order
+of those filenames also matches chronological order, so the
+archive enumeration above stays sorted without timestamp parsing.
+
+**Cap.** Default 10 MB, configurable under Settings → Audit log
+rotation. The cap is on the **active** file's size; archives can
+grow unbounded across history.
+
+**Restore across archives.** Phase 4 (`plan_restore_to`) builds its
+window from `audit::read_all`, which now spans archives. Restoring
+to a point that lives in an archive works the same way as restoring
+to a point in the active log — same `record_sides` walk, same per-
+file snapshot revert.
 
 ## Sandbox
 

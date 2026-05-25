@@ -600,3 +600,52 @@ fn cli_undo_aborts_when_audit_log_changes_during_confirm_prompt() {
         "project settings must be unchanged after a refused undo"
     );
 }
+
+/// #170 — CLI undo / redo / restore must refuse against a log with
+/// unreadable lines. A corrupt restore line could leave the state
+/// machine pointing at an op that's already undone; running undo
+/// against that would emit a duplicate restore entry. Refuse with a
+/// clear message and non-zero status instead.
+#[test]
+fn cli_undo_refuses_when_audit_log_has_unreadable_lines() {
+    let sb = Sandbox::new();
+    sb.write_project(r#"{"permissions":{"allow":["Bash(git status)"]}}"#);
+    sb.write_user(r#"{"permissions":{"allow":[]}}"#);
+
+    // Seed one valid CLI move so there's something the state machine
+    // would have considered undoable.
+    let mv = sb.run(&[
+        "move",
+        "Bash(git status)",
+        "--kind",
+        "allow",
+        "--from",
+        "project",
+        "--to",
+        "user",
+    ]);
+    assert!(mv.status.success(), "seed move failed: {}", stderr(&mv));
+
+    // Append a malformed line to the audit log. `audit::read_all` will
+    // count it as `skipped`. The CLI's `read_audit_log` should refuse.
+    let audit_path = sb
+        .home
+        .join(".claude")
+        .join("claude-scope")
+        .join("audit.jsonl");
+    let mut existing = std::fs::read_to_string(&audit_path).expect("read audit log");
+    existing.push_str("{ not even close to valid json }\n");
+    std::fs::write(&audit_path, existing).expect("rewrite audit log with corrupt line");
+
+    let out = sb.run(&["undo", "--yes"]);
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit on degraded log, got success. stderr: {}",
+        stderr(&out)
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("unreadable") && err.contains("partial log"),
+        "expected staleness error on stderr, got: {err}"
+    );
+}

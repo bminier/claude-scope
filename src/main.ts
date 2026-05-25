@@ -433,8 +433,11 @@ function handleRedo(trigger?: HTMLElement): void {
  * the History dialog closes itself first so the confirm modal opens clean.
  */
 function handleRestoreToPoint(rec: AuditRecordView): void {
-  // `expected_ops_spanned` guards against the log growing between preview
-  // and apply — the backend reverts only the span the user confirmed.
+  // `expected_ops_spanned` + `expected_tail_id` guard against the log
+  // changing between preview and apply. Ops_spanned catches the common
+  // case (an extra op was appended → window grows); tail_id catches the
+  // rarer same-length case (a concurrent rotate+append left the window
+  // with the same count but different records — #171).
   void runRestoreFlow(
     "Restore",
     () => invoke<RestorePreview>("audit_restore_to_point_preview", { target_id: rec.id }),
@@ -442,6 +445,7 @@ function handleRestoreToPoint(rec: AuditRecordView): void {
       invoke("audit_apply_restore_to_point", {
         target_id: rec.id,
         expected_ops_spanned: preview.ops_spanned,
+        expected_tail_id: preview.tail_id ?? null,
       }),
   );
 }
