@@ -748,7 +748,11 @@ fn cmd_move(
     };
 
     if dry_run {
-        let preview = diff_move_leaf_impl(paths, &req)?;
+        // CLI move is single-project: pass `paths` to both sides of the
+        // #179-split impl. The cross-project case lives only on the GUI's
+        // Move-to submenu (#111); the CLI's `move` subcommand keeps its
+        // single `--project-dir` surface until #140's `move-key` lands.
+        let preview = diff_move_leaf_impl(paths, paths, &req)?;
         print_preview(&preview, json)?;
         return Ok(());
     }
@@ -761,6 +765,7 @@ fn cmd_move(
     let from_file = paths.path_for(from).map(Path::to_path_buf);
     let to_file = paths.path_for(to).map(Path::to_path_buf);
     let outcome = apply_move_leaf_impl(
+        paths,
         paths,
         &req,
         cli_backups_for_session(),

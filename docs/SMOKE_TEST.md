@@ -137,6 +137,19 @@ reviewer.
       between two scopes that share a file: the apply should fail with a
       typed error naming both scopes and the shared path. Close and
       re-open against a normal project root; the banner disappears.
+- [ ] **Cross-project Move-to: same-scope unlock (#179, #181).** Set up
+      two project sandboxes (e.g. `/tmp/cs-smoke-a` and `/tmp/cs-smoke-b`,
+      each with a `.claude/settings.local.json` containing a different
+      rule). Launch ClaudeScope against Project A. Right-click a rule
+      in **Local** → **Move to** → **project-b** submenu — both
+      `Local` **and** `Project` appear (pre-#181 only one of them did).
+      Pick `Local`: the diff modal shows source = Project A's Local
+      and destination = Project B's Local (two different files); apply
+      and confirm both files on disk changed. Open Project B's
+      `.claude/settings.local.json` to verify the moved rule landed
+      there, NOT in Project A's `settings.json`. Run **Undo** — both
+      files revert in one shot. Inspect History — the entry's
+      `project_dir` shows Project A, `project_dir_to` shows Project B.
 - [ ] **Kind-disagreement badge (#156).** Hand-edit a rule into two
       scopes under different kinds — e.g. `Bash(git push)` as `allow` in
       User and `deny` in Project. Reload. A red ⚠ badge appears next to

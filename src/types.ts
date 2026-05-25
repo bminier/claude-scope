@@ -140,14 +140,16 @@ export interface AddLeafRequest {
 export interface MoveOptions {
   skipConfirm?: boolean;
   /**
-   * Override the active project root for this single move. The Move-to
-   * submenu (#111) lets a user redirect a rule into a *different*
-   * project's `local` or `project` scope; without this override the
-   * dispatch would silently use `state.projectDir` and land the write
-   * in the currently-open project's settings instead of the chosen
-   * one. See codex 6th-pass [P1].
+   * Destination project root override (#179). The Move-to submenu's
+   * cross-project items set this so the destination side of the move
+   * resolves under the chosen project's `.claude/`, independent of the
+   * currently-viewed project. Pre-#179 single-field analog
+   * (`projectDir`) is now subsumed by this — same effect for the
+   * common User-sourced cross-project move, but additionally enables
+   * cross-project same-scope moves (`Local → Local` across two
+   * projects, #181) which the single field couldn't express.
    */
-  projectDir?: string;
+  projectDirTo?: string;
 }
 
 /**
