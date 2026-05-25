@@ -25,8 +25,16 @@ build:
 
 # --- lint / fmt / test ---------------------------------------------------
 
+# Read-only JS/TS static analysis: biome (lint) + tsc --noEmit
+# (typecheck). Both must pass for `just check` to clear. tsc catches
+# strict-type regressions that biome's syntactic lint doesn't — e.g.
+# missing fields on `PropsOverrides`, return-type drift, unhandled
+# null branches. Vite's build runs tsc too, but kicking it in via the
+# lint pipeline closes the gap where vitest (which doesn't strict-
+# typecheck) passes locally and CI's `npm run build` fails late.
 js-lint:
     npm run lint
+    npm run typecheck
 
 rs-lint:
     cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

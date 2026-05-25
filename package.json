@@ -12,7 +12,8 @@
     "tauri": "tauri",
     "lint": "biome check",
     "format": "biome format --write",
-    "test:unit": "vitest run"
+    "test:unit": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",
