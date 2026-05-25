@@ -1898,7 +1898,11 @@ function treeBranch(
   peek.textContent = treeBranchPeek(path, value, lowerQuery);
   summary.appendChild(peek);
   if (props && offerMoveAffordance) {
-    summary.appendChild(leafMoveButtons(scope, path, props));
+    // Move affordance is now right-click only (#152). The inline
+    // arrow buttons were redundant once the Move-to submenu (#111)
+    // surfaced every legitimate target including cross-project
+    // entries — keyboard drag (#41) and the context menu cover the
+    // remaining gestures.
     attachContextMenu(summary, () => leafContextMenuItems(scope, path, value, props));
   }
   details.appendChild(summary);
@@ -2143,10 +2147,9 @@ function treeLeaf(
     const badge = lintBadge(rule);
     if (badge) row.appendChild(badge);
     if (props) {
-      // Pass the rule string as the move-button label so the screen
-      // reader announces "Move Bash(git status) from …" instead of
-      // the meaningless path "permissions.allow[0]".
-      row.appendChild(leafMoveButtons(scope, path, props, rule));
+      // Inline arrow buttons dropped in #152 — right-click context
+      // menu (with the full Move-to submenu, including cross-project
+      // targets) is now the canonical click affordance.
       attachContextMenu(row, () => leafContextMenuItems(scope, path, value, props));
     }
     return row;
@@ -2182,49 +2185,12 @@ function treeLeaf(
   val.textContent = formatLeaf(value);
   row.appendChild(val);
   if (props && offerMoveAffordance) {
-    row.appendChild(leafMoveButtons(scope, path, props));
+    // Inline arrow buttons dropped in #152 — right-click context menu
+    // is the canonical click affordance; keyboard drag (#41) was wired
+    // by `setupLeafDragSource` above.
     attachContextMenu(row, () => leafContextMenuItems(scope, path, value, props));
   }
   return row;
-}
-
-function leafMoveButtons(
-  scope: Scope,
-  path: PathSeg[],
-  props: AppProps,
-  // Optional override for the screen-reader label. Permission rule rows
-  // pass the rule string so the button announces something meaningful;
-  // top-level key and rule-list rows fall back to the path's
-  // dotted-bracket form, which is informative at that level.
-  ariaSubject?: string,
-): HTMLElement {
-  const moveBtns = document.createElement("div");
-  moveBtns.className = "rule-moves tree-key-moves";
-  const subject = ariaSubject ?? describePath(path);
-  for (const target of SCOPES) {
-    if (target === scope) continue;
-    // Mirror scopeGrid: don't offer moves into columns the user hid — the
-    // result would land in a column they can't see without re-enabling it.
-    if (!isScopeVisible(target)) continue;
-    const btn = document.createElement("button");
-    btn.className = "move-btn";
-    btn.type = "button";
-    btn.textContent = `→ ${SCOPE_LABELS[target]}`;
-    btn.setAttribute(
-      "aria-label",
-      `Move ${subject} from ${SCOPE_LABELS[scope]} to ${SCOPE_LABELS[target]}`,
-    );
-    btn.disabled = props.busy;
-    btn.addEventListener("click", (e) => {
-      // Clicks on the summary element would otherwise toggle the <details>;
-      // the move action is a distinct intent, so swallow propagation.
-      e.preventDefault();
-      e.stopPropagation();
-      props.onMoveLeaf({ path, from: scope, to: target }, e.currentTarget as HTMLElement);
-    });
-    moveBtns.appendChild(btn);
-  }
-  return moveBtns;
 }
 
 /**
