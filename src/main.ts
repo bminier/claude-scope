@@ -217,11 +217,16 @@ async function moveLeaf(
   if (moveInFlight) return;
   moveInFlight = true;
   try {
-    // `opts.projectDir` lets the Move-to submenu redirect a write into
-    // a different known project's `local` / `project` scope (#111).
-    // Without honoring it we'd silently target the currently-open
-    // project regardless of which entry the user clicked.
-    const projectDir = opts?.projectDir ?? state.projectDir;
+    // The source side always lives in the currently-viewed project
+    // (the rule the user is clicking on is rendered against
+    // `state.projectDir`). The destination side may be a different
+    // project when the Move-to submenu's cross-project items are
+    // picked — `opts.projectDirTo` carries that override (#179). For
+    // same-project moves both sides resolve to the same root and the
+    // backend's `resolve_move_paths` collapses them into one
+    // `ScopePaths` so the IPC stays zero-extra-cost on the hot path.
+    const projectDirFrom = state.projectDir ?? undefined;
+    const projectDirTo = opts?.projectDirTo ?? projectDirFrom;
     // Drag-and-drop drops set `skipConfirm`: the user already expressed
     // intent by dragging onto a target column, so the diff/confirm modal
     // becomes friction (#70). Click-to-move stays gated on the modal as
@@ -235,7 +240,8 @@ async function moveLeaf(
       try {
         preview = await invoke<MoveLeafPreview>("diff_move_leaf", {
           req,
-          project_dir: projectDir,
+          project_dir_from: projectDirFrom,
+          project_dir_to: projectDirTo,
         });
       } catch (err) {
         alert(`Move failed: ${err}`);
@@ -249,7 +255,11 @@ async function moveLeaf(
     state.busy = true;
     render();
     try {
-      await invoke("apply_move_leaf", { req, project_dir: projectDir });
+      await invoke("apply_move_leaf", {
+        req,
+        project_dir_from: projectDirFrom,
+        project_dir_to: projectDirTo,
+      });
       // load() owns busy cleanup + final render on success — don't
       // duplicate that work in a finally block.
       //

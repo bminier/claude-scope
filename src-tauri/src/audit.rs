@@ -77,9 +77,24 @@ pub struct Record {
     pub actor: Actor,
     /// Project root that scoped the operation. `None` for user-scope-only
     /// ops (e.g. moving a rule into User scope from another user-level
-    /// scope — there is no project context).
+    /// scope — there is no project context). For a single-project op
+    /// (the usual case), this is the only project root the record
+    /// references. For a cross-project move, this is the **source**'s
+    /// project root; the destination's lives in
+    /// [`project_dir_to`](Record::project_dir_to). See #179.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_dir: Option<PathBuf>,
+    /// Destination project root, set ONLY when a [`Kind::Move`] crossed
+    /// project boundaries — i.e. `apply_move_leaf` was invoked with a
+    /// `project_dir_to` distinct from `project_dir_from`. Single-project
+    /// moves leave this `None` and the wire format stays identical to
+    /// pre-#179 records (the `skip_serializing_if` ensures the field is
+    /// omitted, not emitted as `null`). On read, a missing field
+    /// deserializes to `None` and the restore path falls back to
+    /// `project_dir` for the to-side's allowlist resolution, so existing
+    /// audit logs replay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir_to: Option<PathBuf>,
     /// Source side. `None` for [`Kind::Add`] (no source) and for every
     /// [`Kind::Restore`] entry — restores carry their per-file snapshots in
     /// [`Record::restore`] instead, since they can touch more than two files.
@@ -249,6 +264,7 @@ impl Record {
             leaf_kind,
             actor,
             project_dir,
+            project_dir_to: None,
             from,
             to,
             path,
@@ -256,6 +272,16 @@ impl Record {
             restore: None,
             claude_scope_version: current_version(),
         }
+    }
+
+    /// Tag a [`Kind::Move`] record with a distinct destination project
+    /// root for the cross-project case (#179). Single-project callers
+    /// don't need this — they leave `project_dir_to` at its default
+    /// `None`, which the restore path treats as "same as project_dir."
+    /// Returning `Self` keeps the call site a one-liner builder chain.
+    pub fn with_project_dir_to(mut self, project_dir_to: Option<PathBuf>) -> Self {
+        self.project_dir_to = project_dir_to;
+        self
     }
 
     /// Construct a [`Kind::Restore`] record for an undo / redo /
@@ -277,6 +303,7 @@ impl Record {
             leaf_kind,
             actor,
             project_dir,
+            project_dir_to: None,
             from: None,
             to: None,
             path,

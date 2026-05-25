@@ -3645,14 +3645,23 @@ function buildMoveToSubmenu(
     });
   }
   for (const project of projects) {
+    // Same-scope-name moves within ONE project are a no-op (Local→Local
+    // in the same file makes no sense — the legacy "must differ"
+    // rejection). Across DIFFERENT projects they're meaningful: a rule
+    // in Project A's Local moves into Project B's Local (#181). So
+    // skip `target === from` only when this iteration's project is the
+    // currently-loaded one — for other projects, the full
+    // local + project matrix is fair game.
+    const isCurrentProject = project.root === props.projectDir;
     const inner: MenuItem[] = [];
     for (const target of ["local", "project"] as Scope[]) {
-      if (target === from) continue;
+      if (isCurrentProject && target === from) continue;
       if (!isScopeVisible(target)) continue;
       // Pass `project.root` so the outer onPick wires it through to
       // `onMoveLeaf` as a project override (#111 + codex 6th-pass [P1]).
-      // Without this, choosing `OtherProject > Project` silently
-      // landed the rule in the CURRENT project's settings file.
+      // For the same-name cross-project case (#181) this is what makes
+      // the destination address the other project's file rather than
+      // collapsing to the source's.
       inner.push({
         label: SCOPE_LABELS[target],
         onClick: () => onPick(target, project.root),
@@ -3960,7 +3969,7 @@ function leafContextMenuItems(
     props.onMoveLeaf(
       { path, from: scope, to: target },
       undefined,
-      projectRoot ? { projectDir: projectRoot } : undefined,
+      projectRoot ? { projectDirTo: projectRoot } : undefined,
     );
   });
   items.push({
@@ -3994,7 +4003,7 @@ function combinedChipContextMenuItems(
         props.onMoveLeaf(
           { path: sourcePath, from: sourceScope, to: target },
           undefined,
-          projectRoot ? { projectDir: projectRoot } : undefined,
+          projectRoot ? { projectDirTo: projectRoot } : undefined,
         );
       });
       items.push({

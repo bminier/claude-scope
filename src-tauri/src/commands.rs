@@ -260,6 +260,30 @@ fn resolve_with_overrides(
     scope::resolve_with_home(project_path.as_deref(), overrides.home())
 }
 
+/// Resolve a `(paths_from, paths_to)` pair for a move-leaf command (#179).
+/// Each side honors its own optional `project_dir_*` override; an absent
+/// side falls back to the single-project `project_dir` argument, which in
+/// turn falls back to the runtime override or cwd walk-up. When the two
+/// project dirs end up equal — the usual single-project case — only one
+/// resolution is done and the resulting `ScopePaths` is cloned, so this
+/// helper is zero-extra-work on the hot path.
+fn resolve_move_paths(
+    project_dir: Option<&str>,
+    project_dir_from: Option<&str>,
+    project_dir_to: Option<&str>,
+    overrides: &RuntimeOverrides,
+) -> std::io::Result<(ScopePaths, ScopePaths)> {
+    let from_arg = project_dir_from.or(project_dir);
+    let to_arg = project_dir_to.or(project_dir);
+    if from_arg == to_arg {
+        let paths = resolve_with_overrides(from_arg, overrides)?;
+        return Ok((paths.clone(), paths));
+    }
+    let paths_from = resolve_with_overrides(from_arg, overrides)?;
+    let paths_to = resolve_with_overrides(to_arg, overrides)?;
+    Ok((paths_from, paths_to))
+}
+
 #[tauri::command]
 pub fn load_scopes(
     project_dir: Option<String>,
@@ -293,15 +317,25 @@ pub fn load_scopes(
     Ok(loaded)
 }
 
+/// Diff-preview a move-leaf op (#8). Per-side `project_dir_from` /
+/// `project_dir_to` overrides mirror `apply_move_leaf` for symmetry —
+/// either absent falls back to the single-project `project_dir` (#179).
 #[tauri::command]
 pub fn diff_move_leaf(
     req: MoveLeafRequest,
     project_dir: Option<String>,
+    project_dir_from: Option<String>,
+    project_dir_to: Option<String>,
     overrides: State<'_, RuntimeOverrides>,
 ) -> Result<MoveLeafPreview, String> {
-    let paths =
-        resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
-    diff_move_leaf_impl(&paths, &req).map_err(|e| e.to_string())
+    let (paths_from, paths_to) = resolve_move_paths(
+        project_dir.as_deref(),
+        project_dir_from.as_deref(),
+        project_dir_to.as_deref(),
+        &overrides,
+    )
+    .map_err(|e| e.to_string())?;
+    diff_move_leaf_impl(&paths_from, &paths_to, &req).map_err(|e| e.to_string())
 }
 
 /// Snapshot the value of a single top-level key on `path` if the file
@@ -450,16 +484,31 @@ fn emit_audit(app: &AppHandle, overrides: &RuntimeOverrides, record: audit::Reco
     }
 }
 
+/// Apply a move-leaf op (#8). When `project_dir_from` / `project_dir_to`
+/// are set, the matching side's [`ScopePaths`] resolves under that root
+/// instead of the single-project `project_dir` — used by the Move-to
+/// submenu's cross-project branch (#111 / #181), where a move from the
+/// current project's Local into OtherProject's Local sets the two
+/// overrides to the two project roots. Either field absent (`None`) falls
+/// back to `project_dir`, so existing single-project callers keep their
+/// IPC shape unchanged (#179).
 #[tauri::command]
 pub fn apply_move_leaf(
     req: MoveLeafRequest,
     project_dir: Option<String>,
+    project_dir_from: Option<String>,
+    project_dir_to: Option<String>,
     app: AppHandle,
     watch: State<'_, WatchState>,
     overrides: State<'_, RuntimeOverrides>,
 ) -> Result<(), String> {
-    let paths =
-        resolve_with_overrides(project_dir.as_deref(), &overrides).map_err(|e| e.to_string())?;
+    let (paths_from, paths_to) = resolve_move_paths(
+        project_dir.as_deref(),
+        project_dir_from.as_deref(),
+        project_dir_to.as_deref(),
+        &overrides,
+    )
+    .map_err(|e| e.to_string())?;
 
     // Validate the path shape before any helper that assumes "path[0] is a
     // key" — path_top_level_key panics on a malformed payload, and a panic
@@ -467,14 +516,14 @@ pub fn apply_move_leaf(
     // typed validation message that lives one frame deeper (#174).
     validate_movable_path(&req.path).map_err(|e| e.to_string())?;
     let key = path_top_level_key(&req.path).to_string();
-    let from_path = paths.path_for(req.from).map(Path::to_path_buf);
-    let to_path = paths.path_for(req.to).map(Path::to_path_buf);
+    let from_path = paths_from.path_for(req.from).map(Path::to_path_buf);
+    let to_path = paths_to.path_for(req.to).map(Path::to_path_buf);
 
     // The impl returns the before/after values it captured from its own
     // load_with_stamp — closing the race window a separate pre-snapshot
     // at this boundary would leave open against a third-party writer
     // (#169).
-    let outcome = apply_move_leaf_impl(&paths, &req, backups_for_session(), &watch)
+    let outcome = apply_move_leaf_impl(&paths_from, &paths_to, &req, backups_for_session(), &watch)
         .map_err(|e| e.to_string())?;
 
     // Same-scope move with `to_kind` set is the "change kind" flow (#8);
@@ -486,11 +535,29 @@ pub fn apply_move_leaf(
     } else {
         audit::Kind::Move
     };
+    // Audit metadata splits on cross-project: `project_dir` holds the
+    // source root (or the only root for single-project ops);
+    // `project_dir_to` holds the destination root only when it actually
+    // differs from the source — single-project moves leave the field at
+    // its default `None`, keeping wire compatibility with pre-#179
+    // records.
+    let audit_project_dir_from = project_dir_from
+        .as_ref()
+        .or(project_dir.as_ref())
+        .map(PathBuf::from);
+    let audit_project_dir_to_raw = project_dir_to
+        .as_ref()
+        .or(project_dir.as_ref())
+        .map(PathBuf::from);
+    let audit_project_dir_to = match (&audit_project_dir_from, &audit_project_dir_to_raw) {
+        (Some(f), Some(t)) if f == t => None,
+        (_, t) => t.clone(),
+    };
     let record = audit::Record::new(
         kind,
         audit_leaf_kind(&req.path),
         audit::Actor::Gui,
-        project_dir.as_ref().map(PathBuf::from),
+        audit_project_dir_from,
         audit_side(
             req.from,
             from_path.as_deref(),
@@ -507,7 +574,8 @@ pub fn apply_move_leaf(
         ),
         req.path.clone(),
         req.to_kind,
-    );
+    )
+    .with_project_dir_to(audit_project_dir_to);
     emit_audit(&app, &overrides, record);
     Ok(())
 }
@@ -1400,28 +1468,42 @@ fn dest_path_for(req: &MoveLeafRequest) -> Vec<PathSeg> {
 fn validate_move_request(
     req: &MoveLeafRequest,
     movable: &MovablePath<'_>,
-    paths: &ScopePaths,
+    paths_from: &ScopePaths,
+    paths_to: &ScopePaths,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Cross-scope moves between two scopes whose resolved file paths point
-    // at the same on-disk file are no-ops at best and silently destructive
-    // at worst — the rule lands in the same file under the same key,
-    // overwriting itself. Refuse with a typed error rather than letting
-    // the apply path waste a write or, worse, succeed and leave the
-    // user thinking the move took effect (#153). Same-scope change-kind
-    // (req.from == req.to) is unaffected because the *operation* still
-    // mutates the file's permissions object meaningfully.
-    if req.from != req.to {
-        let from_path = paths.path_for(req.from);
-        let to_path = paths.path_for(req.to);
+    let from_path = paths_from.path_for(req.from);
+    let to_path = paths_to.path_for(req.to);
+
+    // Path-collision check (#153 + #179). Two move shapes collapse to a
+    // file-overwrites-itself no-op:
+    //   - Cross-scope-name same-file: project + user resolve to the same
+    //     `~/.claude/settings.json` when the project root is $HOME (#153).
+    //   - Same-scope-name same-project: the legacy "move local to local"
+    //     within one project, where validate has always rejected because
+    //     there's no meaningful destination distinct from the source.
+    //
+    // The two cases collapse into one check: if the resolved source and
+    // destination paths match, reject. Same-scope change-kind
+    // (`req.from == req.to` with `to_kind` set) skips this gate — the op
+    // mutates the file's permissions object meaningfully even though the
+    // source and destination files are by definition identical.
+    let is_same_scope_change_kind = req.from == req.to && req.to_kind.is_some();
+    if !is_same_scope_change_kind {
         if let (Some(fp), Some(tp)) = (from_path, to_path) {
             if fp == tp {
                 return Err(format!(
-                    "{} and {} both resolve to {} — these scopes share the same file on disk, \
-                     so a move between them would be a no-op. Open a different project root \
-                     to give the scopes distinct files.",
+                    "{} and {} both resolve to {} — a move between them would \
+                     just overwrite the file with itself. {}",
                     req.from.label(),
                     req.to.label(),
                     fp.display(),
+                    if req.from == req.to {
+                        "Pick a different destination scope or use a different \
+                         project for the destination side."
+                    } else {
+                        "Open a different project root to give the scopes \
+                         distinct files."
+                    },
                 )
                 .into());
             }
@@ -1442,31 +1524,33 @@ fn validate_move_request(
         (Some(_), _) => Err(
             "to_kind only applies to a single permission rule path (permissions.<kind>[i])".into(),
         ),
-        (None, _) => {
-            if req.from == req.to {
-                return Err("source and destination scopes must differ".into());
-            }
-            Ok(())
-        }
+        (None, _) => Ok(()),
     }
 }
 
 pub fn diff_move_leaf_impl(
-    paths: &ScopePaths,
+    paths_from: &ScopePaths,
+    paths_to: &ScopePaths,
     req: &MoveLeafRequest,
 ) -> Result<MoveLeafPreview, Box<dyn std::error::Error>> {
     let movable = validate_movable_path(&req.path)?;
-    validate_move_request(req, &movable, paths)?;
+    validate_move_request(req, &movable, paths_from, paths_to)?;
 
-    if req.from == req.to {
-        // Same-scope change-kind: load the file once, simulate add+remove on
-        // a single in-memory doc so the diff reflects what the apply path
-        // will write in one shot.
-        return diff_change_kind_same_scope(paths, req, &movable);
+    // Mirror `apply_move_leaf_impl`'s dispatch: the single-file branch
+    // fires when source and destination resolve to the same on-disk
+    // file, not just when `req.from == req.to`. Same rationale (#179):
+    // cross-project `Local → Local` is a two-file move, not a
+    // change-kind.
+    let same_file = match (paths_from.path_for(req.from), paths_to.path_for(req.to)) {
+        (Some(fp), Some(tp)) => fp == tp,
+        _ => false,
+    };
+    if same_file {
+        return diff_change_kind_same_scope(paths_from, req, &movable);
     }
 
-    let from_path = require_path(paths, req.from)?;
-    let to_path = require_path(paths, req.to)?;
+    let from_path = require_path(paths_from, req.from)?;
+    let to_path = require_path(paths_to, req.to)?;
     let affected_key = path_top_level_key(&req.path);
     let dest_path = dest_path_for(req);
 
@@ -1638,23 +1722,36 @@ fn diff_change_kind_same_scope(
 }
 
 pub fn apply_move_leaf_impl(
-    paths: &ScopePaths,
+    paths_from: &ScopePaths,
+    paths_to: &ScopePaths,
     req: &MoveLeafRequest,
     backups: Option<&BackupTracker>,
     watch: &WatchState,
 ) -> Result<LeafApplyOutcome, Box<dyn std::error::Error>> {
     let movable = validate_movable_path(&req.path)?;
-    validate_move_request(req, &movable, paths)?;
+    validate_move_request(req, &movable, paths_from, paths_to)?;
 
-    if req.from == req.to {
-        // Same-scope change-kind: one file, one write. Apply add+remove to
-        // a single in-memory doc so the destination kind is updated and the
-        // source kind cleaned up in a single atomic save.
-        return apply_change_kind_same_scope(paths, req, &movable, backups, watch);
+    // Take the single-file change-kind branch only when source and
+    // destination resolve to the same on-disk file. Pre-#179, that was
+    // equivalent to `req.from == req.to`; with the cross-project split
+    // (#179), `Local → Local` between two different projects is a real
+    // two-file move and needs the cross-scope branch below. Use the
+    // resolved paths as the discriminator rather than the scope enums
+    // so the dispatch stays correct under any future `ScopePaths`
+    // variation.
+    let same_file = match (paths_from.path_for(req.from), paths_to.path_for(req.to)) {
+        (Some(fp), Some(tp)) => fp == tp,
+        _ => false,
+    };
+    if same_file {
+        // Same-scope change-kind: one file, one write. Same-file
+        // implies one project, so `paths_from` is the only meaningful
+        // side.
+        return apply_change_kind_same_scope(paths_from, req, &movable, backups, watch);
     }
 
-    let from_path = require_path(paths, req.from)?.to_path_buf();
-    let to_path = require_path(paths, req.to)?.to_path_buf();
+    let from_path = require_path(paths_from, req.from)?.to_path_buf();
+    let to_path = require_path(paths_to, req.to)?.to_path_buf();
     let affected_key = path_top_level_key(&req.path);
     let dest_path = dest_path_for(req);
 
@@ -2206,16 +2303,50 @@ pub fn validate_audit_records(
     home_dir: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for entry in records {
+        // Cross-project records (#179) carry two project roots: the
+        // source's lives in `project_dir`, the destination's in
+        // `project_dir_to`. Each side's `file_path` is validated against
+        // *both* allowlists — passing under either is acceptable.
+        // Single-project records leave `project_dir_to` at `None`, in
+        // which case the from + to allowlists collapse to the same set
+        // and the check stays identical to pre-#179 behavior.
+        let project_dirs: [Option<&Path>; 2] = [
+            entry.project_dir.as_deref(),
+            entry.project_dir_to.as_deref(),
+        ];
         for s in record_sides(entry) {
-            validate_audit_path(
+            validate_audit_path_against_any(
                 &s.file_path,
                 &s.top_level_key,
-                entry.project_dir.as_deref(),
+                &project_dirs,
                 home_dir,
             )?;
         }
     }
     Ok(())
+}
+
+/// `validate_audit_path` wrapper that accepts multiple candidate
+/// `project_dir`s and passes the path through if any of them allows it.
+/// The first allow wins; only when all fail do we surface the error
+/// (using the first non-`None` project_dir for the message context so
+/// the legacy single-project case keeps its existing diagnostic).
+fn validate_audit_path_against_any(
+    target_path: &Path,
+    top_level_key: &str,
+    project_dirs: &[Option<&Path>],
+    home_dir: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut first_err: Option<Box<dyn std::error::Error>> = None;
+    for pd in project_dirs {
+        match validate_audit_path(target_path, top_level_key, *pd, home_dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if first_err.is_none() => first_err = Some(e),
+            Err(_) => {}
+        }
+    }
+    Err(first_err
+        .unwrap_or_else(|| -> Box<dyn std::error::Error> { "no project_dir candidates".into() }))
 }
 
 /// Verify that an audit-log-derived `file_path` belongs to the legitimate
@@ -2943,6 +3074,179 @@ mod tests {
     }
 
     #[test]
+    fn apply_move_leaf_impl_moves_local_rule_across_project_boundaries() {
+        // #179 — A rule in Project A's Local scope can be moved into
+        // Project B's Local scope when the impl is called with the two
+        // sides' [`ScopePaths`] resolved independently. Pre-#179 the
+        // backend resolved both sides from one project root, so this
+        // path errored with "source not found" (codex 6th-pass [P1] in
+        // PR #178). Pins the headline cross-project win.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_a = tmp.path().join("a");
+        let project_b = tmp.path().join("b");
+        std::fs::create_dir_all(project_a.join(".claude")).unwrap();
+        std::fs::create_dir_all(project_b.join(".claude")).unwrap();
+        let user_home = tmp.path().join("home");
+        std::fs::create_dir_all(user_home.join(".claude")).unwrap();
+        let paths_from = ScopePaths {
+            project_dir: project_a.clone(),
+            local: Some(project_a.join(".claude").join("settings.local.json")),
+            project: Some(project_a.join(".claude").join("settings.json")),
+            user_local: Some(user_home.join(".claude").join("settings.local.json")),
+            user: Some(user_home.join(".claude").join("settings.json")),
+        };
+        let paths_to = ScopePaths {
+            project_dir: project_b.clone(),
+            local: Some(project_b.join(".claude").join("settings.local.json")),
+            project: Some(project_b.join(".claude").join("settings.json")),
+            user_local: Some(user_home.join(".claude").join("settings.local.json")),
+            user: Some(user_home.join(".claude").join("settings.json")),
+        };
+        let from_file = paths_from.local.clone().unwrap();
+        let to_file = paths_to.local.clone().unwrap();
+        write(&from_file, r#"{"permissions":{"allow":["Bash(rm)"]}}"#);
+
+        let outcome = apply_move_leaf_impl(
+            &paths_from,
+            &paths_to,
+            &MoveLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Local,
+                to: Scope::Local,
+                to_kind: None,
+            },
+            None,
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        // Source file in project A no longer holds the rule.
+        let from_doc = io_atomic::load(&from_file).unwrap().unwrap();
+        assert!(from_doc.permissions().allow.is_empty());
+        // Destination file in project B holds it.
+        let to_doc = io_atomic::load(&to_file).unwrap().unwrap();
+        assert_eq!(to_doc.permissions().allow, vec!["Bash(rm)".to_string()]);
+        // Outcome's `from`/`to` snapshots track each project's file
+        // separately — load-with-stamp captured each before/after from
+        // its own side, so a cross-project undo can later restore each.
+        assert_eq!(
+            outcome.from_before,
+            Some(serde_json::json!({"allow": ["Bash(rm)"]}))
+        );
+        assert_eq!(outcome.from_after, Some(serde_json::json!({"allow": []})));
+        assert!(
+            outcome.to_before.is_none(),
+            "destination file did not exist"
+        );
+        assert_eq!(
+            outcome.to_after,
+            Some(serde_json::json!({"allow": ["Bash(rm)"]}))
+        );
+    }
+
+    #[test]
+    fn apply_move_leaf_impl_moves_project_rule_across_project_boundaries() {
+        // Sibling to the local→local test for the project→project case:
+        // a rule in Project A's `Project` scope (committed) moves into
+        // Project B's `Project` scope. Same physical scope name on both
+        // sides — pre-#179 the resolver would have looked for the
+        // source under the destination's root and failed.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_a = tmp.path().join("a");
+        let project_b = tmp.path().join("b");
+        std::fs::create_dir_all(project_a.join(".claude")).unwrap();
+        std::fs::create_dir_all(project_b.join(".claude")).unwrap();
+        let paths_from = ScopePaths {
+            project_dir: project_a.clone(),
+            local: Some(project_a.join(".claude").join("settings.local.json")),
+            project: Some(project_a.join(".claude").join("settings.json")),
+            user_local: None,
+            user: None,
+        };
+        let paths_to = ScopePaths {
+            project_dir: project_b.clone(),
+            local: Some(project_b.join(".claude").join("settings.local.json")),
+            project: Some(project_b.join(".claude").join("settings.json")),
+            user_local: None,
+            user: None,
+        };
+        let from_file = paths_from.project.clone().unwrap();
+        let to_file = paths_to.project.clone().unwrap();
+        write(&from_file, r#"{"permissions":{"allow":["Read(**)"]}}"#);
+
+        apply_move_leaf_impl(
+            &paths_from,
+            &paths_to,
+            &MoveLeafRequest {
+                path: vec![key("permissions"), key("allow"), idx(0)],
+                from: Scope::Project,
+                to: Scope::Project,
+                to_kind: None,
+            },
+            None,
+            &WatchState::default(),
+        )
+        .unwrap();
+
+        assert!(io_atomic::load(&from_file)
+            .unwrap()
+            .unwrap()
+            .permissions()
+            .allow
+            .is_empty());
+        assert_eq!(
+            io_atomic::load(&to_file)
+                .unwrap()
+                .unwrap()
+                .permissions()
+                .allow,
+            vec!["Read(**)".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_move_paths_falls_back_to_project_dir_when_per_side_unset() {
+        // Backwards-compat: the IPC must accept the pre-#179 shape (just
+        // `project_dir`) and treat both sides as that root. Without this
+        // fallback, every existing same-project caller would break.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        let overrides = RuntimeOverrides::default();
+        let (paths_from, paths_to) =
+            resolve_move_paths(Some(project.to_str().unwrap()), None, None, &overrides).unwrap();
+        assert_eq!(paths_from.project_dir, paths_to.project_dir);
+        assert_eq!(paths_from.project_dir, project);
+    }
+
+    #[test]
+    fn resolve_move_paths_honors_per_side_overrides_when_set() {
+        // The new IPC shape: each side gets its own root. The fallback to
+        // `project_dir` only fires when a side is `None`, so passing both
+        // overrides drives the genuinely two-root resolution path.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_a = tmp.path().join("a");
+        let project_b = tmp.path().join("b");
+        std::fs::create_dir_all(project_a.join(".claude")).unwrap();
+        std::fs::create_dir_all(project_b.join(".claude")).unwrap();
+        let overrides = RuntimeOverrides::default();
+        let (paths_from, paths_to) = resolve_move_paths(
+            None,
+            Some(project_a.to_str().unwrap()),
+            Some(project_b.to_str().unwrap()),
+            &overrides,
+        )
+        .unwrap();
+        assert_eq!(paths_from.project_dir, project_a);
+        assert_eq!(paths_to.project_dir, project_b);
+        // User-scope paths in both sides resolve under the same `$HOME`
+        // (overrides.home is None, so both sides use the real home dir or
+        // None on a no-home environment). The two ScopePaths still
+        // diverge on the local/project scopes — that's the point.
+        assert_ne!(paths_from.local, paths_to.local);
+    }
+
+    #[test]
     fn validate_move_request_refuses_cross_scope_move_into_a_colliding_pair() {
         // #153 — Even with the path-collision banner up, the user could
         // still try to drag a rule from User to Project when both
@@ -2970,10 +3274,14 @@ mod tests {
             to: Scope::User,
             to_kind: None,
         };
-        let err = apply_move_leaf_impl(&paths, &req, None, &WatchState::default()).unwrap_err();
+        let err =
+            apply_move_leaf_impl(&paths, &paths, &req, None, &WatchState::default()).unwrap_err();
         let msg = err.to_string();
+        // Post-#179 the collision message folds the cross-scope and
+        // same-scope same-file cases into one wording — "overwrite the
+        // file with itself" is the substring shared by both branches.
         assert!(
-            msg.contains("share the same file"),
+            msg.contains("overwrite the file with itself"),
             "expected collision-message error, got: {msg}"
         );
     }
@@ -3167,6 +3475,7 @@ mod tests {
 
         apply_move_leaf_impl(
             &paths,
+            &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow"), idx(0)],
                 from: Scope::Project,
@@ -3213,6 +3522,7 @@ mod tests {
         );
 
         apply_move_leaf_impl(
+            &paths,
             &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow"), idx(0)],
@@ -3266,6 +3576,7 @@ mod tests {
 
         apply_move_leaf_impl(
             &paths,
+            &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow"), idx(0)],
                 from: Scope::Project,
@@ -3308,6 +3619,7 @@ mod tests {
         );
 
         apply_move_leaf_impl(
+            &paths,
             &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow"), idx(0)],
@@ -3354,6 +3666,7 @@ mod tests {
         );
 
         apply_move_leaf_impl(
+            &paths,
             &paths,
             &MoveLeafRequest {
                 path: vec![key("env")],
@@ -3404,6 +3717,7 @@ mod tests {
 
         apply_move_leaf_impl(
             &paths,
+            &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow")],
                 from: Scope::Project,
@@ -3442,6 +3756,7 @@ mod tests {
         );
 
         let preview = diff_move_leaf_impl(
+            &paths,
             &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow"), idx(0)],
@@ -3485,6 +3800,7 @@ mod tests {
         );
         let err = apply_move_leaf_impl(
             &paths,
+            &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions")],
                 from: Scope::Project,
@@ -3505,6 +3821,7 @@ mod tests {
         write(paths.project.as_ref().unwrap(), r#"{"theme":"dark"}"#);
         let err = apply_move_leaf_impl(
             &paths,
+            &paths,
             &MoveLeafRequest {
                 path: vec![key("theme")],
                 from: Scope::Project,
@@ -3515,7 +3832,11 @@ mod tests {
             &WatchState::default(),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("must differ"));
+        // Post-#179: the "same scope" rejection was folded into the
+        // path-collision message, since same-scope same-project is just
+        // a special case of "source and destination resolve to the
+        // same file."
+        assert!(err.to_string().contains("overwrite the file with itself"));
     }
 
     #[test]
@@ -3524,6 +3845,7 @@ mod tests {
         let paths = paths_in(tmp.path());
         write(paths.project.as_ref().unwrap(), r#"{"permissions":{}}"#);
         let err = apply_move_leaf_impl(
+            &paths,
             &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow"), idx(0)],
@@ -3554,6 +3876,7 @@ mod tests {
         );
 
         apply_move_leaf_impl(
+            &paths,
             &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow"), idx(0)],
@@ -3590,6 +3913,7 @@ mod tests {
 
         apply_move_leaf_impl(
             &paths,
+            &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow"), idx(0)],
                 from: Scope::Project,
@@ -3623,6 +3947,7 @@ mod tests {
         );
 
         apply_move_leaf_impl(
+            &paths,
             &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow"), idx(0)],
@@ -3660,6 +3985,7 @@ mod tests {
         );
         let err = apply_move_leaf_impl(
             &paths,
+            &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow"), idx(0)],
                 from: Scope::Project,
@@ -3686,6 +4012,7 @@ mod tests {
         );
         let err_list = apply_move_leaf_impl(
             &paths,
+            &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow")],
                 from: Scope::Project,
@@ -3699,6 +4026,7 @@ mod tests {
         assert!(err_list.to_string().contains("to_kind only applies"));
 
         let err_key = apply_move_leaf_impl(
+            &paths,
             &paths,
             &MoveLeafRequest {
                 path: vec![key("theme")],
@@ -3728,6 +4056,7 @@ mod tests {
         );
 
         let preview = diff_move_leaf_impl(
+            &paths,
             &paths,
             &MoveLeafRequest {
                 path: vec![key("permissions"), key("allow"), idx(0)],
@@ -3803,7 +4132,8 @@ mod tests {
             to: Scope::User,
             to_kind: None,
         };
-        let outcome = apply_move_leaf_impl(&paths, &req, None, &WatchState::default()).unwrap();
+        let outcome =
+            apply_move_leaf_impl(&paths, &paths, &req, None, &WatchState::default()).unwrap();
 
         // from_before reflects the file BEFORE the impl's mutation.
         assert_eq!(
@@ -3900,6 +4230,7 @@ mod tests {
             // Move
             let err = apply_move_leaf_impl(
                 &paths,
+                &paths,
                 &MoveLeafRequest {
                     path: bad.clone(),
                     from: Scope::Project,
@@ -3973,7 +4304,8 @@ mod tests {
             to: Scope::Project,
             to_kind: Some(PermissionKind::Deny),
         };
-        let outcome = apply_move_leaf_impl(&paths, &req, None, &WatchState::default()).unwrap();
+        let outcome =
+            apply_move_leaf_impl(&paths, &paths, &req, None, &WatchState::default()).unwrap();
 
         // Same-scope: from_* and to_* describe the same file, before/after
         // the in-memory mutation. The two pre-write captures should be
@@ -4600,6 +4932,91 @@ mod tests {
         let home = tmp.path().join("home");
         validate_audit_records(std::slice::from_ref(&legit), Some(&home))
             .expect("legitimate record must pass");
+    }
+
+    #[test]
+    fn validate_audit_records_accepts_cross_project_move_with_both_project_dirs() {
+        // #179 — A Move record whose from-side lives in Project A and
+        // to-side in Project B must validate. Each side's file_path is
+        // checked against the allowlist of its OWN project_dir (the
+        // record's `project_dir` for from, `project_dir_to` for to).
+        // Without the per-side dispatch the to-side's path would be
+        // rejected as "outside Project A's allowlist."
+        let tmp = tempfile::tempdir().unwrap();
+        let project_a = tmp.path().join("a");
+        let project_b = tmp.path().join("b");
+        std::fs::create_dir_all(project_a.join(".claude")).unwrap();
+        std::fs::create_dir_all(project_b.join(".claude")).unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+
+        let from_path = project_a.join(".claude").join("settings.local.json");
+        let to_path = project_b.join(".claude").join("settings.local.json");
+        std::fs::write(&from_path, r#"{"permissions":{"allow":[]}}"#).unwrap();
+        std::fs::write(&to_path, r#"{"permissions":{"allow":["X"]}}"#).unwrap();
+
+        let record = audit::Record::new(
+            audit::Kind::Move,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            Some(project_a.clone()),
+            Some(audit::Side {
+                scope: Scope::Local,
+                file_path: from_path,
+                top_level_key: "permissions".to_string(),
+                key_before: Some(serde_json::json!({"allow": ["X"]})),
+                key_after: Some(serde_json::json!({"allow": []})),
+            }),
+            Some(audit::Side {
+                scope: Scope::Local,
+                file_path: to_path,
+                top_level_key: "permissions".to_string(),
+                key_before: Some(serde_json::json!({"allow": []})),
+                key_after: Some(serde_json::json!({"allow": ["X"]})),
+            }),
+            vec![key("permissions"), key("allow"), idx(0)],
+            None,
+        )
+        .with_project_dir_to(Some(project_b));
+
+        validate_audit_records(std::slice::from_ref(&record), Some(&home))
+            .expect("cross-project record must pass with both project_dirs");
+    }
+
+    #[test]
+    fn validate_audit_records_refuses_cross_project_path_outside_both_allowlists() {
+        // Defense: tagging a record with `project_dir_to` doesn't open
+        // a wider injection surface. A file_path that's outside BOTH
+        // project allowlists still gets rejected.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_a = tmp.path().join("a");
+        let project_b = tmp.path().join("b");
+        std::fs::create_dir_all(project_a.join(".claude")).unwrap();
+        std::fs::create_dir_all(project_b.join(".claude")).unwrap();
+        let home = tmp.path().join("home");
+
+        let hostile_path = tmp.path().join("malicious.json");
+        let record = audit::Record::new(
+            audit::Kind::Move,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            Some(project_a),
+            None,
+            Some(audit::Side {
+                scope: Scope::Local,
+                file_path: hostile_path,
+                top_level_key: "permissions".to_string(),
+                key_before: None,
+                key_after: Some(serde_json::json!({"allow": ["pwn"]})),
+            }),
+            vec![key("permissions"), key("allow"), idx(0)],
+            None,
+        )
+        .with_project_dir_to(Some(project_b));
+
+        let err = validate_audit_records(std::slice::from_ref(&record), Some(&home))
+            .expect_err("must refuse path outside both project allowlists");
+        assert!(err.to_string().contains("path injection refused"));
     }
 
     #[test]
@@ -5292,7 +5709,7 @@ mod tests {
         let from_before = snapshot_top_level_key(paths.project.as_ref().unwrap(), &key_name);
         let to_before = snapshot_top_level_key(paths.user.as_ref().unwrap(), &key_name);
 
-        apply_move_leaf_impl(&paths, &req, None, &WatchState::default()).unwrap();
+        apply_move_leaf_impl(&paths, &paths, &req, None, &WatchState::default()).unwrap();
 
         let from_after = snapshot_top_level_key(paths.project.as_ref().unwrap(), &key_name);
         let to_after = snapshot_top_level_key(paths.user.as_ref().unwrap(), &key_name);

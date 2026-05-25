@@ -616,6 +616,104 @@ describe("context menu (#8)", () => {
     expect(moveItems).toContain("other-repo");
   });
 
+  it("offers same-scope-name targets when the project differs (#181)", () => {
+    // Pre-#181 the submenu skipped `target === from` in every nested
+    // project, hiding the cross-project same-name move entirely. Now
+    // the skip only fires for the CURRENT project (where Local→Local
+    // really is a no-op against the same file). Project A's Local
+    // should expose `Local` AND `Project` under Project B's submenu.
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "local", permissions: { allow: ["Bash(git push)"] } }],
+      project_dir: "/tmp/project-a",
+    });
+    renderApp(
+      root,
+      makeProps({
+        scopes,
+        knownProjects: [
+          { name: "project-a", root: "/tmp/project-a" },
+          { name: "project-b", root: "/tmp/project-b" },
+        ],
+      }),
+    );
+    const ruleRow = root.querySelector<HTMLElement>(".rule.rule-allow");
+    if (!ruleRow) throw new Error("expected rule row");
+    rightClick(ruleRow);
+    findMenuItem("Move to")?.click();
+    findMenuItem("project-b")?.click();
+    // Three menus visible: root, Move-to, project-b's submenu.
+    const menus = document.querySelectorAll<HTMLElement>(".context-menu");
+    expect(menus.length).toBe(3);
+    const projectBItems = Array.from(
+      menus[2].querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    ).map((b) => b.textContent?.replace(/\s*▸$/, "").trim() ?? "");
+    expect(projectBItems).toContain("Local");
+    expect(projectBItems).toContain("Project");
+  });
+
+  it("still hides the same-scope-name target under the CURRENT project (#181)", () => {
+    // Sanity: the skip is preserved within the loaded project, since
+    // Local→Local against the SAME file is the legacy no-op we still
+    // want to suppress.
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "local", permissions: { allow: ["Bash(git push)"] } }],
+      project_dir: "/tmp/project-a",
+    });
+    renderApp(
+      root,
+      makeProps({
+        scopes,
+        knownProjects: [{ name: "project-a", root: "/tmp/project-a" }],
+      }),
+    );
+    const ruleRow = root.querySelector<HTMLElement>(".rule.rule-allow");
+    if (!ruleRow) throw new Error("expected rule row");
+    rightClick(ruleRow);
+    findMenuItem("Move to")?.click();
+    findMenuItem("project-a")?.click();
+    const menus = document.querySelectorAll<HTMLElement>(".context-menu");
+    const projectAItems = Array.from(
+      menus[2].querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    ).map((b) => b.textContent?.replace(/\s*▸$/, "").trim() ?? "");
+    // Source is Local; current project's Local should NOT appear.
+    expect(projectAItems).not.toContain("Local");
+    expect(projectAItems).toContain("Project");
+  });
+
+  it("dispatches onMoveLeaf with projectDirTo for a cross-project pick (#179, #181)", () => {
+    // The submenu wires the chosen project's root through to
+    // `onMoveLeaf` as `opts.projectDirTo` — that's the field
+    // `main.ts`'s moveLeaf consumes to send `project_dir_to` to the
+    // backend. Without it, the destination would silently resolve
+    // under the currently-viewed project's root.
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "local", permissions: { allow: ["Bash(git push)"] } }],
+      project_dir: "/tmp/project-a",
+    });
+    const onMoveLeaf = vi.fn();
+    renderApp(
+      root,
+      makeProps({
+        scopes,
+        onMoveLeaf,
+        knownProjects: [
+          { name: "project-a", root: "/tmp/project-a" },
+          { name: "project-b", root: "/tmp/project-b" },
+        ],
+      }),
+    );
+    const ruleRow = root.querySelector<HTMLElement>(".rule.rule-allow");
+    if (!ruleRow) throw new Error("expected rule row");
+    rightClick(ruleRow);
+    findMenuItem("Move to")?.click();
+    findMenuItem("project-b")?.click();
+    findMenuItem("Local")?.click();
+    expect(onMoveLeaf).toHaveBeenCalledTimes(1);
+    const [req, _trigger, opts] = onMoveLeaf.mock.calls[0];
+    expect(req).toMatchObject({ from: "local", to: "local" });
+    expect(opts).toEqual({ projectDirTo: "/tmp/project-b" });
+  });
+
   it("closes the context menu on Escape", () => {
     const scopes = buildLoadedScopes({
       scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
