@@ -118,6 +118,25 @@ describe("renderApp", () => {
     expect(empty?.textContent).toBe("No settings loaded.");
   });
 
+  it("places the combined panel as the trailing column inside the scope grid", () => {
+    // Regression for #154. Combined panel used to be a separate band
+    // above the per-scope grid; now it's the trailing column inside
+    // the same grid, peer to Local / Project / User-Local / User.
+    // Two assertions: parent-child relationship, and trailing position
+    // among the grid's children.
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const grid = root.querySelector(".grid");
+    const combined = root.querySelector(".combined");
+    expect(grid).not.toBeNull();
+    expect(combined).not.toBeNull();
+    expect(combined!.parentElement).toBe(grid);
+    // Combined panel is the LAST child of the grid — peers come first.
+    expect(grid!.lastElementChild).toBe(combined);
+  });
+
   it("renders the combined permissions panel with allow/deny/ask counts", () => {
     const scopes = buildLoadedScopes({
       scopes: [

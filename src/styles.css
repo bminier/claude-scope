@@ -320,9 +320,15 @@ button:disabled {
 }
 
 .combined {
-  padding: 12px 16px;
+  /* `.combined` now renders as the trailing column inside `.grid`
+     alongside `.col` (#154). Match `.col`'s card chrome so the row
+     reads as a uniform set of panels rather than a special one. */
   background: var(--panel);
-  border-bottom: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
 }
 
 .combined h2 {

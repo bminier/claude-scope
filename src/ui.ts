@@ -609,7 +609,9 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   // Lowercase the query once per render instead of per rule; scopeGrid/
   // combinedPanel push this down into every filter call.
   const lowerQuery = props.query.toLowerCase();
-  root.appendChild(combinedPanel(props.scopes, props, lowerQuery));
+  // The combined panel renders inside scopeGrid as the trailing
+  // column (#154) — peers with Local / Project / User-Local / User
+  // so the whole "what's where" view sits in one row.
   root.appendChild(scopeGrid(props, lowerQuery));
   restoreSearchFocus(preserveSearchFocus, caret);
   // Re-apply the cross-pane highlight (#49) once the new chips are
@@ -2259,6 +2261,11 @@ function scopeGrid(props: AppProps, lowerQuery: string): HTMLElement {
     if (!view) continue;
     grid.appendChild(scopeColumn(view, props, lowerQuery));
   }
+  // Combined panel as the trailing column (#154). It's a peer of the
+  // per-scope columns rather than a separate band so the user reads
+  // the row as "Local / Project / User-Local / User → Combined" — the
+  // effective view sits where the precedence flow naturally lands.
+  grid.appendChild(combinedPanel(loaded, props, lowerQuery));
   return grid;
 }
 
