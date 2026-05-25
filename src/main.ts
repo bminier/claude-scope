@@ -250,7 +250,18 @@ async function moveLeaf(
       await invoke("apply_move_leaf", { req, project_dir: projectDir });
       // load() owns busy cleanup + final render on success — don't
       // duplicate that work in a finally block.
-      await load(projectDir);
+      //
+      // Reload the CURRENTLY VIEWED project, not the projectDir used
+      // for the move. Cross-project Move-to (#111) uses
+      // opts.projectDir to redirect the write into a different
+      // project, but the user is still looking at state.projectDir —
+      // reloading the override would silently context-switch the UI
+      // to the other project (scopes panel, watcher, recent-projects
+      // LRU). The source side of the move still belonged to
+      // state.projectDir (or User scope, which is project-independent),
+      // so reloading state.projectDir is the right refresh for what
+      // the user sees. Codex/code-review post-fix finding.
+      await load(state.projectDir);
     } catch (err) {
       alert(`Move failed: ${err}`);
       state.busy = false;
