@@ -601,6 +601,69 @@ fn cli_undo_aborts_when_audit_log_changes_during_confirm_prompt() {
     );
 }
 
+/// #183 (security): a hostile audit-log line carrying a `file_path`
+/// outside the legitimate scope set must be refused by the CLI restore
+/// pipeline. Without the allowlist gate, `claude-scope-cli undo --yes`
+/// would write attacker-controlled JSON to the attacker-chosen path.
+#[test]
+fn cli_undo_refuses_audit_record_pointing_outside_scope_allowlist() {
+    use claude_scope_lib::audit;
+    use claude_scope_lib::model::{PathSeg, PermissionKind};
+    use claude_scope_lib::scope::Scope as ScopeEnum;
+
+    let sb = Sandbox::new();
+    sb.write_project(r#"{"permissions":{"allow":[]}}"#);
+    sb.write_user(r#"{"permissions":{"allow":[]}}"#);
+
+    let malicious_target_path = sb._tmp.path().join("attacker-chosen.json");
+
+    // Construct a hostile record via the real audit:: API so the
+    // serde shape is guaranteed correct (the threat model is "attacker
+    // gets one well-formed line into audit.jsonl"). project_dir
+    // claims the legitimate sandbox project; the Side's file_path
+    // points outside the resolved ScopePaths.
+    let hostile = audit::Record::new(
+        audit::Kind::Move,
+        audit::LeafKind::PermissionRule,
+        audit::Actor::Gui,
+        Some(sb.project.clone()),
+        None,
+        Some(audit::Side {
+            scope: ScopeEnum::User,
+            file_path: malicious_target_path.clone(),
+            top_level_key: "permissions".to_string(),
+            key_before: Some(serde_json::json!({"allow": []})),
+            key_after: Some(serde_json::json!({"allow": ["pwn"]})),
+        }),
+        vec![
+            PathSeg::Key("permissions".to_string()),
+            PathSeg::Key("allow".to_string()),
+            PathSeg::Index(0),
+        ],
+        None::<PermissionKind>,
+    );
+    audit::append(&hostile, Some(sb.home.as_path())).expect("write hostile line");
+
+    let out = sb.run(&["undo", "--yes"]);
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit on hostile audit record, got success. stderr: {}",
+        stderr(&out)
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("path injection refused"),
+        "expected path-injection refusal on stderr, got: {err}"
+    );
+
+    // The attacker's target file must NOT exist — the hostile write
+    // was prevented BEFORE any I/O happened.
+    assert!(
+        !malicious_target_path.exists(),
+        "hostile target file must not have been written"
+    );
+}
+
 /// Codex 3rd-pass [P1] — even the post-confirm re-read in
 /// `run_cli_restore` must refuse a degraded log. A malformed line
 /// appended during the prompt window doesn't change the trailing
