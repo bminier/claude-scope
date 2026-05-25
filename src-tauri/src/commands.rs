@@ -2270,6 +2270,64 @@ fn current_top_level(
     Ok((current, exists))
 }
 
+/// Order-insensitive deep equality for `serde_json::Value`.
+///
+/// `serde_json` is built with `preserve_order` (Cargo.toml:27), so
+/// `Value::Object` is backed by `IndexMap` and `Value::eq` compares object
+/// keys in **insertion order**. That makes a file whose top-level key has
+/// the same KV pairs in a different order than the audit snapshot
+/// byte-unequal under `==`, even though no data changed. For the restore
+/// preview/apply equality checks (`will_write`, `state_mismatch`,
+/// phase-2 no-change skip) that means a user's deliberate key
+/// reordering reads as destructive: the preview flags `state_mismatch`,
+/// the apply doesn't skip, and `io_atomic::save` overwrites the
+/// reordering with the audit snapshot's order — silently losing the
+/// user's intent (#176).
+///
+/// The fix treats object key order as **presentation**, not data:
+///
+/// - Objects: same length, every key on one side has a semantically
+///   equal value on the other side. Insertion order ignored.
+/// - Arrays: order-sensitive (a reordered `permissions.allow` list is
+///   distinct from the original — Claude Code treats the list as a set
+///   but ClaudeScope preserves index ordering, so reorderings remain
+///   first-class).
+/// - Scalars: identical to `==`.
+fn values_semantically_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value::*;
+    match (a, b) {
+        (Null, Null) => true,
+        (Bool(x), Bool(y)) => x == y,
+        (Number(x), Number(y)) => x == y,
+        (String(x), String(y)) => x == y,
+        (Array(x), Array(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|(a, b)| values_semantically_equal(a, b))
+        }
+        (Object(x), Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| values_semantically_equal(v, w)))
+        }
+        _ => false,
+    }
+}
+
+/// `Option<Value>` wrapper of [`values_semantically_equal`]. Both `None`
+/// is equal; mixed is not; both `Some` recurses.
+fn opt_values_semantically_equal(
+    a: &Option<serde_json::Value>,
+    b: &Option<serde_json::Value>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => values_semantically_equal(x, y),
+        _ => false,
+    }
+}
+
 /// Compute the diff preview for a restore plan without writing anything.
 /// `target` is the audit entry being acted on.
 pub fn preview_restore_plan(
@@ -2284,8 +2342,8 @@ pub fn preview_restore_plan(
             file_path: t.file_path.display().to_string(),
             file_path_exists: exists,
             top_level_key: t.top_level_key.clone(),
-            will_write: current != t.target_value,
-            state_mismatch: current != t.expected_current,
+            will_write: !opt_values_semantically_equal(&current, &t.target_value),
+            state_mismatch: !opt_values_semantically_equal(&current, &t.expected_current),
             key_current: current,
             key_target: t.target_value.clone(),
         });
@@ -2379,7 +2437,12 @@ pub fn apply_restore_plan(
                 return true;
             }
             let before = fw.original.get_top_level(&t.top_level_key).cloned();
-            before == t.target_value
+            // Order-insensitive equality (#176) — see
+            // `opt_values_semantically_equal`. Skips a write when the
+            // file already holds the target's KV pairs in *any* order,
+            // so a deliberate user reordering isn't overwritten with the
+            // audit snapshot's order on undo.
+            opt_values_semantically_equal(&before, &t.target_value)
         });
         if no_change {
             continue;
@@ -3746,6 +3809,133 @@ mod tests {
         assert!(
             !user_side.state_mismatch,
             "the untouched user file is not a mismatch"
+        );
+    }
+
+    #[test]
+    fn values_semantically_equal_ignores_object_key_order_recursively() {
+        // #176 — Under preserve_order, serde_json::Value::eq is order-
+        // sensitive. The semantic helper used by the restore equality
+        // checks must treat object key order as presentation and not
+        // data, while leaving arrays order-sensitive (a reordered
+        // permissions.allow list is still a different document).
+        let a = serde_json::json!({
+            "permissions": {"allow": ["A"], "deny": ["B"]},
+            "env": {"X": "1", "Y": "2"},
+        });
+        let b = serde_json::json!({
+            "env": {"Y": "2", "X": "1"},
+            "permissions": {"deny": ["B"], "allow": ["A"]},
+        });
+        assert!(values_semantically_equal(&a, &b));
+        // Array reordering remains unequal.
+        let c = serde_json::json!({"permissions": {"allow": ["A", "B"]}});
+        let d = serde_json::json!({"permissions": {"allow": ["B", "A"]}});
+        assert!(!values_semantically_equal(&c, &d));
+        // Different keys aren't equal even with same length.
+        let e = serde_json::json!({"foo": 1});
+        let f = serde_json::json!({"bar": 1});
+        assert!(!values_semantically_equal(&e, &f));
+        // Option wrapper rules.
+        assert!(opt_values_semantically_equal(&None, &None));
+        assert!(!opt_values_semantically_equal(&None, &Some(a.clone())));
+        assert!(opt_values_semantically_equal(&Some(a), &Some(b)));
+    }
+
+    #[test]
+    fn restore_preview_does_not_flag_state_mismatch_on_pure_key_reordering() {
+        // #176 — A user who reordered the keys inside permissions in
+        // their project settings has not changed the document
+        // semantically. After an op landed, undoing it expects
+        // current == key_after; with preserve_order, a hand-reorder of
+        // the post-op file would byte-differ from key_after and trip
+        // state_mismatch. The semantic-equality helper must suppress
+        // that false positive. Pinning with a real preview run rather
+        // than just the helper unit-test so a future refactor that
+        // changes how the equality is wired in (e.g. only state_mismatch
+        // but not will_write) gets caught.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = paths.project.clone().unwrap();
+        // The on-disk file holds the same KV pairs as `key_after` below
+        // but with keys in a different insertion order — same data,
+        // different presentation.
+        write(
+            &project,
+            r#"{"permissions":{"deny":["X"],"allow":["A","B"]}}"#,
+        );
+        let side = side_at(
+            Scope::Project,
+            &project,
+            serde_json::json!({"allow": ["A"], "deny": ["X"]}),
+            serde_json::json!({"allow": ["A", "B"], "deny": ["X"]}),
+        );
+        let rec = audit::Record::new(
+            audit::Kind::Add,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            None,
+            Some(side),
+            vec![key("permissions"), key("allow"), idx(1)],
+            None,
+        );
+        // Undo: target_value = key_before, expected_current = key_after.
+        // Disk matches key_after semantically (modulo key order), so
+        // state_mismatch should be false.
+        let plan = build_restore_plan(&rec, audit::RestoreDirection::Undo).unwrap();
+        let preview = preview_restore_plan(&plan, &rec).unwrap();
+        let project_side = preview
+            .sides
+            .iter()
+            .find(|s| s.scope == Scope::Project)
+            .unwrap();
+        assert!(
+            !project_side.state_mismatch,
+            "pure key reordering of the post-op file must not register as state_mismatch"
+        );
+    }
+
+    #[test]
+    fn apply_restore_plan_skips_write_when_disk_matches_target_in_different_key_order() {
+        // #176 — The apply path's phase-2 no-change skip must also be
+        // order-insensitive. Without the fix, the file on disk holds
+        // the target KV pairs in a different order than the audit
+        // snapshot; phase 2's `before == t.target_value` evaluates
+        // false on insertion-order grounds, and io_atomic::save then
+        // overwrites the user's reordering with the snapshot's order
+        // — silent data loss. With the fix, the apply skips the write.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = paths.project.clone().unwrap();
+        // Pre-state mtime captured before apply; if no write happens
+        // it should be byte-identical after the call.
+        let pre_disk = r#"{"permissions":{"deny":["X"],"allow":["A","B"]}}"#;
+        write(&project, pre_disk);
+        let side = side_at(
+            Scope::Project,
+            &project,
+            serde_json::json!({"allow": ["A"], "deny": ["X"]}),
+            serde_json::json!({"allow": ["A", "B"], "deny": ["X"]}),
+        );
+        let rec = audit::Record::new(
+            audit::Kind::Add,
+            audit::LeafKind::PermissionRule,
+            audit::Actor::Gui,
+            None,
+            None,
+            Some(side),
+            vec![key("permissions"), key("allow"), idx(1)],
+            None,
+        );
+        let plan = build_restore_plan(&rec, audit::RestoreDirection::Redo).unwrap();
+        apply_restore_plan(&plan, None, &WatchState::default()).unwrap();
+        // The file should still hold the user's deny-first key order;
+        // no save should have rewritten it.
+        let after = std::fs::read_to_string(&project).unwrap();
+        assert!(
+            after.contains(r#""deny":["X"],"allow":["A","B"]"#),
+            "file was rewritten — user's key reordering was lost: {after}"
         );
     }
 
