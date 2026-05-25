@@ -424,18 +424,38 @@ fn resolve_paths(
     let Some(project_root) = project_dir else {
         return Ok(scope::resolve_with_home(None, home_dir)?);
     };
-    let home = home_dir
-        .map(std::path::Path::to_path_buf)
-        .or_else(dirs::home_dir);
+    // Absolutize the project root so audit-log entries persist absolute
+    // `file_path` values. Otherwise a CLI move with `--project-dir foo`
+    // logs `./foo/.claude/settings.json`, and a later `undo` run from a
+    // different cwd would resolve that against the new cwd — restoring
+    // (or creating) the wrong file. Same posture for `--home-dir`. See
+    // codex 4th-pass [P1].
+    let project_root_abs = absolutize(project_root)?;
+    let home = match home_dir {
+        Some(p) => Some(absolutize(p)?),
+        None => dirs::home_dir(),
+    };
     Ok(ScopePaths {
-        project_dir: project_root.to_path_buf(),
-        local: Some(project_root.join(".claude").join("settings.local.json")),
-        project: Some(project_root.join(".claude").join("settings.json")),
+        project_dir: project_root_abs.clone(),
+        local: Some(project_root_abs.join(".claude").join("settings.local.json")),
+        project: Some(project_root_abs.join(".claude").join("settings.json")),
         user_local: home
             .as_ref()
             .map(|h| h.join(".claude").join("settings.local.json")),
         user: home.map(|h| h.join(".claude").join("settings.json")),
     })
+}
+
+/// Resolve a possibly-relative path against the current working
+/// directory, without requiring the target to exist. Used to anchor CLI
+/// `--project-dir` / `--home-dir` flags so any audit-log entries built
+/// from them carry absolute paths — see `resolve_paths`.
+fn absolutize(p: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if p.is_absolute() {
+        Ok(p.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(p))
+    }
 }
 
 fn cmd_scopes(paths: &ScopePaths, json: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -1403,9 +1423,15 @@ mod tests {
         // ancestor (e.g. $HOME) happens to be a git working tree. Pin the
         // CLI-literal behavior so a future refactor can't quietly route
         // back through the walk-up.
-        let project = Path::new("/tmp/clitest-fixture/project");
-        let home = Path::new("/tmp/clitest-fixture/home");
-        let paths = resolve_paths(Some(project), Some(home)).unwrap();
+        //
+        // Use a tempdir so the paths are absolute on both Linux and
+        // Windows — bare `/tmp/...` strings look absolute on Linux but
+        // are relative on Windows, and `absolutize()` would resolve them
+        // against the test process's cwd. See codex 4th-pass [P1].
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("clitest-fixture").join("project");
+        let home = tmp.path().join("clitest-fixture").join("home");
+        let paths = resolve_paths(Some(&project), Some(&home)).unwrap();
         assert_eq!(paths.project_dir, project);
         assert_eq!(
             paths.local.as_deref().unwrap(),
@@ -1422,9 +1448,10 @@ mod tests {
         // Sandbox / dogfooding parity with the GUI's `--home` override.
         // Verify user + user-local both resolve under the supplied home,
         // not the real `dirs::home_dir()`.
-        let project = Path::new("/tmp/clitest-fixture/project");
-        let home = Path::new("/tmp/clitest-fixture/home");
-        let paths = resolve_paths(Some(project), Some(home)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("clitest-fixture").join("project");
+        let home = tmp.path().join("clitest-fixture").join("home");
+        let paths = resolve_paths(Some(&project), Some(&home)).unwrap();
         assert_eq!(
             paths.user.as_deref().unwrap(),
             home.join(".claude").join("settings.json")
@@ -1433,6 +1460,23 @@ mod tests {
             paths.user_local.as_deref().unwrap(),
             home.join(".claude").join("settings.local.json")
         );
+    }
+
+    #[test]
+    fn resolve_paths_absolutizes_relative_project_dir() {
+        // Regression for codex 4th-pass [P1]: a relative `--project-dir`
+        // used to be stored verbatim in `ScopePaths` and propagated into
+        // the audit log's `file_path` values, so a later `undo` /
+        // `restore` run from a different cwd would resolve them against
+        // the new cwd and miss (or clobber) the original project.
+        let cwd = std::env::current_dir().unwrap();
+        let paths = resolve_paths(Some(Path::new("relative-foo")), None).unwrap();
+        assert!(
+            paths.project_dir.is_absolute(),
+            "project_dir must be absolute, got: {}",
+            paths.project_dir.display()
+        );
+        assert_eq!(paths.project_dir, cwd.join("relative-foo"));
     }
 
     #[test]
