@@ -719,7 +719,7 @@ fn undo_redo_target(
     direction: audit::RestoreDirection,
     overrides: &RuntimeOverrides,
 ) -> Result<audit::Record, Box<dyn std::error::Error>> {
-    let (records, _) = audit::read_all(overrides.home())?;
+    let records = require_clean_audit_log(overrides)?;
     let state = audit::undo_redo_state(&records);
     let target = match direction {
         audit::RestoreDirection::Undo => state.undoable,
@@ -739,6 +739,37 @@ fn undo_redo_target(
             _ => "nothing to redo".into(),
         }
     })
+}
+
+/// Read the audit log, refusing if any records were skipped. Shared
+/// gate for every undo/redo/restore-to-point GUI command path: an IPC
+/// caller that bypassed the topbar's pre-check shouldn't be able to
+/// drive the state machine against a partial log either (#170 extended
+/// per codex's second-pass finding). The CLI has its own equivalent in
+/// `read_audit_log`.
+fn require_clean_audit_log(
+    overrides: &RuntimeOverrides,
+) -> Result<Vec<audit::Record>, Box<dyn std::error::Error>> {
+    let (records, skipped) = audit::read_all(overrides.home())?;
+    if skipped > 0 {
+        return Err(format!(
+            "{skipped} audit-log {} unreadable — refusing to compute \
+             undo/redo against a partial log. Repair {} (or copy aside \
+             and reset) before retrying.",
+            if skipped == 1 {
+                "entry is"
+            } else {
+                "entries are"
+            },
+            if skipped == 1 {
+                "the entry"
+            } else {
+                "those entries"
+            }
+        )
+        .into());
+    }
+    Ok(records)
 }
 
 fn undo_redo_preview(
@@ -839,7 +870,7 @@ fn restore_to_point_preview(
     overrides: &RuntimeOverrides,
 ) -> Result<RestorePreview, Box<dyn std::error::Error>> {
     let id = parse_audit_id(target_id)?;
-    let (records, _) = audit::read_all(overrides.home())?;
+    let records = require_clean_audit_log(overrides)?;
     let plan = plan_restore_to(&records, id)?;
     let target = records
         .iter()
@@ -871,7 +902,7 @@ fn apply_restore_to_point(
     overrides: &RuntimeOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let id = parse_audit_id(target_id)?;
-    let (records, _) = audit::read_all(overrides.home())?;
+    let records = require_clean_audit_log(overrides)?;
     // Identity check first: a concurrent rotate+append can leave the log
     // with a same-length-but-different-records window (codex #166 +
     // #171). Compare the trailing ULID against the preview's snapshot.
@@ -3591,6 +3622,36 @@ mod tests {
             key_before: Some(before),
             key_after: Some(after),
         }
+    }
+
+    #[test]
+    fn require_clean_audit_log_refuses_when_skipped_nonzero() {
+        // Regression for codex 2nd-pass [P1]: every undo/redo/restore
+        // GUI command must refuse a partial log, not just the topbar
+        // pre-check via `audit_undo_status`. Write a malformed line
+        // into the audit log and assert the gate rejects it.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let overrides = RuntimeOverrides {
+            home: Some(home.to_path_buf()),
+            project: None,
+        };
+
+        // Write the audit dir and drop a malformed line.
+        let audit_dir = home.join(".claude").join("claude-scope");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        std::fs::write(
+            audit_dir.join("audit.jsonl"),
+            b"{ this is not a valid audit record }\n",
+        )
+        .unwrap();
+
+        let err = require_clean_audit_log(&overrides).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unreadable") && msg.contains("partial log"),
+            "expected staleness/partial-log message, got: {msg}"
+        );
     }
 
     #[test]
