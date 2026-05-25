@@ -155,6 +155,32 @@ jobs:
 
       - run: npm ci
 
+      # macOS-only: pre-build claude-scope-cli for BOTH Apple architectures
+      # and lipo them into a universal binary at the path Tauri's bundler
+      # looks for. `tauri build --target universal-apple-darwin` does the
+      # universal-build dance for the default binary (`claude-scope`) only,
+      # but the bundler then walks every `[[bin]]` declared in Cargo.toml
+      # and tries to copy each from `target/universal-apple-darwin/release/`
+      # into the .app. Without this step the `claude-scope-cli` bin gets
+      # built for the host arch only, in the wrong target dir, and the
+      # bundler fails with "binary does not exist". Linux + Windows are
+      # single-arch so this step is a no-op there.
+      - name: Pre-build claude-scope-cli as macOS universal binary
+        if: matrix.platform.os == 'macos-latest'
+        working-directory: src-tauri
+        run: |
+          cargo build --release --bin claude-scope-cli --target aarch64-apple-darwin
+          cargo build --release --bin claude-scope-cli --target x86_64-apple-darwin
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/claude-scope-cli \
+            target/x86_64-apple-darwin/release/claude-scope-cli \
+            -output target/universal-apple-darwin/release/claude-scope-cli
+          # Sanity-check the result reports both arches so a future
+          # toolchain change can't silently regress to a single-arch
+          # binary while still putting *a* file in the expected path.
+          lipo -info target/universal-apple-darwin/release/claude-scope-cli
+
       # tauri-action runs `beforeBuildCommand` (which is `npm run build`)
       # before invoking `tauri build`, so the frontend dist/ is produced
       # as part of the same step. Pinned to a specific version rather than
