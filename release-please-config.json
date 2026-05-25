@@ -9,6 +9,7 @@
       "release-type": "node",
       "package-name": "claude-scope",
       "bootstrap-sha": "57893438aecf3b293ded4aca25876eb3fee2db67",
+      "release-as": "0.6.0",
       "skip-changelog": true,
       "changelog-sections": [
         { "type": "feat", "section": "Features" },
