@@ -3421,7 +3421,7 @@ export function _resetMoveToProjectFilterForTesting(): void {
 function buildMoveToSubmenu(
   props: AppProps,
   from: Scope,
-  onPick: (target: Scope) => void,
+  onPick: (target: Scope, projectRoot?: string) => void,
 ): MenuItem[] {
   const items: MenuItem[] = [];
   // Machine-global scopes first.
@@ -3455,7 +3455,14 @@ function buildMoveToSubmenu(
     for (const target of ["local", "project"] as Scope[]) {
       if (target === from) continue;
       if (!isScopeVisible(target)) continue;
-      inner.push({ label: SCOPE_LABELS[target], onClick: () => onPick(target) });
+      // Pass `project.root` so the outer onPick wires it through to
+      // `onMoveLeaf` as a project override (#111 + codex 6th-pass [P1]).
+      // Without this, choosing `OtherProject > Project` silently
+      // landed the rule in the CURRENT project's settings file.
+      inner.push({
+        label: SCOPE_LABELS[target],
+        onClick: () => onPick(target, project.root),
+      });
     }
     if (inner.length === 0) continue;
     items.push({
@@ -3755,8 +3762,12 @@ function leafContextMenuItems(
     items.push({ label: "Change kind", submenu: sub });
   }
 
-  const moveItems = buildMoveToSubmenu(props, scope, (target) => {
-    props.onMoveLeaf({ path, from: scope, to: target });
+  const moveItems = buildMoveToSubmenu(props, scope, (target, projectRoot) => {
+    props.onMoveLeaf(
+      { path, from: scope, to: target },
+      undefined,
+      projectRoot ? { projectDir: projectRoot } : undefined,
+    );
   });
   items.push({
     label: "Move to",
@@ -3785,8 +3796,12 @@ function combinedChipContextMenuItems(
   if (sourceScope) {
     const sourcePath = findPermissionPath(props, rule, sourceScope);
     if (sourcePath) {
-      const moveItems = buildMoveToSubmenu(props, sourceScope, (target) => {
-        props.onMoveLeaf({ path: sourcePath, from: sourceScope, to: target });
+      const moveItems = buildMoveToSubmenu(props, sourceScope, (target, projectRoot) => {
+        props.onMoveLeaf(
+          { path: sourcePath, from: sourceScope, to: target },
+          undefined,
+          projectRoot ? { projectDir: projectRoot } : undefined,
+        );
       });
       items.push({
         label: `Move to (from ${SCOPE_LABELS[sourceScope]})`,
