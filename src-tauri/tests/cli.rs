@@ -601,6 +601,82 @@ fn cli_undo_aborts_when_audit_log_changes_during_confirm_prompt() {
     );
 }
 
+/// Codex 3rd-pass [P1] — even the post-confirm re-read in
+/// `run_cli_restore` must refuse a degraded log. A malformed line
+/// appended during the prompt window doesn't change the trailing
+/// ULID (it's just `skipped`), so the existing tail-id check sails
+/// past it. The new `skipped > 0` guard catches it.
+#[test]
+fn cli_undo_refuses_when_audit_log_degrades_during_confirm_prompt() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let sb = Sandbox::new();
+    sb.write_project(r#"{"permissions":{"allow":["Bash(git status)"]}}"#);
+    sb.write_user(r#"{"permissions":{"allow":[]}}"#);
+
+    // Seed one valid CLI move so undo has something to act on.
+    let mv = sb.run(&[
+        "move",
+        "Bash(git status)",
+        "--kind",
+        "allow",
+        "--from",
+        "project",
+        "--to",
+        "user",
+    ]);
+    assert!(mv.status.success(), "seed move failed: {}", stderr(&mv));
+
+    let mut child = Command::new(BIN)
+        .env("CLAUDE_SCOPE_CONFIG_DIR", &sb.config_dir)
+        .args([
+            "--project-dir",
+            sb.project.to_str().unwrap(),
+            "--home-dir",
+            sb.home.to_str().unwrap(),
+        ])
+        .arg("undo")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn claude-scope-cli undo");
+
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Append a malformed line directly to the audit log — the post-
+    // confirm re-read will see this as `skipped > 0`.
+    let audit_path = sb
+        .home
+        .join(".claude")
+        .join("claude-scope")
+        .join("audit.jsonl");
+    let mut existing = std::fs::read_to_string(&audit_path).expect("read audit log");
+    existing.push_str("{ this is not valid json }\n");
+    std::fs::write(&audit_path, existing).expect("inject corrupt line");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(b"y\n")
+        .expect("write y to child stdin");
+
+    let out = child.wait_with_output().expect("wait for child");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit on degraded log, got success. stderr: {}",
+        stderr(&out)
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("degraded") && err.contains("unreadable"),
+        "expected degraded-log message on stderr, got: {err}"
+    );
+}
+
 /// #170 — CLI undo / redo / restore must refuse against a log with
 /// unreadable lines. A corrupt restore line could leave the state
 /// machine pointing at an op that's already undone; running undo
