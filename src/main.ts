@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
+import { type RestoreFlowDeps, runRestoreFlow } from "./restore-flow.ts";
 import type {
   AddLeafPreview,
   AddLeafRequest,
@@ -383,43 +384,29 @@ async function addLeaf(req: AddLeafRequest, trigger?: HTMLElement): Promise<void
  * different IPC commands; everything else — the guard, modal, busy state,
  * reload — is identical.
  */
-async function runRestoreFlow(
-  label: string,
-  fetchPreview: () => Promise<RestorePreview>,
-  applyRestore: (preview: RestorePreview) => Promise<void>,
-  trigger?: HTMLElement,
-): Promise<void> {
-  if (moveInFlight) return;
-  moveInFlight = true;
-  try {
-    let preview: RestorePreview;
-    try {
-      preview = await fetchPreview();
-    } catch (err) {
-      alert(`${label} failed: ${err}`);
-      return;
-    }
-
-    const apply = await confirmRestore(preview, trigger);
-    if (!apply) return;
-
-    state.busy = true;
-    render();
-    try {
-      await applyRestore(preview);
-      await load(state.projectDir);
-    } catch (err) {
-      alert(`${label} failed: ${err}`);
-      state.busy = false;
+function makeRestoreFlowDeps(): RestoreFlowDeps {
+  return {
+    alert: (msg) => {
+      window.alert(msg);
+    },
+    confirmRestore: (preview, trigger) => confirmRestore(preview, trigger),
+    reload: () => load(state.projectDir),
+    beginBusy: () => {
+      state.busy = true;
       render();
-    }
-  } finally {
-    moveInFlight = false;
-    if (externalReloadPending && !state.busy) {
-      externalReloadPending = false;
-      void load(state.projectDir);
-    }
-  }
+    },
+    isMoveInFlight: () => moveInFlight,
+    setMoveInFlight: (v) => {
+      moveInFlight = v;
+    },
+    consumeExternalReload: () => {
+      if (externalReloadPending && !state.busy) {
+        externalReloadPending = false;
+        return true;
+      }
+      return false;
+    },
+  };
 }
 
 function handleUndo(trigger?: HTMLElement): void {
@@ -431,6 +418,7 @@ function handleUndo(trigger?: HTMLElement): void {
     () => invoke<RestorePreview>("audit_undo_preview"),
     (preview) => invoke("audit_apply_undo", { expected_id: preview.target.id }),
     trigger,
+    makeRestoreFlowDeps(),
   );
 }
 
@@ -440,6 +428,7 @@ function handleRedo(trigger?: HTMLElement): void {
     () => invoke<RestorePreview>("audit_redo_preview"),
     (preview) => invoke("audit_apply_redo", { expected_id: preview.target.id }),
     trigger,
+    makeRestoreFlowDeps(),
   );
 }
 
@@ -463,6 +452,8 @@ function handleRestoreToPoint(rec: AuditRecordView): void {
         expected_ops_spanned: preview.ops_spanned,
         expected_tail_id: preview.tail_id ?? null,
       }),
+    undefined,
+    makeRestoreFlowDeps(),
   );
 }
 
