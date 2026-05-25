@@ -161,6 +161,9 @@ export function buildPreferences(overrides: Partial<Preferences> = {}): Preferen
     // `??` instead of `||` so explicit `null` (= never group) is
     // honored — `null || 2` would silently flip to 2.
     group_rules_at: overrides.group_rules_at !== undefined ? overrides.group_rules_at : 2,
+    // Default collapsed mirrors the Rust default (#155). Tests that
+    // need the expanded view override explicitly.
+    combined_panel_collapsed: overrides.combined_panel_collapsed ?? true,
   };
 }
 

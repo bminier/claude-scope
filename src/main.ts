@@ -49,6 +49,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   audit_log_rotate: true,
   audit_log_max_size_mb: 10,
   group_rules_at: 2,
+  combined_panel_collapsed: true,
 };
 
 const state: {
@@ -582,6 +583,11 @@ function onChangeGroupRulesAt(value: number | null): void {
   void persistPreferences({ ...state.preferences, group_rules_at: value });
 }
 
+function onToggleCombinedPanelCollapsed(collapsed: boolean): void {
+  if (state.preferences.combined_panel_collapsed === collapsed) return;
+  void persistPreferences({ ...state.preferences, combined_panel_collapsed: collapsed });
+}
+
 function onOpenSettings(trigger?: HTMLElement): void {
   void openSettings(
     {
@@ -621,6 +627,7 @@ function render(): void {
     onOpenSettings,
     onOpenAbout: handleOpenAbout,
     onOpenHistory: handleOpenHistory,
+    onToggleCombinedPanelCollapsed,
     onQueryChange: setQuery,
   });
 }

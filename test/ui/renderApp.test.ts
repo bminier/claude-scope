@@ -92,6 +92,7 @@ function makeProps(overrides: PropsOverrides = {}) {
     onOpenSettings: vi.fn(),
     onOpenAbout: vi.fn(),
     onQueryChange: vi.fn(),
+    onToggleCombinedPanelCollapsed: overrides.onToggleCombinedPanelCollapsed ?? vi.fn(),
   };
 }
 
@@ -116,6 +117,68 @@ describe("renderApp", () => {
     renderApp(root, makeProps({ busy: false }));
     const empty = root.querySelector(".empty");
     expect(empty?.textContent).toBe("No settings loaded.");
+  });
+
+  it("defaults the combined panel to collapsed via preferences (#155)", () => {
+    // Default `combined_panel_collapsed: true` from buildPreferences
+    // mirrors the Rust default — the panel renders closed on first
+    // paint. `<details>.open === false` is the load-bearing signal.
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const combined = root.querySelector(".combined") as HTMLDetailsElement | null;
+    expect(combined).not.toBeNull();
+    expect(combined!.tagName).toBe("DETAILS");
+    expect(combined!.open).toBe(false);
+  });
+
+  it("opens the combined panel when preferences.combined_panel_collapsed is false", () => {
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(
+      root,
+      makeProps({
+        scopes,
+        preferences: buildPreferences({ combined_panel_collapsed: false }),
+      }),
+    );
+    const combined = root.querySelector(".combined") as HTMLDetailsElement;
+    expect(combined.open).toBe(true);
+  });
+
+  it("renders the combined panel summary with inline kind counts when collapsed (#155)", () => {
+    // Collapsed state still tells the user what's in the combined view.
+    const scopes = buildLoadedScopes({
+      scopes: [
+        {
+          scope: "project",
+          permissions: {
+            allow: ["Bash(git status)", "Read(**)"],
+            deny: ["Bash(rm -rf *)"],
+          },
+        },
+        { scope: "user", permissions: { ask: ["WebFetch(domain:x.com)"] } },
+      ],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const counts = root.querySelector(".combined-counts");
+    expect(counts?.textContent).toBe("2 allow · 1 deny · 1 ask");
+  });
+
+  it("persists the collapsed state on user toggle (#155)", () => {
+    const onToggleCombinedPanelCollapsed = vi.fn();
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes, onToggleCombinedPanelCollapsed }));
+    const combined = root.querySelector(".combined") as HTMLDetailsElement;
+    // Default is collapsed (open=false). Simulate the user opening it.
+    combined.open = true;
+    combined.dispatchEvent(new Event("toggle"));
+    // The setter receives the inverse — open === !collapsed.
+    expect(onToggleCombinedPanelCollapsed).toHaveBeenCalledWith(false);
   });
 
   it("places the combined panel as the trailing column inside the scope grid", () => {

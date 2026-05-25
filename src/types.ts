@@ -205,6 +205,12 @@ export interface Preferences {
    *  `Some(n < 2)` back to the default, so anything the frontend reads
    *  is either `null` or `>= 2`. */
   group_rules_at: number | null;
+  /** Whether the combined permissions panel starts collapsed (#155).
+   *  Default `true` on a fresh install — the per-scope columns own the
+   *  top of the row at first paint, and the user expands the combined
+   *  view by clicking the disclosure widget. The toggle persists per
+   *  the user's last choice. */
+  combined_panel_collapsed: boolean;
 }
 
 /** Bounds on `Preferences.audit_log_max_size_mb`. Mirrors Rust's
