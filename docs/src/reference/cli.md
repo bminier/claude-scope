@@ -137,3 +137,26 @@ For `undo` / `redo` / `restore`, `--json` emits the `RestorePreview`
 for a `--dry-run` and the resulting `restore` entry (as an
 `AuditRecordView`, the same shape `history --json` produces) once
 applied.
+
+### Refusals
+
+`undo` / `redo` / `restore` exit non-zero with a clear message and
+write nothing in these cases:
+
+- **`N audit-log entries are unreadable — refusing to compute
+  undo/redo against a partial log.`** The audit log has malformed
+  lines that the reader skipped. Acting against a partial log could
+  emit a duplicate restore entry; repair the log (copy aside, drop
+  the broken lines) and retry.
+- **`the audit log changed since the plan was built` /
+  `the audit log changed while waiting for confirmation`.** A
+  concurrent CLI or GUI session appended to the log between this
+  command's plan-build and apply (or during the confirm prompt). The
+  stale plan is rejected; re-run the command against the fresh log.
+- **`path injection refused`.** An entry's `file_path` points outside
+  the legitimate scope set for its `project_dir`. Indicates the log
+  has been hand-edited or corrupted by a third party; do not apply.
+  See the [security threat model](../security.md#threat-model).
+
+These refusals apply equally under `--yes` — there is no path that
+silently writes to the wrong file.
