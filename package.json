@@ -25,7 +25,7 @@
     "@tauri-apps/cli": "^2.11.2",
     "happy-dom": "^20.0.0",
     "typescript": "^6.0.3",
-    "vite": "^8.0.13",
-    "vitest": "^4.1.6"
+    "vite": "^8.0.14",
+    "vitest": "^4.1.7"
   }
 }
