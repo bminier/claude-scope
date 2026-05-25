@@ -649,15 +649,10 @@ button:disabled {
   white-space: nowrap;
 }
 
-.rule-moves {
-  display: flex;
-  gap: 4px;
-}
-
-.move-btn {
-  font-size: 11px;
-  padding: 2px 6px;
-}
+/* `.rule-moves` / `.move-btn` / `.tree-key-moves` removed in #152 —
+   inline arrow buttons were redundant with the right-click context
+   menu (#111 Move-to submenu). Right-click and keyboard drag (#41)
+   are the canonical move affordances. */
 
 /* Tree view for non-permission top-level keys (env, hooks, theme, …).
    Uses native <details>/<summary> so expand/collapse and keyboard
@@ -751,14 +746,6 @@ button:disabled {
 .tree-value-null {
   color: var(--muted);
   font-style: italic;
-}
-
-/* Move-target buttons for top-level tree keys. Live on the summary row
-   (branches) or the leaf row (scalars). Push to the right so the
-   key/peek/value stays readable and button clicks are intentional. */
-.tree-key-moves {
-  margin-left: auto;
-  gap: 4px;
 }
 
 /* ------- Diff confirm modal ------- */

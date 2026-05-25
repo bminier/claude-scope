@@ -273,28 +273,19 @@ describe("renderApp", () => {
     expect(after?.selectionEnd).toBe(2);
   });
 
-  it("invokes onMoveLeaf with a path-based request when a per-scope move button is clicked", () => {
-    // Permission rules now live as tree leaves under `permissions.allow[*]`,
-    // so the move button rides on the leaf's `.rule .rule-moves .move-btn`
-    // and the request payload carries a JSON path instead of {rule, kind}.
-    const onMoveLeaf = vi.fn();
+  it("no longer renders inline →Scope move buttons on rule rows (#152)", () => {
+    // Regression for #152. The inline arrow buttons were dropped in
+    // favor of the right-click context menu's Move-to submenu (#111).
+    // Asserts the DOM has no `.move-btn` / `.rule-moves` markers
+    // anywhere — keyboard drag (#41) and right-click are the
+    // canonical move affordances now.
     const scopes = buildLoadedScopes({
       scopes: [{ scope: "project", permissions: { allow: ["Bash(git status)"] } }],
     });
-    renderApp(root, makeProps({ scopes, onMoveLeaf }));
-    const buttons = Array.from(
-      root.querySelectorAll<HTMLButtonElement>(".rule.rule-allow .rule-moves .move-btn"),
-    );
-    const toUser = buttons.find((b) => b.textContent === "→ User");
-    expect(toUser).toBeDefined();
-    toUser?.click();
-    expect(onMoveLeaf).toHaveBeenCalledTimes(1);
-    const [req] = onMoveLeaf.mock.calls[0];
-    expect(req).toEqual({
-      path: ["permissions", "allow", 0],
-      from: "project",
-      to: "user",
-    });
+    renderApp(root, makeProps({ scopes }));
+    expect(root.querySelector(".move-btn")).toBeNull();
+    expect(root.querySelector(".rule-moves")).toBeNull();
+    expect(root.querySelector(".tree-key-moves")).toBeNull();
   });
 
   it("renders a lint warning badge for a malformed rule", () => {
@@ -1229,7 +1220,12 @@ describe("tool-prefix grouping in the scope tree (#68)", () => {
     expect(visibleRules[0].querySelector(".rule-text")?.textContent).toBe("handoff(copilot *)");
   });
 
-  it("group members keep leaf-level paths so move buttons still address the rule directly", () => {
+  it("group members keep leaf-level paths so context-menu moves address the rule directly", () => {
+    // #152 dropped the inline arrow buttons in favor of the right-click
+    // Move-to submenu (#111). This test now exercises that path: inside
+    // a tool-group, right-click the second member and assert the
+    // dispatched path is `permissions.allow[1]` (not anything
+    // group-relative).
     const onMoveLeaf = vi.fn();
     const scopes = buildLoadedScopes({
       project_dir: "/fake/grouping-move",
@@ -1241,27 +1237,28 @@ describe("tool-prefix grouping in the scope tree (#68)", () => {
       ],
     });
     renderApp(root, makeProps({ scopes, onMoveLeaf }));
-    // Inside the Bash group: click the second member's "→ User" button and
-    // assert the dispatched path is `permissions.allow[1]`, not anything
-    // group-relative.
     const group = root.querySelector<HTMLDetailsElement>(".tree-tool-group");
     if (!group) throw new Error("expected tool group");
     const memberRows = group.querySelectorAll<HTMLElement>(".rule.rule-allow");
     expect(memberRows.length).toBe(2);
-    const toUser = memberRows[1].querySelector<HTMLButtonElement>(".rule-moves .move-btn");
-    if (!toUser || toUser.textContent !== "→ User") {
-      // The first matching scope target may differ depending on default
-      // visibility; fall back to searching by label across all buttons in
-      // the row.
-      const buttons = Array.from(
-        memberRows[1].querySelectorAll<HTMLButtonElement>(".rule-moves .move-btn"),
-      );
-      const fallback = buttons.find((b) => b.textContent === "→ User");
-      if (!fallback) throw new Error("expected → User button");
-      fallback.click();
-    } else {
-      toUser.click();
-    }
+    // Right-click the second member to open its context menu, then
+    // navigate into Move-to → User. `findMenuItem` is defined in the
+    // context-menu describe block; reuse the local helper here too.
+    memberRows[1].dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 50, clientY: 50 }),
+    );
+    const items = document.querySelectorAll<HTMLButtonElement>(".context-menu-item");
+    const moveTo = Array.from(items).find((b) =>
+      b.textContent?.replace(/\s+/g, " ").trim().startsWith("Move to"),
+    );
+    expect(moveTo).toBeDefined();
+    moveTo?.click();
+    const submenus = document.querySelectorAll<HTMLElement>(".context-menu");
+    const user = Array.from(
+      submenus[submenus.length - 1].querySelectorAll<HTMLButtonElement>(".context-menu-item"),
+    ).find((b) => b.textContent?.replace(/\s*▸$/, "").trim() === "User");
+    expect(user).toBeDefined();
+    user?.click();
     expect(onMoveLeaf).toHaveBeenCalledTimes(1);
     const [req] = onMoveLeaf.mock.calls[0];
     expect(req).toEqual({
@@ -1269,6 +1266,9 @@ describe("tool-prefix grouping in the scope tree (#68)", () => {
       from: "project",
       to: "user",
     });
+    // Clean up the lingering context menus from this test so the next
+    // test doesn't inherit them.
+    for (const m of Array.from(document.querySelectorAll(".context-menu"))) m.remove();
   });
 });
 
