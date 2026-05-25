@@ -120,6 +120,133 @@ describe("renderApp", () => {
     expect(empty?.textContent).toBe("No settings loaded.");
   });
 
+  it("does not render the path-collisions banner when no scopes share files (#153)", () => {
+    // Sanity: the common case has no collisions, so the banner must
+    // not exist by default — otherwise it would be a noisy permanent
+    // fixture for every user.
+    const scopes = buildLoadedScopes({
+      scopes: [{ scope: "project", permissions: { allow: ["Bash(ls)"] } }],
+    });
+    renderApp(root, makeProps({ scopes }));
+    expect(root.querySelector(".collision-banner")).toBeNull();
+  });
+
+  it("renders the path-collisions banner with scope labels + shared path (#153)", () => {
+    // Mirrors the headline case: launching from $HOME makes Project and
+    // User resolve to the same `~/.claude/settings.json`. The banner
+    // names both scopes by their display labels (broad→narrow) and the
+    // shared path so the user can spot the collision before relying on
+    // the columns as if they were independent.
+    const scopes = buildLoadedScopes({
+      path_collisions: [
+        {
+          scopes: ["project", "user"],
+          path: "/home/u/.claude/settings.json",
+        },
+        {
+          scopes: ["local", "user_local"],
+          path: "/home/u/.claude/settings.local.json",
+        },
+      ],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const banner = root.querySelector(".collision-banner");
+    expect(banner).not.toBeNull();
+    expect(banner!.textContent).toContain("Scopes share files");
+    const items = banner!.querySelectorAll(".collision-list li");
+    expect(items).toHaveLength(2);
+    expect(items[0].textContent).toContain("Project and User");
+    expect(items[0].textContent).toContain("/home/u/.claude/settings.json");
+    expect(items[1].textContent).toContain("Local and User-Local");
+    expect(items[1].textContent).toContain("/home/u/.claude/settings.local.json");
+  });
+
+  it("renders a kind-conflict badge on the per-scope rule row (#156)", () => {
+    // `Bash(git push)` is allowed in User but denied in Project — the
+    // detector picks this up and surfaces a `kind_conflicts` entry; the
+    // renderer must put a ⚠ badge on the rule row in each scope it
+    // appears in, with the popover naming both occurrences.
+    //
+    // Unique project_dir so `seedDefaultOpenPermissions` actually runs
+    // for this test (the seeder no-ops when `lastSeededProjectDir`
+    // already matches the incoming projectDir — module-level state
+    // shared across tests in this file).
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/project-kind-conflict-per-scope",
+      scopes: [
+        { scope: "project", permissions: { deny: ["Bash(git push)"] } },
+        { scope: "user", permissions: { allow: ["Bash(git push)"] } },
+      ],
+      kind_conflicts: [
+        {
+          rule: "Bash(git push)",
+          occurrences: [
+            { scope: "project", kind: "deny" },
+            { scope: "user", kind: "allow" },
+          ],
+        },
+      ],
+    });
+    renderApp(root, makeProps({ scopes }));
+    const projectRule = Array.from(root.querySelectorAll(".rule")).find(
+      (r) => r.textContent?.includes("Bash(git push)") && r.classList.contains("rule-deny"),
+    );
+    expect(projectRule).toBeDefined();
+    expect(projectRule!.querySelector(".kind-conflict-wrap")).not.toBeNull();
+    // Popover lists both occurrences with Project first (precedence).
+    const pop = projectRule!.querySelector(".kind-conflict-popover");
+    expect(pop?.textContent).toContain("Project: deny");
+    expect(pop?.textContent).toContain("User: allow");
+    expect(pop?.textContent).toContain("wins by precedence");
+  });
+
+  it("does not render the kind-conflict badge when scopes agree (#156)", () => {
+    // Same rule under the same kind in two scopes — agreement, not
+    // conflict. No badge.
+    const scopes = buildLoadedScopes({
+      scopes: [
+        { scope: "project", permissions: { allow: ["Bash(git status)"] } },
+        { scope: "user", permissions: { allow: ["Bash(git status)"] } },
+      ],
+      // Detector returns empty for matching kinds; the fixture mirrors that.
+      kind_conflicts: [],
+    });
+    renderApp(root, makeProps({ scopes }));
+    expect(root.querySelector(".kind-conflict-wrap")).toBeNull();
+  });
+
+  it("renders the kind-conflict badge on the combined panel chip (#156)", () => {
+    const scopes = buildLoadedScopes({
+      project_dir: "/fake/project-kind-conflict-combined",
+      scopes: [
+        { scope: "project", permissions: { deny: ["Bash(git push)"] } },
+        { scope: "user", permissions: { allow: ["Bash(git push)"] } },
+      ],
+      kind_conflicts: [
+        {
+          rule: "Bash(git push)",
+          occurrences: [
+            { scope: "project", kind: "deny" },
+            { scope: "user", kind: "allow" },
+          ],
+        },
+      ],
+    });
+    renderApp(
+      root,
+      makeProps({ scopes, preferences: buildPreferences({ combined_panel_collapsed: false }) }),
+    );
+    // The combined panel renders the rule under each kind it appears in
+    // (allow and deny in this case). Each chip should carry the badge.
+    const chips = Array.from(root.querySelectorAll(".combo-group .chip-wrap")).filter((w) =>
+      w.textContent?.includes("Bash(git push)"),
+    );
+    expect(chips.length).toBeGreaterThanOrEqual(1);
+    for (const chip of chips) {
+      expect(chip.querySelector(".kind-conflict-wrap")).not.toBeNull();
+    }
+  });
+
   it("defaults the combined panel to collapsed via preferences (#155)", () => {
     // Default `combined_panel_collapsed: true` from buildPreferences
     // mirrors the Rust default — the panel renders closed on first

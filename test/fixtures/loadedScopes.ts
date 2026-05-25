@@ -1,6 +1,8 @@
 import type {
   JsonValue,
+  KindConflict,
   LoadedScopes,
+  PathCollision,
   PermissionKind,
   PermissionRuleOrigins,
   PermissionRules,
@@ -96,6 +98,8 @@ interface LoadedScopesOverrides {
   scopes?: ScopeViewOverrides[];
   combined_permissions?: Partial<PermissionRules>;
   combined_origins?: Partial<PermissionRuleOrigins>;
+  path_collisions?: PathCollision[];
+  kind_conflicts?: KindConflict[];
 }
 
 /**
@@ -147,6 +151,8 @@ export function buildLoadedScopes(overrides: LoadedScopesOverrides = {}): Loaded
     scopes,
     combined_permissions: { ...combined, ...(overrides.combined_permissions ?? {}) },
     combined_origins: { ...origins, ...(overrides.combined_origins ?? {}) },
+    path_collisions: overrides.path_collisions ?? [],
+    kind_conflicts: overrides.kind_conflicts ?? [],
   };
 }
 
