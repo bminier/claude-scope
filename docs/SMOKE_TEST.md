@@ -129,6 +129,22 @@ reviewer.
 - [ ] **Last-column guard.** In the Settings dialog, uncheck scopes one by
       one. The final remaining checkbox refuses to uncheck (the grid would
       otherwise render empty with no recovery from inside the dialog).
+- [ ] **Path-collision banner (#153).** Open ClaudeScope against your real
+      `$HOME` (e.g. `Open project…` → pick your home directory). A yellow
+      banner appears directly under the toolbar: **Scopes share files**,
+      listing "Project and User both resolve to `~/.claude/settings.json`"
+      and the same for Local + User-Local. Try clicking a `→` move target
+      between two scopes that share a file: the apply should fail with a
+      typed error naming both scopes and the shared path. Close and
+      re-open against a normal project root; the banner disappears.
+- [ ] **Kind-disagreement badge (#156).** Hand-edit a rule into two
+      scopes under different kinds — e.g. `Bash(git push)` as `allow` in
+      User and `deny` in Project. Reload. A red ⚠ badge appears next to
+      the rule row in **both** affected scope columns AND on the matching
+      chips in the Effective settings panel. Hover (or focus + Enter) the
+      badge: a popover lists every (scope, kind) pairing of the rule with
+      the highest-precedence one marked **wins by precedence**. Click the
+      badge to pin the popover; Esc or outside-click dismisses it.
 
 ## Audit log: History, undo, redo (non-sandbox runs only)
 

@@ -145,6 +145,44 @@ body {
   color: var(--sandbox-text-strong);
 }
 
+/* Path-collision banner (#153). Reuses the sandbox color palette — both
+   are persistent warnings that live directly under the toolbar. The
+   list+explain stack distinguishes it from the single-line sandbox
+   banner so the user can tell them apart at a glance when both happen
+   to be up. */
+.collision-banner {
+  background: var(--sandbox-bg);
+  color: var(--sandbox-text);
+  border-bottom: 1px solid var(--sandbox-border);
+  padding: 10px 16px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.collision-banner strong {
+  color: var(--sandbox-text-strong);
+}
+
+.collision-list {
+  margin: 4px 0;
+  padding-left: 20px;
+}
+
+.collision-list li {
+  margin: 2px 0;
+}
+
+.collision-list code {
+  background: var(--panel-2);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.collision-explain {
+  margin: 4px 0 0;
+  opacity: 0.85;
+}
+
 .search {
   position: relative;
   flex: 0 1 320px;
@@ -1021,6 +1059,36 @@ button:disabled {
   transition:
     opacity 120ms ease,
     visibility 120ms ease;
+}
+
+/* Kind-disagreement badge (#156). Reuses the lint-warn shape but
+   recolors to --deny so a user can tell at a glance which of the two
+   warnings is on a row when both happen to fire. --deny is the
+   "structural problem" color in the rest of the UI; conflict between
+   allow/deny/ask is exactly that, vs. lint's heuristic shape check. */
+.kind-conflict-warn {
+  color: var(--deny);
+}
+.kind-conflict-warn:hover,
+.kind-conflict-wrap.is-open > .kind-conflict-warn {
+  color: var(--deny);
+  border-color: var(--deny);
+}
+.kind-conflict-warn:focus-visible {
+  color: var(--deny);
+  border-color: var(--deny);
+}
+
+.kind-conflict-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  list-style: disc;
+}
+.kind-conflict-list li {
+  margin: 2px 0;
+}
+.kind-conflict-winner {
+  font-weight: 600;
 }
 
 /* Reason on top, then a muted heuristic disclaimer separated by a hairline.

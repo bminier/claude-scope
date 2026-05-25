@@ -10,6 +10,7 @@ import type {
   DeleteLeafPreview,
   DeleteLeafRequest,
   JsonValue,
+  KindConflict,
   KnownProject,
   LoadedScopes,
   MoveLeafKind,
@@ -587,6 +588,12 @@ export function renderApp(root: HTMLElement, props: AppProps): void {
   root.appendChild(header(props));
   const banner = sandboxBanner(props.runtime);
   if (banner) root.appendChild(banner);
+  // Path-collision banner (#153) — only renders when the resolved scope
+  // paths overlap (the common case: launching from $HOME itself). Goes
+  // under the sandbox banner so the most contextual / surprising
+  // warnings stack near the topbar.
+  const collisionBanner = pathCollisionsBanner(props.scopes);
+  if (collisionBanner) root.appendChild(collisionBanner);
 
   if (!props.scopes) {
     const empty = document.createElement("div");
@@ -654,6 +661,51 @@ function restoreSearchFocus(
  * is "the user can't forget they're in scratch mode," so we deliberately
  * don't make this dismissible.
  */
+/**
+ * Warning banner shown when two or more scopes resolved to the same file
+ * on disk (#153). The common case: launching ClaudeScope with the
+ * project root equal to `$HOME` — Project and User then collapse onto the
+ * same `~/.claude/settings.json` and Local/UserLocal onto the same
+ * `settings.local.json`. The columns still render, but every cross-scope
+ * move between a colliding pair is rejected by the backend; this banner
+ * names the affected scopes + shared path so the user notices before
+ * trying.
+ */
+function pathCollisionsBanner(scopes: LoadedScopes | null): HTMLElement | null {
+  if (!scopes || scopes.path_collisions.length === 0) return null;
+  const banner = document.createElement("div");
+  banner.className = "collision-banner";
+  banner.setAttribute("role", "note");
+
+  const label = document.createElement("strong");
+  label.textContent = "Scopes share files";
+  banner.appendChild(label);
+
+  const list = document.createElement("ul");
+  list.className = "collision-list";
+  for (const c of scopes.path_collisions) {
+    const item = document.createElement("li");
+    const labels = c.scopes.map((s) => SCOPE_LABELS[s]).join(" and ");
+    const intro = document.createElement("span");
+    intro.textContent = `${labels} both resolve to `;
+    const path = document.createElement("code");
+    path.textContent = c.path;
+    item.appendChild(intro);
+    item.appendChild(path);
+    list.appendChild(item);
+  }
+  banner.appendChild(list);
+
+  const explain = document.createElement("p");
+  explain.className = "collision-explain";
+  explain.textContent =
+    "Moves between these scopes are disabled — they'd be no-ops or overwrite the file with itself. " +
+    "Open a different project root to give the scopes distinct files.";
+  banner.appendChild(explain);
+
+  return banner;
+}
+
 function sandboxBanner(runtime: RuntimeInfo): HTMLElement | null {
   if (!runtime.home_override && !runtime.project_override) return null;
   const banner = document.createElement("div");
@@ -1058,6 +1110,18 @@ function combinedPanel(loaded: LoadedScopes, props: AppProps, lowerQuery: string
       chipWrap.appendChild(originWrap);
       const badge = lintBadge(rule);
       if (badge) chipWrap.appendChild(badge);
+      // Kind-disagreement badge (#156). The combined panel deduplicates
+      // each kind separately, so the *same* rule string can appear in
+      // both `combined.allow` and `combined.deny`. The badge anchors on
+      // the highest-precedence (scope, kind) for this row — the first
+      // entry of `combined_origins[kind][i]` — so it sits exactly where
+      // the rule "lives" in this kind's column.
+      const conflictAnchorScope = (allOrigins[i] ?? [])[0];
+      if (conflictAnchorScope) {
+        const conflict = findKindConflict(rule, conflictAnchorScope, kind, loaded.kind_conflicts);
+        const cBadge = kindConflictBadge(conflict);
+        if (cBadge) chipWrap.appendChild(cBadge);
+      }
       attachContextMenu(chipWrap, () =>
         combinedChipContextMenuItems(rule, allOrigins[i] ?? [], props),
       );
@@ -1067,6 +1131,98 @@ function combinedPanel(loaded: LoadedScopes, props: AppProps, lowerQuery: string
   }
   panel.appendChild(groupsWrap);
   return panel;
+}
+
+/**
+ * Look up a rule's cross-scope kind disagreement (#156). Returns the
+ * matching `KindConflict` only when the *current* row's (scope, kind) is
+ * one of the occurrences — a rule that disagrees across two *other*
+ * scopes shouldn't render a badge on a row that's not part of the
+ * conflict. For the combined panel, callers pass the panel's "winning"
+ * scope (first entry of the rule's `combined_origins`) so the badge
+ * only sits on rule rows that are themselves part of the disagreement.
+ */
+function findKindConflict(
+  rule: string,
+  scope: Scope,
+  kind: PermissionKind,
+  conflicts: KindConflict[],
+): KindConflict | null {
+  for (const c of conflicts) {
+    if (c.rule !== rule) continue;
+    if (c.occurrences.some((o) => o.scope === scope && o.kind === kind)) return c;
+  }
+  return null;
+}
+
+/**
+ * Warning badge for a permission rule whose kind disagrees across scopes
+ * (#156). Shape mirrors `lintBadge`: a focusable ⚠ button paired with a
+ * popover so the explanation surfaces consistently on hover, focus, and
+ * click. The popover names every (scope, kind) the rule appears under,
+ * with the highest-precedence entry labeled as the winner.
+ *
+ * Returns null when `conflict` is null so callers can write
+ * `chip.append(kindConflictBadge(...) ?? document.createTextNode(""))`-
+ * style code without branching.
+ */
+function kindConflictBadge(conflict: KindConflict | null): HTMLElement | null {
+  if (conflict === null) return null;
+
+  const wrap = document.createElement("span");
+  wrap.className = "lint-warn-wrap kind-conflict-wrap";
+  const popoverId = `kind-conflict-popover-${++lintPopoverSeq}`;
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "lint-warn kind-conflict-warn";
+  btn.textContent = "⚠";
+  btn.setAttribute("aria-label", "Rule kind disagrees across scopes");
+  btn.setAttribute("aria-describedby", popoverId);
+
+  const pop = document.createElement("span");
+  pop.id = popoverId;
+  pop.className = "lint-warn-popover kind-conflict-popover";
+  pop.setAttribute("role", "tooltip");
+
+  const intro = document.createElement("span");
+  intro.className = "lint-warn-popover-reason";
+  intro.textContent = `Rule appears in multiple scopes with different kinds:`;
+  pop.appendChild(intro);
+
+  const list = document.createElement("ul");
+  list.className = "kind-conflict-list";
+  for (let i = 0; i < conflict.occurrences.length; i++) {
+    const o = conflict.occurrences[i];
+    const item = document.createElement("li");
+    const isWinner = i === 0;
+    item.textContent = `${SCOPE_LABELS[o.scope]}: ${KIND_LABELS[o.kind]}${
+      isWinner ? "  (wins by precedence)" : ""
+    }`;
+    if (isWinner) item.className = "kind-conflict-winner";
+    list.appendChild(item);
+  }
+  pop.appendChild(list);
+
+  const note = document.createElement("span");
+  note.className = "lint-warn-popover-note";
+  note.textContent =
+    "Highest-precedence scope wins for the effective union, but Claude Code's runtime " +
+    "resolution may apply additional rules.";
+  pop.appendChild(note);
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (openPinnedPopover === wrap) {
+      closePinnedPopover();
+    } else {
+      pinPopover(wrap);
+    }
+  });
+
+  wrap.appendChild(btn);
+  wrap.appendChild(pop);
+  return wrap;
 }
 
 /**
@@ -2146,6 +2302,15 @@ function treeLeaf(
     row.appendChild(wrapWithOriginTooltip(code, [scope]));
     const badge = lintBadge(rule);
     if (badge) row.appendChild(badge);
+    // Kind-disagreement badge (#156). Surfaces when the same rule string
+    // exists in another scope under a different kind (allow vs deny vs
+    // ask). The popover lists every (scope, kind) so the user can spot
+    // a likely typo or stale rule without scanning every column.
+    if (props?.scopes) {
+      const conflict = findKindConflict(rule, scope, permKind, props.scopes.kind_conflicts);
+      const cBadge = kindConflictBadge(conflict);
+      if (cBadge) row.appendChild(cBadge);
+    }
     if (props) {
       // Inline arrow buttons dropped in #152 — right-click context
       // menu (with the full Move-to submenu, including cross-project

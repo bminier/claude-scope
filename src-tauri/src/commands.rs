@@ -68,6 +68,50 @@ pub struct LoadedScopes {
     /// precedence order (highest first). Drives the front-end's
     /// scope-origin tooltip on combined rule rows.
     pub combined_origins: PermissionRuleOrigins,
+    /// Pairs (or larger groups) of scopes whose resolved file paths point at
+    /// the same file on disk — the common case is launching ClaudeScope
+    /// from `$HOME` itself, which makes Project and User collapse onto the
+    /// same `~/.claude/settings.json`. Surfacing this as a warning banner
+    /// stops the user from believing "move from User to Project" is doing
+    /// anything other than overwriting the file with its own contents. See
+    /// #153.
+    pub path_collisions: Vec<PathCollision>,
+    /// Rules that appear in multiple scopes under *different* kinds — e.g.
+    /// `Bash(git *)` is `allow` in User scope but `deny` in Project. The
+    /// effective union picks one by precedence; the UI surfaces the
+    /// disagreement so the user can spot a likely typo or stale rule
+    /// without scanning every column. See #156.
+    pub kind_conflicts: Vec<KindConflict>,
+}
+
+/// Two-or-more scopes whose resolved file paths point at the same on-disk
+/// file. Surfaced by [`detect_path_collisions`] and rendered as a top-of-app
+/// warning banner. See #153.
+#[derive(Debug, Clone, Serialize)]
+pub struct PathCollision {
+    /// Scopes that share the path, in [`Scope::ALL`] order so the rendered
+    /// banner reads in the same broad→narrow order as the scope columns.
+    pub scopes: Vec<Scope>,
+    /// The shared file path, as resolved by [`scope::resolve_with_home`].
+    pub path: String,
+}
+
+/// One rule string that appears in 2+ scopes with disagreeing kinds. See
+/// #156.
+#[derive(Debug, Clone, Serialize)]
+pub struct KindConflict {
+    pub rule: String,
+    /// Every (scope, kind) pairing of this rule across all four scopes, in
+    /// precedence order (highest first — matches `combined_origins`). The
+    /// frontend picks the highest-precedence entry as the "winner" for
+    /// effective-evaluation rendering.
+    pub occurrences: Vec<KindOccurrence>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct KindOccurrence {
+    pub scope: Scope,
+    pub kind: PermissionKind,
 }
 
 /// Per-rule provenance for the combined permissions view: for each rule in
@@ -1015,13 +1059,118 @@ pub fn build_loaded(paths: &ScopePaths) -> Result<LoadedScopes, Box<dyn std::err
     }
 
     let (combined, origins) = combined_permissions(&views);
+    let path_collisions = detect_path_collisions(paths);
+    let kind_conflicts = detect_kind_conflicts(&views);
 
     Ok(LoadedScopes {
         project_dir: paths.project_dir.display().to_string(),
         scopes: views,
         combined_permissions: combined,
         combined_origins: origins,
+        path_collisions,
+        kind_conflicts,
     })
+}
+
+/// Detect scopes whose resolved file paths point at the same on-disk file
+/// (#153). The common case is launching ClaudeScope with the project root
+/// equal to `$HOME` — Project and User then both resolve to
+/// `~/.claude/settings.json`, and so do Local and UserLocal. The two
+/// columns are still rendered, but every move between them is a no-op
+/// against the same file; surfacing the collision lets the user notice
+/// before relying on the columns as if they were independent.
+///
+/// Comparison is byte-equal on the `PathBuf`s `resolve_with_home` produced.
+/// That's enough for the only collision shape this catches: project_dir
+/// landing on home, which generates the same lexical path string from both
+/// sides of the resolver. Canonicalize-if-exists would defend against an
+/// exotic case (one scope's symlink resolving differently from another's
+/// non-symlink view), but that case isn't observed in the wild and the
+/// existing `dirs::home_dir()` / `find_project_root` pipeline never emits
+/// such a pair anyway.
+pub fn detect_path_collisions(paths: &ScopePaths) -> Vec<PathCollision> {
+    let mut groups: std::collections::BTreeMap<PathBuf, Vec<Scope>> =
+        std::collections::BTreeMap::new();
+    for scope in Scope::ALL {
+        if let Some(p) = paths.path_for(scope) {
+            groups.entry(p.to_path_buf()).or_default().push(scope);
+        }
+    }
+    let mut out = Vec::new();
+    for (path, mut scopes) in groups {
+        if scopes.len() < 2 {
+            continue;
+        }
+        // Sort by Scope::ALL order so the banner reads broad→narrow,
+        // matching the column layout. BTreeMap gave us path-key sort, not
+        // scope sort, so this is the meaningful ordering step.
+        scopes.sort_by_key(|s| Scope::ALL.iter().position(|x| x == s).unwrap_or(usize::MAX));
+        out.push(PathCollision {
+            scopes,
+            path: path.display().to_string(),
+        });
+    }
+    out
+}
+
+/// Detect rules that appear in 2+ scopes with disagreeing kinds (#156). A
+/// rule string is in conflict iff it lands in at least one `allow` list AND
+/// at least one `deny` or `ask` list across the four scopes (any pair of
+/// different kinds suffices; the case shape is two `allow`s and one `deny`
+/// of the same rule, etc.).
+///
+/// Returns one [`KindConflict`] per conflicting rule, with occurrences
+/// listed in [`Scope::ALL`] precedence order (highest first) so the
+/// frontend can render "X wins by precedence" against the head entry
+/// without re-sorting. A rule that appears multiple times in the same
+/// (scope, kind) bucket — possible from a hand-edited duplicate —
+/// collapses to a single occurrence; the duplicate-detection issue (#17)
+/// is the right surface for "you've got two copies of the same rule
+/// here", not this one.
+fn detect_kind_conflicts(views: &[ScopeView]) -> Vec<KindConflict> {
+    // Preserve first-seen rule order so the rendered list stays stable
+    // across loads. `views` is in `Scope::ALL` (precedence) order, so the
+    // first scope to mention a rule sets its slot here, and subsequent
+    // scopes append to that slot.
+    let mut order: Vec<String> = Vec::new();
+    let mut by_rule: std::collections::HashMap<String, Vec<KindOccurrence>> =
+        std::collections::HashMap::new();
+    for view in views {
+        let perms = permissions_from_values(&view.values);
+        for (kind, rules) in [
+            (PermissionKind::Allow, &perms.allow),
+            (PermissionKind::Deny, &perms.deny),
+            (PermissionKind::Ask, &perms.ask),
+        ] {
+            for rule in rules {
+                let entry = by_rule.entry(rule.clone()).or_insert_with(|| {
+                    order.push(rule.clone());
+                    Vec::new()
+                });
+                // Collapse duplicates within the same (scope, kind) bucket;
+                // see fn-level rationale.
+                if !entry
+                    .iter()
+                    .any(|o| o.scope == view.scope && o.kind == kind)
+                {
+                    entry.push(KindOccurrence {
+                        scope: view.scope,
+                        kind,
+                    });
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for rule in order {
+        let occurrences = by_rule.remove(&rule).expect("seeded above");
+        let distinct_kinds: std::collections::HashSet<PermissionKind> =
+            occurrences.iter().map(|o| o.kind).collect();
+        if distinct_kinds.len() >= 2 {
+            out.push(KindConflict { rule, occurrences });
+        }
+    }
+    out
 }
 
 fn load_scope_view(scope: Scope, path: Option<&Path>) -> ScopeView {
@@ -1251,7 +1400,33 @@ fn dest_path_for(req: &MoveLeafRequest) -> Vec<PathSeg> {
 fn validate_move_request(
     req: &MoveLeafRequest,
     movable: &MovablePath<'_>,
+    paths: &ScopePaths,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Cross-scope moves between two scopes whose resolved file paths point
+    // at the same on-disk file are no-ops at best and silently destructive
+    // at worst — the rule lands in the same file under the same key,
+    // overwriting itself. Refuse with a typed error rather than letting
+    // the apply path waste a write or, worse, succeed and leave the
+    // user thinking the move took effect (#153). Same-scope change-kind
+    // (req.from == req.to) is unaffected because the *operation* still
+    // mutates the file's permissions object meaningfully.
+    if req.from != req.to {
+        let from_path = paths.path_for(req.from);
+        let to_path = paths.path_for(req.to);
+        if let (Some(fp), Some(tp)) = (from_path, to_path) {
+            if fp == tp {
+                return Err(format!(
+                    "{} and {} both resolve to {} — these scopes share the same file on disk, \
+                     so a move between them would be a no-op. Open a different project root \
+                     to give the scopes distinct files.",
+                    req.from.label(),
+                    req.to.label(),
+                    fp.display(),
+                )
+                .into());
+            }
+        }
+    }
     match (req.to_kind, movable) {
         (Some(new_kind), MovablePath::PermissionRule(current_kind, _)) => {
             if req.from == req.to && *current_kind == new_kind {
@@ -1281,7 +1456,7 @@ pub fn diff_move_leaf_impl(
     req: &MoveLeafRequest,
 ) -> Result<MoveLeafPreview, Box<dyn std::error::Error>> {
     let movable = validate_movable_path(&req.path)?;
-    validate_move_request(req, &movable)?;
+    validate_move_request(req, &movable, paths)?;
 
     if req.from == req.to {
         // Same-scope change-kind: load the file once, simulate add+remove on
@@ -1469,7 +1644,7 @@ pub fn apply_move_leaf_impl(
     watch: &WatchState,
 ) -> Result<LeafApplyOutcome, Box<dyn std::error::Error>> {
     let movable = validate_movable_path(&req.path)?;
-    validate_move_request(req, &movable)?;
+    validate_move_request(req, &movable, paths)?;
 
     if req.from == req.to {
         // Same-scope change-kind: one file, one write. Apply add+remove to
@@ -2655,6 +2830,178 @@ mod tests {
         assert_eq!(origins.allow[2], vec![Scope::User]);
         assert!(origins.deny.is_empty());
         assert!(origins.ask.is_empty());
+    }
+
+    #[test]
+    fn detect_path_collisions_groups_scopes_sharing_one_file() {
+        // #153 — Launching ClaudeScope with project_dir == $HOME makes
+        // User and Project resolve to the same `~/.claude/settings.json`,
+        // and Local/UserLocal to the same `settings.local.json`. The
+        // detector groups those collisions with the scopes sorted in
+        // Scope::ALL (broad→narrow) order so the rendered banner reads
+        // in the same order the columns are laid out.
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let shared_settings = claude.join("settings.json");
+        let shared_local = claude.join("settings.local.json");
+        let paths = ScopePaths {
+            project_dir: tmp.path().to_path_buf(),
+            local: Some(shared_local.clone()),
+            project: Some(shared_settings.clone()),
+            user_local: Some(shared_local.clone()),
+            user: Some(shared_settings.clone()),
+        };
+
+        let collisions = detect_path_collisions(&paths);
+        assert_eq!(collisions.len(), 2, "two distinct shared files");
+
+        // Scope::ALL ordering is [Local, Project, UserLocal, User], so
+        // the broader (User, UserLocal) pair lists first in each group.
+        let local_collision = collisions
+            .iter()
+            .find(|c| c.path == shared_local.display().to_string())
+            .expect("local collision present");
+        assert_eq!(local_collision.scopes, vec![Scope::Local, Scope::UserLocal]);
+        let project_collision = collisions
+            .iter()
+            .find(|c| c.path == shared_settings.display().to_string())
+            .expect("project collision present");
+        assert_eq!(project_collision.scopes, vec![Scope::Project, Scope::User]);
+    }
+
+    #[test]
+    fn detect_path_collisions_returns_empty_when_paths_are_distinct() {
+        // Sanity: the common case (project_dir != home) produces zero
+        // collisions even though Local/Project share a parent and
+        // UserLocal/User share theirs.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        assert!(detect_path_collisions(&paths).is_empty());
+    }
+
+    #[test]
+    fn detect_kind_conflicts_surfaces_allow_vs_deny_across_scopes() {
+        // #156 — `Bash(git push)` is allowed in User but denied in
+        // Project. The conflict surfaces with both occurrences in
+        // precedence order (highest first = Project before User), so
+        // the frontend can label "Project's deny wins by precedence".
+        let views = vec![
+            make_view(Scope::Local, true, &[], &[], &[]),
+            make_view(Scope::Project, true, &[], &["Bash(git push)"], &[]),
+            make_view(Scope::UserLocal, true, &[], &[], &[]),
+            make_view(Scope::User, true, &["Bash(git push)"], &[], &[]),
+        ];
+        let conflicts = detect_kind_conflicts(&views);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].rule, "Bash(git push)");
+        // Scope::ALL is [Local, Project, UserLocal, User] (precedence,
+        // highest first); the conflict's occurrences inherit that.
+        assert_eq!(
+            conflicts[0]
+                .occurrences
+                .iter()
+                .map(|o| (o.scope, o.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (Scope::Project, PermissionKind::Deny),
+                (Scope::User, PermissionKind::Allow),
+            ]
+        );
+    }
+
+    #[test]
+    fn detect_kind_conflicts_ignores_matching_kinds_in_multiple_scopes() {
+        // The same rule in `allow` across two scopes is *not* a conflict;
+        // it just means both scopes agree. Without filtering on distinct
+        // kinds, the detector would emit a spurious entry every time a
+        // user-scope allow was reaffirmed at project scope.
+        let views = vec![
+            make_view(Scope::Local, true, &["Bash(git status)"], &[], &[]),
+            make_view(Scope::User, true, &["Bash(git status)"], &[], &[]),
+        ];
+        assert!(detect_kind_conflicts(&views).is_empty());
+    }
+
+    #[test]
+    fn detect_kind_conflicts_collapses_duplicates_in_one_scope_kind() {
+        // A hand-edited duplicate in the same (scope, kind) bucket
+        // shouldn't produce a phantom conflict against itself, and
+        // shouldn't appear twice in `occurrences`. Duplicate-detection
+        // is #17's surface, not this one.
+        let views = vec![make_view(
+            Scope::Local,
+            true,
+            &["Bash(rm)", "Bash(rm)"],
+            &["Bash(rm)"],
+            &[],
+        )];
+        let conflicts = detect_kind_conflicts(&views);
+        assert_eq!(conflicts.len(), 1);
+        // Two unique (scope, kind) pairs, not three.
+        assert_eq!(conflicts[0].occurrences.len(), 2);
+    }
+
+    #[test]
+    fn validate_move_request_refuses_cross_scope_move_into_a_colliding_pair() {
+        // #153 — Even with the path-collision banner up, the user could
+        // still try to drag a rule from User to Project when both
+        // resolve to the same file. Such a move would either be a no-op
+        // or corrupt the file (rewrite-with-self while the source
+        // and destination IPCs race for the same FileStamp). Refuse at
+        // validation rather than asking the apply layer to deal with
+        // it: a typed error keeps the modal close path clean and gives
+        // the UI a stable string to surface.
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let shared = claude.join("settings.json");
+        let paths = ScopePaths {
+            project_dir: tmp.path().to_path_buf(),
+            local: Some(claude.join("settings.local.json")),
+            project: Some(shared.clone()),
+            user_local: None,
+            user: Some(shared.clone()),
+        };
+        std::fs::write(&shared, r#"{"permissions":{"allow":["X"]}}"#).unwrap();
+        let req = MoveLeafRequest {
+            path: vec![key("permissions"), key("allow"), idx(0)],
+            from: Scope::Project,
+            to: Scope::User,
+            to_kind: None,
+        };
+        let err = apply_move_leaf_impl(&paths, &req, None, &WatchState::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("share the same file"),
+            "expected collision-message error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_kind_conflicts_handles_three_way_disagreement() {
+        // Allow / deny / ask across three scopes — all three should
+        // appear in `occurrences`, still in precedence order.
+        let views = vec![
+            make_view(Scope::Local, true, &["X"], &[], &[]),
+            make_view(Scope::Project, true, &[], &["X"], &[]),
+            make_view(Scope::UserLocal, true, &[], &[], &[]),
+            make_view(Scope::User, true, &[], &[], &["X"]),
+        ];
+        let conflicts = detect_kind_conflicts(&views);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0]
+                .occurrences
+                .iter()
+                .map(|o| (o.scope, o.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (Scope::Local, PermissionKind::Allow),
+                (Scope::Project, PermissionKind::Deny),
+                (Scope::User, PermissionKind::Ask),
+            ]
+        );
     }
 
     #[test]

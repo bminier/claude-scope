@@ -58,6 +58,43 @@ export interface LoadedScopes {
   scopes: ScopeView[];
   combined_permissions: PermissionRules;
   combined_origins: PermissionRuleOrigins;
+  /**
+   * Pairs (or larger groups) of scopes whose resolved file paths point at
+   * the same file on disk — the common case is launching ClaudeScope from
+   * `$HOME` itself, which collapses Project onto User (and Local onto
+   * UserLocal). Rendered as a top-of-app warning banner so the user can't
+   * miss it before treating the columns as if they were independent
+   * (#153).
+   */
+  path_collisions: PathCollision[];
+  /**
+   * Rule strings that appear in multiple scopes under disagreeing kinds —
+   * e.g. `Bash(git *)` is `allow` in User but `deny` in Project. Rendered
+   * as a warning chip next to the affected rule rows; the chip's tooltip
+   * explains which kind wins by precedence (#156).
+   */
+  kind_conflicts: KindConflict[];
+}
+
+/** One group of scopes whose resolved file paths point at the same on-disk
+ *  file (#153). Mirrors Rust's `PathCollision`. Scopes are in `SCOPES`
+ *  display order so the banner reads broad→narrow, same as the columns. */
+export interface PathCollision {
+  scopes: Scope[];
+  path: string;
+}
+
+/** One rule with disagreeing kinds across scopes (#156). Mirrors Rust's
+ *  `KindConflict`. Occurrences are in precedence order (highest first); the
+ *  frontend treats `occurrences[0]` as the winner. */
+export interface KindConflict {
+  rule: string;
+  occurrences: KindOccurrence[];
+}
+
+export interface KindOccurrence {
+  scope: Scope;
+  kind: PermissionKind;
 }
 
 /**
