@@ -291,7 +291,15 @@ where
 /// Resolve the on-disk path for the config file. `None` when the OS couldn't
 /// give us a config directory (no `$HOME` set, say) — we treat that the same
 /// as "no config yet" and fall back to defaults.
+///
+/// `CLAUDE_SCOPE_CONFIG_DIR` overrides the default OS location. Used by the
+/// CLI integration tests to point at a sandbox config; also a useful escape
+/// hatch for users who want to relocate preferences (XDG-style on platforms
+/// where `dirs` doesn't honor it natively).
 pub fn config_path() -> Option<PathBuf> {
+    if let Some(override_dir) = std::env::var_os("CLAUDE_SCOPE_CONFIG_DIR") {
+        return Some(PathBuf::from(override_dir).join("config.json"));
+    }
     dirs::config_dir().map(|d| d.join("claude-scope").join("config.json"))
 }
 

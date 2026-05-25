@@ -266,7 +266,7 @@ pub fn diff_move_leaf(
 /// state before computing any delta, so distinguishing the two at log time
 /// would just bloat the schema). Errors are also collapsed to `None`: an
 /// I/O hiccup pre-apply shouldn't poison the post-apply audit entry.
-fn snapshot_top_level_key(path: &Path, key: &str) -> Option<serde_json::Value> {
+pub fn snapshot_top_level_key(path: &Path, key: &str) -> Option<serde_json::Value> {
     let (doc, _stamp) = io_atomic::load_with_stamp(path).ok()?;
     doc.and_then(|d| d.get_top_level(key).cloned())
 }
@@ -277,7 +277,7 @@ fn snapshot_top_level_key(path: &Path, key: &str) -> Option<serde_json::Value> {
 /// runs the apply impl has already validated. Keeping this classifier
 /// path-driven also means the audit module doesn't pull in `MovablePath`,
 /// which is a frontend-facing wire enum.
-fn audit_leaf_kind(path: &[PathSeg]) -> audit::LeafKind {
+pub fn audit_leaf_kind(path: &[PathSeg]) -> audit::LeafKind {
     if path.len() == 1 {
         audit::LeafKind::TopLevelKey
     } else if path.len() == 2
@@ -293,7 +293,7 @@ fn audit_leaf_kind(path: &[PathSeg]) -> audit::LeafKind {
 /// when the scope has no file path on this machine (e.g. user scope
 /// disabled on a sandboxed home), so the audit record skips the field
 /// rather than emitting `"file_path":""` placeholder garbage.
-fn audit_side(
+pub fn audit_side(
     scope: Scope,
     file_path: Option<&Path>,
     key: &str,
@@ -310,31 +310,76 @@ fn audit_side(
     })
 }
 
-/// Append one entry to the audit log on a successful write. Fail-open: any
-/// error from the audit append surfaces as a Tauri event but never as a
-/// hard failure to the caller — the primary write already succeeded, and
-/// the user's stated intent (move / add / delete this rule) took effect.
-/// Sandbox sessions (`--home` override active) skip the write entirely so
-/// scratch-mode runs don't pollute the real `~/.claude/claude-scope/`.
-fn emit_audit(app: &AppHandle, overrides: &RuntimeOverrides, record: audit::Record) {
-    if overrides.home().is_some() {
-        return;
+/// Outcome of [`persist_audit_record`]. Rotation and append errors are
+/// reported separately so the GUI can surface them as distinct Tauri
+/// events and the CLI can print distinct warnings.
+#[derive(Debug, Default)]
+pub struct AuditPersistResult {
+    /// Set when log rotation failed. Non-fatal — the append still
+    /// proceeds against the over-cap log; the user just keeps writing
+    /// to a log that's larger than the configured cap until rotation
+    /// can land.
+    pub rotate_error: Option<String>,
+    /// Set when the append failed. Fatal-ish: the record is *not* in
+    /// the log; history/undo/redo won't see this op. Callers surface
+    /// it as a warning rather than a hard error because the primary
+    /// write already succeeded.
+    pub append_error: Option<String>,
+}
+
+impl AuditPersistResult {
+    pub fn is_clean(&self) -> bool {
+        self.rotate_error.is_none() && self.append_error.is_none()
     }
+}
+
+/// Rotate (if configured) and append `record` to the audit log at the
+/// location implied by `home` (None = production, Some = sandbox / test).
+///
+/// Both steps are best-effort: rotation failure is logged and execution
+/// proceeds to append; append failure is reported in the returned struct
+/// so the caller can surface it in their idiomatic way (the GUI emits a
+/// Tauri event; the CLI prints to stderr). Shared by GUI and CLI write
+/// paths so the two surfaces can't drift on rotation behavior — see
+/// #164 and #168.
+pub fn persist_audit_record(record: &audit::Record, home: Option<&Path>) -> AuditPersistResult {
+    let mut out = AuditPersistResult::default();
     let prefs = preferences::load();
     // Rotate before the append so the fresh entry lands in the new
     // active file (#127). Rotation errors are fail-open: we surface
-    // them as a non-fatal event and proceed to append against the
+    // them as a non-fatal warning and proceed to append against the
     // existing file rather than dropping the entry. The append itself
     // would then write to an over-cap log, which is still better than
     // losing the record.
     if prefs.audit_log_rotate {
         let cap_bytes = u64::from(prefs.audit_log_max_size_mb) * 1_000_000;
-        if let Err(err) = audit::rotate_if_needed(None, cap_bytes) {
-            let _ = app.emit("audit-error", format!("rotation: {err}"));
+        if let Err(err) = audit::rotate_if_needed(home, cap_bytes) {
+            out.rotate_error = Some(format!("rotation: {err}"));
         }
     }
-    if let Err(err) = audit::append(&record, None) {
-        let _ = app.emit("audit-error", err.to_string());
+    if let Err(err) = audit::append(record, home) {
+        out.append_error = Some(err.to_string());
+    }
+    out
+}
+
+/// Append one entry to the audit log on a successful GUI write. Fail-open:
+/// any error from rotation or append surfaces as a Tauri event but never
+/// as a hard failure to the caller — the primary write already succeeded,
+/// and the user's stated intent (move / add / delete this rule) took
+/// effect. Sandbox sessions (`--home` override active) skip the write
+/// entirely so scratch-mode runs don't pollute the real
+/// `~/.claude/claude-scope/`.
+fn emit_audit(app: &AppHandle, overrides: &RuntimeOverrides, record: audit::Record) {
+    if overrides.home().is_some() {
+        return;
+    }
+    let outcome = persist_audit_record(&record, None);
+    if let Some(err) = outcome.rotate_error {
+        let _ = app.emit("audit-error", err);
+    }
+    if let Some(err) = outcome.append_error {
+        let _ = app.emit("audit-error", err);
     }
 }
 
@@ -978,7 +1023,7 @@ fn accumulate(
 /// infallible after `validate_movable_path` succeeds. Pulled out so the
 /// diff/apply flows can stay readable and the invariant is documented in
 /// exactly one place.
-fn path_top_level_key(path: &[PathSeg]) -> &str {
+pub fn path_top_level_key(path: &[PathSeg]) -> &str {
     path.first()
         .and_then(PathSeg::as_key)
         .expect("validate_movable_path guarantees path[0] is a key")

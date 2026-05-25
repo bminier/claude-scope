@@ -22,6 +22,7 @@ struct Sandbox {
     _tmp: TempDir,
     project: PathBuf,
     home: PathBuf,
+    config_dir: PathBuf,
 }
 
 impl Sandbox {
@@ -29,13 +30,23 @@ impl Sandbox {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let project = tmp.path().join("project");
         let home = tmp.path().join("home");
+        let config_dir = tmp.path().join("config");
         std::fs::create_dir_all(project.join(".claude")).unwrap();
         std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
         Self {
             _tmp: tmp,
             project,
             home,
+            config_dir,
         }
+    }
+
+    /// Write the CLI's `config.json` (the file `preferences::load()` reads).
+    /// The integration tests pass `CLAUDE_SCOPE_CONFIG_DIR` to redirect
+    /// `preferences::config_path()` here, so each test gets isolated prefs.
+    fn write_pref(&self, json: &str) {
+        std::fs::write(self.config_dir.join("config.json"), json).unwrap();
     }
 
     fn write_project(&self, body: &str) {
@@ -73,6 +84,7 @@ impl Sandbox {
 
     fn run(&self, args: &[&str]) -> Output {
         Command::new(BIN)
+            .env("CLAUDE_SCOPE_CONFIG_DIR", &self.config_dir)
             .args([
                 "--project-dir",
                 self.project.to_str().unwrap(),
@@ -392,4 +404,199 @@ fn version_subcommand_json_shape_is_stable() {
     }
     // CLI process: `webview_version` must be null, not a fabricated string.
     assert!(v["webview_version"].is_null());
+}
+
+// ---------------------------------------------------------------------------
+// v0.6 release-gate fixes: audit emission, backup pref, restore log recheck
+// ---------------------------------------------------------------------------
+
+/// #164 — `claude-scope-cli move` must append an audit record. Pre-fix the
+/// command wrote settings files but never called `audit::append`, so the
+/// move was invisible to History / Undo / Redo.
+#[test]
+fn cli_move_appends_audit_record() {
+    let sb = Sandbox::new();
+    sb.write_project(r#"{"permissions":{"allow":["Bash(git status)"]}}"#);
+    sb.write_user(r#"{"permissions":{"allow":[]}}"#);
+
+    let mv = sb.run(&[
+        "move",
+        "Bash(git status)",
+        "--kind",
+        "allow",
+        "--from",
+        "project",
+        "--to",
+        "user",
+    ]);
+    assert!(mv.status.success(), "stderr: {}", stderr(&mv));
+
+    let hist = sb.run(&["history", "--json"]);
+    assert!(hist.status.success(), "stderr: {}", stderr(&hist));
+    let page: serde_json::Value = serde_json::from_str(&stdout(&hist)).expect("non-json history");
+    let records = page["records"]
+        .as_array()
+        .expect("history JSON must have a records array");
+    assert_eq!(
+        records.len(),
+        1,
+        "expected exactly one audit entry from the CLI move, got: {records:?}"
+    );
+    // AuditRecordView flattens Record into the parent object via
+    // #[serde(flatten)], so `kind` / `actor` live at the top level
+    // alongside `ts_ms` — not nested under `record`.
+    let rec = &records[0];
+    assert_eq!(rec["kind"], "move", "audit kind should be move");
+    assert_eq!(
+        rec["actor"], "cli",
+        "audit actor should be cli for a CLI-initiated move"
+    );
+}
+
+/// #168 — CLI write paths must honor `Preferences::backup_on_write`. With
+/// the pref set to `false`, no `.bak` should be created.
+#[test]
+fn cli_move_respects_backup_on_write_false_pref() {
+    let sb = Sandbox::new();
+    sb.write_project(r#"{"permissions":{"allow":["Bash(git status)"]}}"#);
+    sb.write_user(r#"{"permissions":{"allow":[]}}"#);
+    sb.write_pref(r#"{"backup_on_write":false}"#);
+
+    let out = sb.run(&[
+        "move",
+        "Bash(git status)",
+        "--kind",
+        "allow",
+        "--from",
+        "project",
+        "--to",
+        "user",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    // The move itself must still succeed — pref only affects .bak creation.
+    let project_allow = read_allow(&sb.project.join(".claude").join("settings.json"));
+    assert!(project_allow.is_empty(), "rule should have moved out");
+
+    // No .bak alongside either touched file.
+    assert!(
+        !sb.project
+            .join(".claude")
+            .join("settings.json.bak")
+            .exists(),
+        "project settings.json.bak must not exist when backup_on_write=false"
+    );
+    assert!(
+        !sb.home.join(".claude").join("settings.json.bak").exists(),
+        "user settings.json.bak must not exist when backup_on_write=false"
+    );
+}
+
+/// #165 — CLI restore must re-read the audit log after the confirm prompt
+/// and refuse to apply if another session appended between preview and
+/// apply. Uses a stdin pipe with a brief sleep so the child has time to
+/// build the preview + print the prompt; then we inject a concurrent
+/// append before sending `y`.
+#[test]
+fn cli_undo_aborts_when_audit_log_changes_during_confirm_prompt() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    use claude_scope_lib::audit;
+
+    let sb = Sandbox::new();
+    sb.write_project(r#"{"permissions":{"allow":["Bash(git status)"]}}"#);
+    sb.write_user(r#"{"permissions":{"allow":[]}}"#);
+
+    // Seed the audit log with one CLI move so there's something to undo.
+    let mv = sb.run(&[
+        "move",
+        "Bash(git status)",
+        "--kind",
+        "allow",
+        "--from",
+        "project",
+        "--to",
+        "user",
+    ]);
+    assert!(mv.status.success(), "seed move failed: {}", stderr(&mv));
+
+    // Snapshot the project file so we can confirm the aborted undo did NOT
+    // overwrite it.
+    let project_after_move = sb.project_settings();
+
+    // Spawn `undo` with stdin piped — we'll send "y\n" later but only
+    // AFTER injecting a concurrent append.
+    let mut child = Command::new(BIN)
+        .env("CLAUDE_SCOPE_CONFIG_DIR", &sb.config_dir)
+        .args([
+            "--project-dir",
+            sb.project.to_str().unwrap(),
+            "--home-dir",
+            sb.home.to_str().unwrap(),
+        ])
+        .arg("undo")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn claude-scope-cli undo");
+
+    // The child reads the audit log, prints the preview, then prompts. By
+    // the time we wake up, the log read is done (expected_tail_id captured)
+    // and the child is blocked on stdin. 400ms is generous on a CI-ish
+    // machine; bump if this turns flaky.
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Inject a fresh audit record via the lib — this is the "concurrent
+    // GUI/CLI session" the issue's failure scenario describes. The child's
+    // post-prompt re-read must notice this and refuse to apply.
+    let bogus = audit::Record::new(
+        audit::Kind::Add,
+        audit::LeafKind::PermissionRule,
+        audit::Actor::Cli,
+        None,
+        None,
+        Some(audit::Side {
+            scope: claude_scope_lib::scope::Scope::Project,
+            file_path: sb.project.join(".claude").join("settings.json"),
+            top_level_key: "permissions".to_string(),
+            key_before: Some(serde_json::json!({"allow": []})),
+            key_after: Some(serde_json::json!({"allow": ["Sleep(injected)"]})),
+        }),
+        vec![],
+        None,
+    );
+    audit::append(&bogus, Some(sb.home.as_path())).expect("inject bogus audit append");
+
+    // Now confirm the prompt. The child reads "y", proceeds to its
+    // post-prompt re-read, sees the tail shifted, and aborts.
+    child
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(b"y\n")
+        .expect("write y to child stdin");
+
+    let out = child
+        .wait_with_output()
+        .expect("wait for claude-scope-cli undo");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit on stale-log apply, got success. stderr: {}",
+        stderr(&out)
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("log changed"),
+        "expected staleness error on stderr, got: {err}"
+    );
+
+    // The aborted undo must not have touched the on-disk settings.
+    assert_eq!(
+        sb.project_settings(),
+        project_after_move,
+        "project settings must be unchanged after a refused undo"
+    );
 }
