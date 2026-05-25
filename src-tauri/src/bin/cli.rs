@@ -19,8 +19,8 @@ use claude_scope_lib::audit::{self, Record as AuditRecord};
 use claude_scope_lib::commands::{
     apply_move_leaf_impl, apply_restore_plan, audit_leaf_kind, audit_side, build_loaded,
     build_restore_plan, diff_move_leaf_impl, persist_audit_record, plan_restore_to,
-    preview_restore_plan, restore_record, snapshot_top_level_key, AuditLogPage, AuditRecordView,
-    MoveLeafPreview, MoveLeafRequest, RestorePlan, RestorePreview,
+    preview_restore_plan, restore_record, AuditLogPage, AuditRecordView, MoveLeafPreview,
+    MoveLeafRequest, RestorePlan, RestorePreview,
 };
 use claude_scope_lib::io_atomic::{self, BackupTracker};
 use claude_scope_lib::model::{PathSeg, PermissionKind};
@@ -732,40 +732,19 @@ fn cmd_move(
         return Ok(());
     }
 
-    // Pre-snapshot the affected top-level key on both sides so the audit
-    // record can carry a faithful before/after. Mirrors the GUI's
-    // `apply_move_leaf` flow at commands.rs — see #164.
+    // The impl returns before/after values captured from its own
+    // load_with_stamp — closing the race window a separate pre-snapshot
+    // at this boundary would leave open against a third-party writer
+    // (#169). Mirrors the GUI's `apply_move_leaf`.
     let top_key = "permissions";
     let from_file = paths.path_for(from).map(Path::to_path_buf);
     let to_file = paths.path_for(to).map(Path::to_path_buf);
-    let from_before = from_file
-        .as_deref()
-        .and_then(|p| snapshot_top_level_key(p, top_key));
-    let to_before = if from == to {
-        from_before.clone()
-    } else {
-        to_file
-            .as_deref()
-            .and_then(|p| snapshot_top_level_key(p, top_key))
-    };
-
-    apply_move_leaf_impl(
+    let outcome = apply_move_leaf_impl(
         paths,
         &req,
         cli_backups_for_session(),
         &WatchState::default(),
     )?;
-
-    let from_after = from_file
-        .as_deref()
-        .and_then(|p| snapshot_top_level_key(p, top_key));
-    let to_after = if from == to {
-        from_after.clone()
-    } else {
-        to_file
-            .as_deref()
-            .and_then(|p| snapshot_top_level_key(p, top_key))
-    };
 
     // Build and persist the audit record. CLI move is always
     // `Kind::Move` today — no change-kind path is exposed at the
@@ -779,15 +758,21 @@ fn cmd_move(
             req.from,
             from_file.as_deref(),
             top_key,
-            from_before,
-            from_after,
+            outcome.from_before,
+            outcome.from_after,
         ),
-        audit_side(req.to, to_file.as_deref(), top_key, to_before, to_after),
+        audit_side(
+            req.to,
+            to_file.as_deref(),
+            top_key,
+            outcome.to_before,
+            outcome.to_after,
+        ),
         req.path.clone(),
         req.to_kind,
     );
-    let outcome = persist_audit_record(&record, home);
-    report_audit_persist(outcome, "move");
+    let persist_result = persist_audit_record(&record, home);
+    report_audit_persist(persist_result, "move");
 
     if json {
         let out = json!({
