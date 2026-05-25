@@ -697,10 +697,30 @@ pub fn undo_redo_state(records: &[Record]) -> UndoRedoState {
                 // the active log, or never written) — skip it silently.
             }
             ReplayRole::Redo(target) => {
+                // Redo records target the top of the redo stack. An entry
+                // that names any other undone op puts the state machine in
+                // a configuration the linear history never had — a later
+                // user-clicked Redo would target whatever sits on top of
+                // the now-perturbed stack and write `key_after` over a
+                // file that holds an unrelated op's result, masking that
+                // op's effect on disk (#173). Out-of-order targets can
+                // appear via a corrupt log line, a hand-edit, or a racing
+                // concurrent writer.
+                //
+                // Treat any out-of-order Redo as a sequence break: keep
+                // the redo stack intact (mirror the existing post-undo Op
+                // semantics — entries are kept, not discarded) and latch
+                // `sequence_break` so the UI withholds Redo and explains
+                // why. A Redo that arrives with no pending undos at all
+                // is also bogus; same treatment.
                 if let Some(op_ix) = ops.iter().position(|&r| records[r].id == target) {
                     if undone[op_ix] {
-                        undone[op_ix] = false;
-                        redo_stack.retain(|&x| x != op_ix);
+                        if redo_stack.last() == Some(&op_ix) {
+                            undone[op_ix] = false;
+                            redo_stack.pop();
+                        } else {
+                            sequence_break = true;
+                        }
                     }
                 }
             }
@@ -1195,6 +1215,70 @@ mod tests {
         let state = undo_redo_state(&[a.clone(), to_point.clone(), undo_tp]);
         assert_eq!(state.undoable.unwrap().id, a.id);
         assert_eq!(state.redoable.unwrap().id, to_point.id);
+    }
+
+    #[test]
+    fn undo_redo_state_out_of_order_redo_is_a_sequence_break() {
+        // #173 — A Redo entry that doesn't target the top of the redo
+        // stack puts the state machine in a configuration the linear
+        // history never had. Without the guard, the impl would accept
+        // *any* undone op as a valid redo target; the next user-clicked
+        // Redo would then target whatever still sat on top of the
+        // perturbed stack and write that op's `key_after` over the
+        // wrong file state. Such an entry can only appear via a corrupt
+        // log line, hand-edit, or racing concurrent writer — theoretical
+        // today, real once the CLI's undo/redo land in daily use
+        // alongside the GUI.
+        //
+        // Build the failing shape from the issue:
+        //   ops:       [A, B, C]
+        //   undos:     Undo C, Undo B   → undone = {B, C}, stack = [C, B]
+        //   bad redo:  Redo C            (top is B, not C)
+        // Expectation: stack stays [C, B], sequence_break latches, and
+        // redoable is None — the UI surfaces the break instead of
+        // offering a corrupt Redo target.
+        let (a, b, c) = (op_record(), op_record(), op_record());
+        let log = [
+            a.clone(),
+            b.clone(),
+            c.clone(),
+            restore_of(&c, RestoreDirection::Undo),
+            restore_of(&b, RestoreDirection::Undo),
+            restore_of(&c, RestoreDirection::Redo),
+        ];
+        let state = undo_redo_state(&log);
+        assert!(
+            state.sequence_break,
+            "out-of-order redo must latch the break"
+        );
+        assert!(
+            state.redoable.is_none(),
+            "redo must be withheld while the stack is ambiguous"
+        );
+        // undoable is whatever was most recently undone's predecessor —
+        // here A, because B and C are both still undone.
+        assert_eq!(state.undoable.unwrap().id, a.id);
+    }
+
+    #[test]
+    fn undo_redo_state_in_order_redo_still_advances() {
+        // Regression sibling to the out-of-order test above: the
+        // ordering enforcement must not break the headline redo flow.
+        // Undo C then Undo B → stack [C, B]; Redo B (top) → stack [C];
+        // the next redo targets C and there's no sequence break.
+        let (a, b, c) = (op_record(), op_record(), op_record());
+        let log = [
+            a.clone(),
+            b.clone(),
+            c.clone(),
+            restore_of(&c, RestoreDirection::Undo),
+            restore_of(&b, RestoreDirection::Undo),
+            restore_of(&b, RestoreDirection::Redo),
+        ];
+        let state = undo_redo_state(&log);
+        assert!(!state.sequence_break);
+        assert_eq!(state.redoable.unwrap().id, c.id);
+        assert_eq!(state.undoable.unwrap().id, b.id);
     }
 
     #[test]
