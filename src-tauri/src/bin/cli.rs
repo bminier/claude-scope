@@ -954,7 +954,25 @@ fn run_cli_restore(
         // pre-prompt log; applying it against a changed log can clobber
         // the intervening op. Skipped only when `--yes` is set, since
         // there's no prompt window then. See #165.
-        let (current_records, _) = audit::read_all(home)?;
+        let (current_records, current_skipped) = audit::read_all(home)?;
+        // Mirror the GUI's `require_clean_audit_log` gate: a malformed
+        // tail line that landed during the prompt window would skip the
+        // tail-id check entirely (the corrupt entry doesn't shift the
+        // last record's id), and the restore would apply against a
+        // partial log. Refuse instead. Codex 3rd-pass [P1].
+        if current_skipped > 0 {
+            return Err(format!(
+                "the audit log became degraded while waiting for confirmation \
+                 ({current_skipped} unreadable {}). Re-run the command after \
+                 repairing the log.",
+                if current_skipped == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                }
+            )
+            .into());
+        }
         let current_tail = current_records.last().map(|r| r.id);
         if current_tail != expected_tail_id {
             return Err("the audit log changed while waiting for \

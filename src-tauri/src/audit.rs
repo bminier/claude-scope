@@ -546,39 +546,41 @@ fn audit_archives(home: Option<&Path>) -> io::Result<Vec<PathBuf>> {
     Ok(archives)
 }
 
-/// Sort key for an `audit-YYYY-MM[-N].jsonl` archive filename:
-/// `(YYYY-MM string, N as integer)`. The base archive (no suffix)
-/// sorts as `N=1` so it comes before any collision suffix
-/// (`audit-YYYY-MM-2.jsonl` and beyond). Names that don't match the
-/// pattern fall to the end with `N=u32::MAX`, which keeps them
-/// deterministic without claiming they were chronologically first.
-fn archive_sort_key(name: &str) -> (String, u32) {
+/// Sort key for an `audit-YYYY-MM[-N].jsonl` archive filename. Tuple
+/// shape is `(is_unrecognized, YYYY-MM, suffix)`:
+///
+/// - `is_unrecognized: bool` is `false` for parseable shapes and
+///   `true` for everything else. Putting it first means parseable
+///   archives sort before unknown ones regardless of name — fixing
+///   codex 3rd-pass [P2] where a stray `audit-0000.jsonl` would
+///   otherwise lex-sort ahead of valid `audit-2026-05.jsonl`.
+/// - `YYYY-MM` string for chronological grouping (lex == chrono on
+///   ISO-like dates).
+/// - `suffix: u32` — 1 for the base file, 2/3/… for the collision
+///   siblings.
+fn archive_sort_key(name: &str) -> (bool, String, u32) {
     // Strip the `audit-` prefix and `.jsonl` suffix; what's left is
     // either `YYYY-MM` or `YYYY-MM-N`.
     let stem = name
         .strip_prefix("audit-")
         .and_then(|s| s.strip_suffix(".jsonl"))
         .unwrap_or("");
+    let is_year_month = |s: &str| s.len() == 7 && s.as_bytes().get(4) == Some(&b'-');
     // Try `YYYY-MM-N` first: split on the LAST `-` and parse the tail.
     if let Some((head, tail)) = stem.rsplit_once('-') {
         if let Ok(n) = tail.parse::<u32>() {
-            // Tail parsed as a number — but only treat it as a
-            // collision suffix when the head still looks like
-            // `YYYY-MM` (7 chars, digits + one dash). Otherwise the
-            // whole stem is a bare year-month with a hyphen inside
-            // (e.g. `2026-05`).
-            if head.len() == 7 && head.as_bytes().get(4) == Some(&b'-') {
-                return (head.to_string(), n);
+            if is_year_month(head) {
+                return (false, head.to_string(), n);
             }
         }
     }
     // Bare `YYYY-MM` form — treat as collision index 1 so it sorts
     // before the `-2`, `-3`, … siblings.
-    if stem.len() == 7 && stem.as_bytes().get(4) == Some(&b'-') {
-        return (stem.to_string(), 1);
+    if is_year_month(stem) {
+        return (false, stem.to_string(), 1);
     }
-    // Unrecognized shape; park at the end deterministically.
-    (stem.to_string(), u32::MAX)
+    // Unrecognized shape; park after every parseable archive.
+    (true, stem.to_string(), 0)
 }
 
 /// Read records + skipped count from a single audit-log file. Factored
@@ -1511,12 +1513,28 @@ mod tests {
     }
 
     #[test]
-    fn archive_sort_key_parks_unknown_shapes_deterministically() {
-        // Unrecognized shapes still need a stable position. Park them
-        // at the end via u32::MAX rather than mixing with parseable
-        // archives.
-        let key = archive_sort_key("audit-garbage.jsonl");
-        assert_eq!(key.1, u32::MAX);
+    fn archive_sort_key_parks_unknown_shapes_after_valid() {
+        // Codex 3rd-pass [P2] fix: unknown shapes must sort AFTER
+        // every parseable archive, regardless of name. A stray
+        // `audit-0000.jsonl` would otherwise lex-sort ahead of valid
+        // dates. Test both directly via key + via the actual sort.
+        let valid = archive_sort_key("audit-2026-05.jsonl");
+        let unknown = archive_sort_key("audit-0000.jsonl");
+        assert!(
+            valid < unknown,
+            "valid archive {valid:?} should sort before unknown {unknown:?}"
+        );
+
+        let mut names = [
+            "audit-0000.jsonl",
+            "audit-2026-05.jsonl",
+            "audit-garbage.jsonl",
+        ];
+        names.sort_by_cached_key(|n| archive_sort_key(n));
+        assert_eq!(
+            names[0], "audit-2026-05.jsonl",
+            "parseable archive must come first"
+        );
     }
 
     #[test]
