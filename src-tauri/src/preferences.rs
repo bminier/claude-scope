@@ -112,6 +112,14 @@ pub struct Preferences {
         deserialize_with = "deserialize_group_rules_at"
     )]
     pub group_rules_at: Option<u32>,
+    /// Whether the combined permissions panel starts collapsed (#155).
+    /// Default `true` so first-paint is quick to scan — the per-scope
+    /// columns own the top of the row, and the user expands the
+    /// combined view only when they want the effective summary. The
+    /// toggle persists per the user's last choice so an expanded
+    /// panel stays expanded across sessions.
+    #[serde(default = "default_combined_panel_collapsed")]
+    pub combined_panel_collapsed: bool,
 }
 
 impl Default for Preferences {
@@ -124,6 +132,7 @@ impl Default for Preferences {
             audit_log_rotate: default_audit_log_rotate(),
             audit_log_max_size_mb: default_audit_log_max_size_mb(),
             group_rules_at: default_group_rules_at(),
+            combined_panel_collapsed: default_combined_panel_collapsed(),
         }
     }
 }
@@ -133,6 +142,13 @@ fn default_visible_scopes() -> Vec<Scope> {
 }
 
 fn default_backup_on_write() -> bool {
+    true
+}
+
+fn default_combined_panel_collapsed() -> bool {
+    // Default collapsed (#155). First-launch users see the per-scope
+    // columns at full attention; toggling open is one click away and
+    // their choice persists.
     true
 }
 
@@ -413,6 +429,7 @@ mod tests {
             audit_log_rotate: false,
             audit_log_max_size_mb: 25,
             group_rules_at: Some(3),
+            combined_panel_collapsed: false,
         };
         let json = serde_json::to_string(&prefs).unwrap();
         let parsed: Preferences = serde_json::from_str(&json).unwrap();
@@ -434,6 +451,31 @@ mod tests {
     }
 
     #[test]
+    fn combined_panel_collapsed_defaults_to_true() {
+        // First launch (#155): the combined panel starts collapsed so
+        // the per-scope columns own the top of the row at first paint.
+        let prefs = Preferences::default();
+        assert!(prefs.combined_panel_collapsed);
+    }
+
+    #[test]
+    fn combined_panel_collapsed_missing_field_defaults_to_true() {
+        // Older configs predate the field; the missing key must
+        // collapse to the same default as a fresh install (#155).
+        let prefs: Preferences = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(prefs.combined_panel_collapsed);
+    }
+
+    #[test]
+    fn combined_panel_collapsed_explicit_false_survives_round_trip() {
+        let prefs: Preferences =
+            serde_json::from_str(r#"{"combined_panel_collapsed":false}"#).unwrap();
+        assert!(!prefs.combined_panel_collapsed);
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert!(json.contains(r#""combined_panel_collapsed":false"#));
+    }
+
+    #[test]
     fn theme_round_trips_through_json_for_each_variant() {
         for theme in [Theme::Auto, Theme::Light, Theme::Dark] {
             let prefs = Preferences {
@@ -444,6 +486,7 @@ mod tests {
                 audit_log_rotate: true,
                 audit_log_max_size_mb: AUDIT_LOG_MAX_SIZE_MB_DEFAULT,
                 group_rules_at: default_group_rules_at(),
+                combined_panel_collapsed: default_combined_panel_collapsed(),
             };
             let json = serde_json::to_string(&prefs).unwrap();
             let parsed: Preferences = serde_json::from_str(&json).unwrap();
@@ -472,6 +515,7 @@ mod tests {
             audit_log_rotate: true,
             audit_log_max_size_mb: AUDIT_LOG_MAX_SIZE_MB_DEFAULT,
             group_rules_at: default_group_rules_at(),
+            combined_panel_collapsed: default_combined_panel_collapsed(),
         };
         let json = serde_json::to_string(&prefs).unwrap();
         // The JS side reads this string verbatim — pinning the casing
@@ -711,6 +755,7 @@ mod tests {
             audit_log_rotate: true,
             audit_log_max_size_mb: AUDIT_LOG_MAX_SIZE_MB_DEFAULT,
             group_rules_at: default_group_rules_at(),
+            combined_panel_collapsed: default_combined_panel_collapsed(),
         };
         let body = serde_json::to_vec_pretty(&first).unwrap();
         let parent = target.parent().unwrap();
@@ -730,6 +775,7 @@ mod tests {
             audit_log_rotate: false,
             audit_log_max_size_mb: 5,
             group_rules_at: None,
+            combined_panel_collapsed: true,
         };
         let body2 = serde_json::to_vec_pretty(&second).unwrap();
         let mut tmpfile2 = tempfile::NamedTempFile::new_in(parent).unwrap();

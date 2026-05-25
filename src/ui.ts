@@ -80,6 +80,11 @@ interface AppProps {
    *  trigger-pattern so focus restore lands on the History button. */
   onOpenHistory: (trigger?: HTMLElement) => void;
   onQueryChange: (next: string) => void;
+  /** Persist the combined panel's collapsed state (#155). Wired to the
+   *  `<details>` toggle event in `combinedPanel`. The receiver
+   *  no-ops when the value hasn't changed, so the initial `open=`
+   *  assignment doesn't echo back into persistence. */
+  onToggleCombinedPanelCollapsed: (collapsed: boolean) => void;
 }
 
 /**
@@ -938,11 +943,42 @@ function searchBox(props: AppProps): HTMLElement {
 
 function combinedPanel(loaded: LoadedScopes, props: AppProps, lowerQuery: string): HTMLElement {
   const query = props.query;
-  const panel = document.createElement("section");
+  // `<details>` instead of `<section>` so the panel collapses with a
+  // single click on the disclosure widget (#155). Default-collapsed is
+  // persisted via `preferences.combined_panel_collapsed` — `open` is
+  // its negation, and the toggle event mirrors the user's choice back
+  // through `onToggleCombinedPanelCollapsed`.
+  const panel = document.createElement("details");
   panel.className = "combined";
-  const title = document.createElement("h2");
+  panel.open = !props.preferences.combined_panel_collapsed;
+
+  const summary = document.createElement("summary");
+  summary.className = "combined-summary";
+  const title = document.createElement("span");
+  title.className = "combined-title";
   title.textContent = "Combined permissions";
-  panel.appendChild(title);
+  summary.appendChild(title);
+  // Inline kind-count summary so the collapsed state still tells the
+  // user what's in the combined view at a glance. Reads "5 allow ·
+  // 2 deny · 1 ask", with the dots-as-separators staying narrow
+  // enough to fit alongside the title in a single grid column.
+  const counts = document.createElement("span");
+  counts.className = "combined-counts";
+  counts.textContent =
+    `${loaded.combined_permissions.allow.length} allow` +
+    ` · ${loaded.combined_permissions.deny.length} deny` +
+    ` · ${loaded.combined_permissions.ask.length} ask`;
+  summary.appendChild(counts);
+  panel.appendChild(summary);
+
+  // Persist the toggle. The setter no-ops when the value hasn't
+  // changed, so the initial `panel.open = ...` (which queues a
+  // toggle event in some browsers) doesn't echo back into write
+  // traffic against config.json.
+  panel.addEventListener("toggle", () => {
+    props.onToggleCombinedPanelCollapsed(!panel.open);
+  });
+
   const subtitle = document.createElement("p");
   subtitle.className = "combined-subtitle";
   subtitle.textContent = "Union across scopes — not a precedence-aware evaluation.";

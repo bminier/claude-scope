@@ -331,12 +331,60 @@ button:disabled {
   flex-direction: column;
 }
 
-.combined h2 {
+/* `.combined` is a `<details>`; its `<summary>` is the always-visible
+   header bearing the title and the inline count chip. Cursor: pointer
+   signals it's interactive; the default disclosure widget on the left
+   stays visible. The summary stacks the title and counts vertically
+   when the column is narrow, but they sit on one line by default. */
+.combined-summary {
+  cursor: pointer;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
   margin: 0;
+  /* Default `<summary>` adds list-style markers on some browsers; the
+     disclosure widget itself is enough. */
+  list-style: none;
+}
+
+.combined-summary::-webkit-details-marker {
+  display: none;
+}
+
+.combined-summary::marker {
+  content: "";
+}
+
+.combined-summary::before {
+  /* Hand-rolled disclosure indicator — a small triangle that rotates
+     when the details opens. Replaces the browser default marker we
+     just hid, so the visual cue stays consistent across browsers. */
+  content: "▶";
+  font-size: 10px;
+  color: var(--muted);
+  transition: transform 120ms ease;
+  display: inline-block;
+  width: 10px;
+}
+
+.combined[open] > .combined-summary::before {
+  transform: rotate(90deg);
+}
+
+.combined-title {
   font-size: 13px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--muted);
+}
+
+.combined-counts {
+  font-size: 11px;
+  color: var(--muted);
+  /* Slightly lighter weight than the title so the title still leads
+     visually when both are inline. */
+  font-weight: normal;
 }
 
 .combined-subtitle {
