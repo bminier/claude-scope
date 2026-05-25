@@ -59,6 +59,7 @@ interface PropsOverrides {
   onMoveLeaf?: (req: MoveLeafRequest, trigger?: HTMLElement, opts?: MoveOptions) => void;
   onPickProject?: () => void;
   onPickRecentProject?: (projectDir: string) => void;
+  onToggleCombinedPanelCollapsed?: (collapsed: boolean) => void;
 }
 
 function makeProps(overrides: PropsOverrides = {}) {
