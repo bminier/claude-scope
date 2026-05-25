@@ -421,20 +421,21 @@ fn resolve_paths(
     project_dir: Option<&std::path::Path>,
     home_dir: Option<&std::path::Path>,
 ) -> Result<ScopePaths, Box<dyn std::error::Error>> {
-    let Some(project_root) = project_dir else {
-        return Ok(scope::resolve_with_home(None, home_dir)?);
-    };
-    // Absolutize the project root so audit-log entries persist absolute
-    // `file_path` values. Otherwise a CLI move with `--project-dir foo`
-    // logs `./foo/.claude/settings.json`, and a later `undo` run from a
-    // different cwd would resolve that against the new cwd — restoring
-    // (or creating) the wrong file. Same posture for `--home-dir`. See
-    // codex 4th-pass [P1].
-    let project_root_abs = absolutize(project_root)?;
-    let home = match home_dir {
+    // Absolutize `--home-dir` regardless of which branch we take — a
+    // relative `--home-dir` would otherwise persist relative
+    // `file_path`s into the audit log for the user / user-local scopes,
+    // and a later restore from a different cwd would resolve those
+    // against the new cwd. Codex 5th-pass [P1].
+    let home_abs = match home_dir {
         Some(p) => Some(absolutize(p)?),
-        None => dirs::home_dir(),
+        None => None,
     };
+    let Some(project_root) = project_dir else {
+        return Ok(scope::resolve_with_home(None, home_abs.as_deref())?);
+    };
+    // Same absolutize for `--project-dir` (codex 4th-pass [P1]).
+    let project_root_abs = absolutize(project_root)?;
+    let home = home_abs.or_else(dirs::home_dir);
     Ok(ScopePaths {
         project_dir: project_root_abs.clone(),
         local: Some(project_root_abs.join(".claude").join("settings.local.json")),
@@ -934,10 +935,10 @@ fn resolve_entry_id(
 /// confirm, apply, and log the resulting `restore` entry (actor `cli`).
 ///
 /// `expected_tail_id` is the ULID of the last audit-log record the caller
-/// saw when building the plan. After the confirm prompt — the only window
-/// where another process can append an entry — the log is re-read and the
-/// new tail compared against `expected_tail_id`. A mismatch means the
-/// plan is stale; abort instead of applying it (#165).
+/// saw when building the plan. Immediately before applying — whether the
+/// user just confirmed at a prompt or skipped the prompt via `--yes` —
+/// the log is re-read and compared. A mismatch means the plan is stale;
+/// abort instead of applying it (#165, codex 5th-pass extension).
 fn run_cli_restore(
     home: Option<&std::path::Path>,
     plan: &RestorePlan,
@@ -968,38 +969,34 @@ fn run_cli_restore(
             }
             return Ok(());
         }
-        // Re-read the log right after the prompt to catch a concurrent
-        // append from another GUI/CLI session that landed during the
-        // user's confirm window. The plan was computed against the
-        // pre-prompt log; applying it against a changed log can clobber
-        // the intervening op. Skipped only when `--yes` is set, since
-        // there's no prompt window then. See #165.
-        let (current_records, current_skipped) = audit::read_all(home)?;
-        // Mirror the GUI's `require_clean_audit_log` gate: a malformed
-        // tail line that landed during the prompt window would skip the
-        // tail-id check entirely (the corrupt entry doesn't shift the
-        // last record's id), and the restore would apply against a
-        // partial log. Refuse instead. Codex 3rd-pass [P1].
-        if current_skipped > 0 {
-            return Err(format!(
-                "the audit log became degraded while waiting for confirmation \
-                 ({current_skipped} unreadable {}). Re-run the command after \
-                 repairing the log.",
-                if current_skipped == 1 {
-                    "entry"
-                } else {
-                    "entries"
-                }
-            )
+    }
+    // Re-read the log immediately before applying — covers both the
+    // interactive prompt window and the smaller-but-real window between
+    // the caller's initial read and this point under `--yes`. A
+    // concurrent GUI/CLI append in either window would leave us
+    // applying a stale plan against a changed log. Refuse on any
+    // mismatch (tail shifted, or new malformed lines). Codex 3rd- and
+    // 5th-pass [P1]s.
+    let (current_records, current_skipped) = audit::read_all(home)?;
+    if current_skipped > 0 {
+        return Err(format!(
+            "the audit log became degraded since the plan was built \
+             ({current_skipped} unreadable {}). Re-run the command after \
+             repairing the log.",
+            if current_skipped == 1 {
+                "entry"
+            } else {
+                "entries"
+            }
+        )
+        .into());
+    }
+    let current_tail = current_records.last().map(|r| r.id);
+    if current_tail != expected_tail_id {
+        return Err("the audit log changed since the plan was built \
+                    (another session appended an entry). \
+                    Re-run the command."
             .into());
-        }
-        let current_tail = current_records.last().map(|r| r.id);
-        if current_tail != expected_tail_id {
-            return Err("the audit log changed while waiting for \
-                        confirmation (another session appended an entry). \
-                        Re-run the command."
-                .into());
-        }
     }
     let files = apply_restore_plan(plan, cli_backups_for_session(), &WatchState::default())?;
     let record = restore_record(plan, audit::Actor::Cli, files);
