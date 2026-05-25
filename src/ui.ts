@@ -21,6 +21,7 @@ import type {
   PathSeg,
   PermissionKind,
   Preferences,
+  Redundancy,
   RestorePreview,
   RestoreSidePreview,
   RuntimeInfo,
@@ -1122,6 +1123,16 @@ function combinedPanel(loaded: LoadedScopes, props: AppProps, lowerQuery: string
         const cBadge = kindConflictBadge(conflict);
         if (cBadge) chipWrap.appendChild(cBadge);
       }
+      // Redundancy badge (#17). The combined panel collapses by rule
+      // string, so the badge surfaces when ANY per-scope occurrence of
+      // this rule under this kind is flagged. Match on rule + kind
+      // since we don't know which per-scope index the chip "is" —
+      // there can be multiple contributors.
+      const redundancyForChip = loaded.redundancies.find(
+        (r) => r.redundant.rule === rule && r.redundant.kind === kind,
+      );
+      const rBadge = redundancyBadge(redundancyForChip ?? null);
+      if (rBadge) chipWrap.appendChild(rBadge);
       attachContextMenu(chipWrap, () =>
         combinedChipContextMenuItems(rule, allOrigins[i] ?? [], props),
       );
@@ -1209,6 +1220,107 @@ function kindConflictBadge(conflict: KindConflict | null): HTMLElement | null {
   note.textContent =
     "Highest-precedence scope wins for the effective union, but Claude Code's runtime " +
     "resolution may apply additional rules.";
+  pop.appendChild(note);
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (openPinnedPopover === wrap) {
+      closePinnedPopover();
+    } else {
+      pinPopover(wrap);
+    }
+  });
+
+  wrap.appendChild(btn);
+  wrap.appendChild(pop);
+  return wrap;
+}
+
+/**
+ * Find the redundancy entry whose `redundant.{scope, kind, index}`
+ * matches a rule's position (#17). Returns null when the rule isn't
+ * flagged as redundant — the caller skips the badge entirely.
+ *
+ * Linear scan is fine: realistic settings have <100 rules total and
+ * usually far fewer redundancies; building a Map per render would buy
+ * nothing.
+ */
+function findRedundancy(
+  scope: Scope,
+  kind: PermissionKind,
+  index: number,
+  redundancies: Redundancy[],
+): Redundancy | null {
+  for (const r of redundancies) {
+    if (r.redundant.scope === scope && r.redundant.kind === kind && r.redundant.index === index) {
+      return r;
+    }
+  }
+  return null;
+}
+
+/**
+ * Warning badge for a rule that's been flagged as redundant (#17).
+ * Same shape as `lintBadge` / `kindConflictBadge`: a focusable ⚠ button
+ * paired with a popover. The popover names the rule that covers this
+ * one (with scope) and labels the redundancy as either an exact
+ * duplicate or a pattern subsumption so the user can decide whether to
+ * remove the chip.
+ *
+ * Recolored with the `muted-warn` palette — redundancies are
+ * informational ("this could be tidied up"), not the same severity as
+ * a kind disagreement or a structural shape error. Distinguishing the
+ * three palettes lets a rule with two badges (lint + redundancy, or
+ * conflict + redundancy) read as three separate cues.
+ */
+function redundancyBadge(redundancy: Redundancy | null): HTMLElement | null {
+  if (redundancy === null) return null;
+
+  const wrap = document.createElement("span");
+  wrap.className = "lint-warn-wrap redundancy-wrap";
+  const popoverId = `redundancy-popover-${++lintPopoverSeq}`;
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "lint-warn redundancy-warn";
+  btn.textContent = "⚠";
+  const label =
+    redundancy.kind === "duplicate"
+      ? "Duplicate rule — already present in another scope"
+      : "Redundant rule — covered by a broader rule";
+  btn.setAttribute("aria-label", label);
+  btn.setAttribute("aria-describedby", popoverId);
+
+  const pop = document.createElement("span");
+  pop.id = popoverId;
+  pop.className = "lint-warn-popover redundancy-popover";
+  pop.setAttribute("role", "tooltip");
+
+  const reasonLine = document.createElement("span");
+  reasonLine.className = "lint-warn-popover-reason";
+  reasonLine.textContent =
+    redundancy.kind === "duplicate"
+      ? "Exact duplicate of another rule:"
+      : "Already covered by a broader rule:";
+  pop.appendChild(reasonLine);
+
+  const covering = document.createElement("code");
+  covering.className = "redundancy-covering";
+  covering.textContent = redundancy.covered_by.rule;
+  pop.appendChild(covering);
+
+  const scopeLine = document.createElement("span");
+  scopeLine.className = "redundancy-scope";
+  scopeLine.textContent = ` in ${SCOPE_LABELS[redundancy.covered_by.scope]} (${
+    KIND_LABELS[redundancy.covered_by.kind]
+  })`;
+  pop.appendChild(scopeLine);
+
+  const note = document.createElement("span");
+  note.className = "lint-warn-popover-note";
+  note.textContent =
+    "Safe to remove — the covering rule grants/denies the same behavior. " +
+    "Right-click this chip to delete.";
   pop.appendChild(note);
 
   btn.addEventListener("click", (e) => {
@@ -2310,6 +2422,16 @@ function treeLeaf(
       const conflict = findKindConflict(rule, scope, permKind, props.scopes.kind_conflicts);
       const cBadge = kindConflictBadge(conflict);
       if (cBadge) row.appendChild(cBadge);
+      // Redundancy badge (#17). The rule's position in this kind's
+      // array is `path[2]` for a permission-rule leaf. Lookup keys on
+      // (scope, kind, index) so two chips with the same text but
+      // different indices each get their own badge (or none).
+      const rulePathIdx = typeof path[2] === "number" ? path[2] : -1;
+      if (rulePathIdx >= 0) {
+        const redundancy = findRedundancy(scope, permKind, rulePathIdx, props.scopes.redundancies);
+        const rBadge = redundancyBadge(redundancy);
+        if (rBadge) row.appendChild(rBadge);
+      }
     }
     if (props) {
       // Inline arrow buttons dropped in #152 — right-click context

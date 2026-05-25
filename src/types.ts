@@ -74,6 +74,30 @@ export interface LoadedScopes {
    * explains which kind wins by precedence (#156).
    */
   kind_conflicts: KindConflict[];
+  /**
+   * Permission rules that are either exact duplicates or fully covered
+   * by a broader rule of the same kind (#17). Each entry is one
+   * redundant rule with the rule that covers it; rendering puts a ⚠
+   * badge on the redundant chip and the popover explains which rule
+   * (and which scope) covers it.
+   */
+  redundancies: Redundancy[];
+}
+
+export type RedundancyKind = "duplicate" | "subsumed";
+
+/** One detected redundancy (#17). Mirrors Rust's `redundancy::Redundancy`. */
+export interface Redundancy {
+  redundant: RuleLoc;
+  covered_by: RuleLoc;
+  kind: RedundancyKind;
+}
+
+export interface RuleLoc {
+  rule: string;
+  scope: Scope;
+  kind: PermissionKind;
+  index: number;
 }
 
 /** One group of scopes whose resolved file paths point at the same on-disk

@@ -137,6 +137,17 @@ reviewer.
       between two scopes that share a file: the apply should fail with a
       typed error naming both scopes and the shared path. Close and
       re-open against a normal project root; the banner disappears.
+- [ ] **Redundancy badge (#17).** Set up a sandbox project whose
+      User-scope settings contain `"Bash(git *)"` in `allow` and whose
+      Project-scope settings duplicate it AND add `"Bash(git status)"`.
+      Reload. The Project's `Bash(git *)` row shows a gray ⚠ badge
+      ("Exact duplicate of another rule" / covered by User). The
+      Project's `Bash(git status)` row shows a gray ⚠ badge ("Already
+      covered by a broader rule" / `Bash(git *)` in User). The User's
+      `Bash(git *)` row stays clean. Hover (or focus + Enter) each
+      badge: the popover names the covering rule + scope and points at
+      right-click → Delete. Right-click the redundant chip → **Delete**
+      → confirm: the rule disappears and the badge clears.
 - [ ] **Cross-project Move-to: same-scope unlock (#179, #181).** Set up
       two project sandboxes (e.g. `/tmp/cs-smoke-a` and `/tmp/cs-smoke-b`,
       each with a `.claude/settings.local.json` containing a different
