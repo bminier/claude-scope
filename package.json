@@ -21,11 +21,11 @@
     "@tauri-apps/plugin-dialog": "^2.7.1"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.4.15",
+    "@biomejs/biome": "2.4.16",
     "@tauri-apps/cli": "^2.11.2",
     "happy-dom": "^20.0.0",
     "typescript": "^6.0.3",
-    "vite": "^8.0.14",
-    "vitest": "^4.1.7"
+    "vite": "^8.0.16",
+    "vitest": "^4.1.8"
   }
 }
